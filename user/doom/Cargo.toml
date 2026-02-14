@@ -1,0 +1,8 @@
+# user/doom/Cargo.toml: package manifest for M10 Doom userland Rust stub.
+[package]
+name = "arrost-user-doom"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrostd = { path = "../../crates/arrostd" }

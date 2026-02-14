@@ -1,0 +1,13 @@
+[package]
+name = "arrost-kernel"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+bootloader_api = "0.11.15"
+arrostd = { path = "../crates/arrostd" }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+
+[build-dependencies]
+cc = "1.1"

@@ -1,0 +1,14 @@
+[package]
+name = "arrost"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[workspace]
+resolver = "2"
+members = ["kernel", "xtask", "crates/arrostd", "user/init", "user/doom"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"

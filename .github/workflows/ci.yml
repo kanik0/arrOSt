@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy xtask
+        run: cargo clippy -p xtask --all-targets -- -D warnings
+
+      - name: Clippy kernel
+        run: cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+
+      - name: Test xtask
+        run: cargo test -p xtask
+
+      - name: Test arrostd
+        run: cargo test -p arrostd
+
+  doom-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf lsof clang
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Build Image
+        run: cargo xtask build
+
+      - name: Smoke DOOM
+        run: timeout 180s cargo xtask smoke-doom
+
+      - name: Smoke DOOM Long
+        run: timeout 240s cargo xtask smoke-doom-long
+
+      - name: Smoke DOOM Fallback
+        run: timeout 180s cargo xtask smoke-doom-fallback
