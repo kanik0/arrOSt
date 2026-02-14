@@ -1,5 +1,7 @@
 # ArrOSt
 
+![ArrOSt logo](logo.png)
+
 ArrOSt is an educational 64-bit operating system written in Rust (`no_std`) and designed to run on QEMU with UEFI firmware.
 
 The project focuses on practical kernel engineering with observable behavior, reproducible headless tests, and incremental subsystem bring-up.
