@@ -153,4 +153,4 @@ cargo xtask smoke-doom-fallback
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0 (see workspace metadata in `Cargo.toml`).
+Apache-2.0 (see workspace metadata in `Cargo.toml`).
