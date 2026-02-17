@@ -12,15 +12,20 @@
 #define ARR_AUDIO_CHANNELS 16
 #define ARR_AUDIO_OUTPUT_RATE 44100u
 #define ARR_AUDIO_OUTPUT_CHANNELS 2u
-#define ARR_AUDIO_SLICE_FRAMES 1024u
-#define ARR_AUDIO_MASTER_GAIN_NUM 2
-#define ARR_AUDIO_MASTER_GAIN_DEN 1
+#define ARR_AUDIO_SLICE_FRAMES 512u
+#define ARR_AUDIO_MASTER_GAIN_NUM 9
+#define ARR_AUDIO_MASTER_GAIN_DEN 8
+#define ARR_AUDIO_LIMIT_TARGET 28500u
+#define ARR_AUDIO_SOFT_CLIP_THRESHOLD 22000u
+#define ARR_AUDIO_SOFT_CLIP_KNEE 10000u
+#define ARR_AUDIO_LIMIT_ATTACK_SHIFT 1u
+#define ARR_AUDIO_LIMIT_RELEASE_SHIFT 4u
 #define ARR_AUDIO_PAN_DEN (127 * 254)
-#define ARR_AUDIO_MAX_MIX_SLICES_PER_UPDATE 8u
-#define ARR_AUDIO_MAX_DELTA_MS 120u
-#define ARR_AUDIO_MAX_CREDIT_FRAMES (ARR_AUDIO_OUTPUT_RATE / 4u)
+#define ARR_AUDIO_MAX_MIX_SLICES_PER_UPDATE 6u
+#define ARR_AUDIO_MAX_DELTA_MS 80u
+#define ARR_AUDIO_MAX_CREDIT_FRAMES (ARR_AUDIO_SLICE_FRAMES * 6u)
 #define ARR_MUSIC_CHANNELS 16u
-#define ARR_MUSIC_VOICES 24u
+#define ARR_MUSIC_VOICES 32u
 #define ARR_MUSIC_TICKS_PER_SEC 140u
 #define ARR_MUSIC_EVENT_RELEASEKEY 0x00u
 #define ARR_MUSIC_EVENT_PRESSKEY 0x10u
@@ -39,7 +44,7 @@
 #define ARR_MUSIC_SEMITONE_NUM 1059463u
 #define ARR_MUSIC_SEMITONE_DEN 1000000u
 #define ARR_MUSIC_PARSE_GUARD 2048u
-#define ARR_MUSIC_FILTER_SHIFT 2
+#define ARR_MUSIC_FILTER_SHIFT 1
 
 typedef struct {
     int16_t *samples;
@@ -111,6 +116,7 @@ static int32_t g_music_filter_l = 0;
 static int32_t g_music_filter_r = 0;
 static uint32_t g_audio_last_update_ms = 0u;
 static uint32_t g_audio_credit_frames = 0u;
+static uint32_t g_limiter_gain_q15 = 32767u;
 static arr_mix_channel_t g_channels[ARR_AUDIO_CHANNELS];
 static int32_t g_mix_buffer[ARR_AUDIO_SLICE_FRAMES * ARR_AUDIO_OUTPUT_CHANNELS];
 static int16_t g_pcm_buffer[ARR_AUDIO_SLICE_FRAMES * ARR_AUDIO_OUTPUT_CHANNELS];
@@ -167,6 +173,25 @@ static int clamp_channel(int channel) {
 
 static uint16_t read_le16(const uint8_t *ptr) {
     return (uint16_t)((uint16_t)ptr[0] | ((uint16_t)ptr[1] << 8));
+}
+
+static int32_t soft_clip_sample(int32_t sample) {
+    int64_t abs_sample = sample < 0 ? -(int64_t)sample : (int64_t)sample;
+    int64_t compressed;
+    int64_t extra;
+
+    if (abs_sample <= (int64_t)ARR_AUDIO_SOFT_CLIP_THRESHOLD) {
+        return sample;
+    }
+
+    extra = abs_sample - (int64_t)ARR_AUDIO_SOFT_CLIP_THRESHOLD;
+    compressed = (int64_t)ARR_AUDIO_SOFT_CLIP_THRESHOLD
+        + (extra * (int64_t)ARR_AUDIO_SOFT_CLIP_KNEE)
+            / (extra + (int64_t)ARR_AUDIO_SOFT_CLIP_KNEE);
+    if (compressed > 32767) {
+        compressed = 32767;
+    }
+    return sample < 0 ? -(int32_t)compressed : (int32_t)compressed;
 }
 
 static void music_reset_filter(void) {
@@ -883,8 +908,11 @@ static void mix_channel(arr_mix_channel_t *channel) {
 static int mix_and_submit_audio_slice(void) {
     int channel;
     uint32_t frame_index;
+    uint32_t sample_index;
     uint64_t abs_sum = 0u;
     int has_active = 0;
+    uint32_t target_gain_q15 = 32767u;
+    int64_t peak = 0;
 
     memset(g_mix_buffer, 0, sizeof(g_mix_buffer));
     for (channel = 0; channel < ARR_AUDIO_CHANNELS; ++channel) {
@@ -906,12 +934,56 @@ static int mix_and_submit_audio_slice(void) {
         return 0;
     }
 
+    for (sample_index = 0u;
+         sample_index < ARR_AUDIO_SLICE_FRAMES * ARR_AUDIO_OUTPUT_CHANNELS;
+         ++sample_index) {
+        int64_t scaled = ((int64_t)g_mix_buffer[sample_index] * (int64_t)ARR_AUDIO_MASTER_GAIN_NUM)
+            / (int64_t)ARR_AUDIO_MASTER_GAIN_DEN;
+        int64_t abs_scaled = scaled < 0 ? -scaled : scaled;
+        if (scaled > 2147483647LL) {
+            scaled = 2147483647LL;
+        } else if (scaled < -2147483648LL) {
+            scaled = -2147483648LL;
+        }
+        g_mix_buffer[sample_index] = (int32_t)scaled;
+        if (abs_scaled > peak) {
+            peak = abs_scaled;
+        }
+    }
+    if (peak > (int64_t)ARR_AUDIO_LIMIT_TARGET && peak > 0) {
+        target_gain_q15 =
+            (uint32_t)(((int64_t)ARR_AUDIO_LIMIT_TARGET * 32767LL) / peak);
+        if (target_gain_q15 == 0u) {
+            target_gain_q15 = 1u;
+        }
+    }
+    if (target_gain_q15 < g_limiter_gain_q15) {
+        g_limiter_gain_q15 =
+            target_gain_q15
+            + ((g_limiter_gain_q15 - target_gain_q15) >> ARR_AUDIO_LIMIT_ATTACK_SHIFT);
+    } else if (target_gain_q15 > g_limiter_gain_q15) {
+        g_limiter_gain_q15 +=
+            (target_gain_q15 - g_limiter_gain_q15) >> ARR_AUDIO_LIMIT_RELEASE_SHIFT;
+    }
+    if (g_limiter_gain_q15 == 0u) {
+        g_limiter_gain_q15 = 1u;
+    } else if (g_limiter_gain_q15 > 32767u) {
+        g_limiter_gain_q15 = 32767u;
+    }
+
     for (frame_index = 0u; frame_index < ARR_AUDIO_SLICE_FRAMES; ++frame_index) {
         int32_t mixed_left = g_mix_buffer[frame_index * 2u];
         int32_t mixed_right = g_mix_buffer[frame_index * 2u + 1u];
 
-        mixed_left = (mixed_left * ARR_AUDIO_MASTER_GAIN_NUM) / ARR_AUDIO_MASTER_GAIN_DEN;
-        mixed_right = (mixed_right * ARR_AUDIO_MASTER_GAIN_NUM) / ARR_AUDIO_MASTER_GAIN_DEN;
+        if (g_limiter_gain_q15 < 32767u) {
+            mixed_left =
+                (int32_t)(((int64_t)mixed_left * (int64_t)g_limiter_gain_q15) / 32767LL);
+            mixed_right =
+                (int32_t)(((int64_t)mixed_right * (int64_t)g_limiter_gain_q15) / 32767LL);
+        }
+
+        mixed_left = soft_clip_sample(mixed_left);
+        mixed_right = soft_clip_sample(mixed_right);
 
         if (mixed_left > 32767) {
             mixed_left = 32767;
@@ -948,6 +1020,7 @@ static boolean I_ARR_InitSound(boolean use_sfx_prefix) {
     g_sound_initialized = 1u;
     g_audio_last_update_ms = arr_dg_get_realtime_ms();
     g_audio_credit_frames = 0u;
+    g_limiter_gain_q15 = 32767u;
     for (channel = 0; channel < ARR_AUDIO_CHANNELS; ++channel) {
         memset(&g_channels[channel], 0, sizeof(g_channels[channel]));
     }
@@ -959,6 +1032,7 @@ static void I_ARR_ShutdownSound(void) {
     int channel;
     g_sound_initialized = 0u;
     g_audio_credit_frames = 0u;
+    g_limiter_gain_q15 = 32767u;
     for (channel = 0; channel < ARR_AUDIO_CHANNELS; ++channel) {
         g_channels[channel].active = 0u;
     }

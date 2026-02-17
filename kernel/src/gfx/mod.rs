@@ -11,7 +11,10 @@ use bootloader_api::{
 use core::cell::UnsafeCell;
 use core::cmp::min;
 
-const WINDOW_COUNT: usize = 2;
+const WINDOW_COUNT: usize = 3;
+const SHELL_WINDOW_INDEX: usize = 0;
+const FILE_MANAGER_WINDOW_INDEX: usize = 1;
+const DOOM_WINDOW_INDEX: usize = 2;
 const WINDOW_MAX_COLS: usize = 96;
 const WINDOW_MAX_ROWS: usize = 32;
 const INPUT_EVENT_CAPACITY: usize = 128;
@@ -29,11 +32,9 @@ const DOUBLE_CLICK_TICKS: u64 = 25;
 const POINTER_RECT_SIZE: usize = 8;
 const DAMAGE_MERGE_PAD: usize = 12;
 const MAX_BACKBUFFER_BYTES: usize = 8 * 1024 * 1024;
-const FILE_MANAGER_WINDOW_INDEX: usize = 1;
-const DOOM_VIEW_MAX_W: usize = 96;
-const DOOM_VIEW_MAX_H: usize = 72;
+const DOOM_VIEW_MAX_W: usize = 320;
+const DOOM_VIEW_MAX_H: usize = 200;
 const DOOM_VIEW_MAX_PIXELS: usize = DOOM_VIEW_MAX_W * DOOM_VIEW_MAX_H;
-const DOOM_VIEW_PALETTE_LEN: usize = 16;
 
 #[derive(Clone, Copy)]
 pub struct GfxInitReport {
@@ -58,6 +59,58 @@ impl Color {
     const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+}
+
+fn color_from_rgb24(pixel: u32) -> Color {
+    Color::rgb(
+        ((pixel >> 16) & 0xFF) as u8,
+        ((pixel >> 8) & 0xFF) as u8,
+        (pixel & 0xFF) as u8,
+    )
+}
+
+fn bilinear_channel(c00: u8, c10: u8, c01: u8, c11: u8, wx: u32, wy: u32) -> u8 {
+    let one = 1u64 << 16;
+    let inv_wx = one.saturating_sub(wx as u64);
+    let inv_wy = one.saturating_sub(wy as u64);
+
+    let top = ((u64::from(c00).saturating_mul(inv_wx) + u64::from(c10).saturating_mul(wx as u64))
+        .saturating_add(1u64 << 15))
+        >> 16;
+    let bottom = ((u64::from(c01).saturating_mul(inv_wx)
+        + u64::from(c11).saturating_mul(wx as u64))
+    .saturating_add(1u64 << 15))
+        >> 16;
+    (((top.saturating_mul(inv_wy) + bottom.saturating_mul(wy as u64)).saturating_add(1u64 << 15))
+        >> 16) as u8
+}
+
+fn bilinear_rgb24(c00: u32, c10: u32, c01: u32, c11: u32, wx: u32, wy: u32) -> Color {
+    let r = bilinear_channel(
+        ((c00 >> 16) & 0xFF) as u8,
+        ((c10 >> 16) & 0xFF) as u8,
+        ((c01 >> 16) & 0xFF) as u8,
+        ((c11 >> 16) & 0xFF) as u8,
+        wx,
+        wy,
+    );
+    let g = bilinear_channel(
+        ((c00 >> 8) & 0xFF) as u8,
+        ((c10 >> 8) & 0xFF) as u8,
+        ((c01 >> 8) & 0xFF) as u8,
+        ((c11 >> 8) & 0xFF) as u8,
+        wx,
+        wy,
+    );
+    let b = bilinear_channel(
+        (c00 & 0xFF) as u8,
+        (c10 & 0xFF) as u8,
+        (c01 & 0xFF) as u8,
+        (c11 & 0xFF) as u8,
+        wx,
+        wy,
+    );
+    Color::rgb(r, g, b)
 }
 
 #[derive(Clone, Copy)]
@@ -428,13 +481,11 @@ impl ResizeState {
     }
 }
 
-#[derive(Clone, Copy)]
 struct DoomViewLayer {
     active: bool,
     width: usize,
     height: usize,
-    pixels: [u8; DOOM_VIEW_MAX_PIXELS],
-    palette: [[u8; 3]; DOOM_VIEW_PALETTE_LEN],
+    filter: DoomViewFilter,
 }
 
 impl DoomViewLayer {
@@ -443,31 +494,26 @@ impl DoomViewLayer {
             active: false,
             width: 0,
             height: 0,
-            pixels: [0; DOOM_VIEW_MAX_PIXELS],
-            palette: [[0; 3]; DOOM_VIEW_PALETTE_LEN],
+            filter: DoomViewFilter::Nearest,
         }
     }
 
-    fn set(&mut self, width: usize, height: usize, pixels: &[u8], palette: &[[u8; 3]]) -> bool {
+    fn set(&mut self, width: usize, height: usize, pixels: &[u32]) -> bool {
         if width == 0 || height == 0 || width > DOOM_VIEW_MAX_W || height > DOOM_VIEW_MAX_H {
             return false;
         }
         let len = width.saturating_mul(height);
-        if pixels.len() < len || palette.is_empty() {
+        if pixels.len() < len {
             return false;
         }
 
         self.active = true;
         self.width = width;
         self.height = height;
-        self.pixels[..len].copy_from_slice(&pixels[..len]);
-        for slot in len..DOOM_VIEW_MAX_PIXELS {
-            self.pixels[slot] = 0;
-        }
-
-        for (index, color) in self.palette.iter_mut().enumerate() {
-            *color = palette.get(index).copied().unwrap_or([0, 0, 0]);
-        }
+        with_doom_view_pixels_mut(|storage| {
+            storage[..len].copy_from_slice(&pixels[..len]);
+            storage[len..DOOM_VIEW_MAX_PIXELS].fill(0);
+        });
         true
     }
 
@@ -476,6 +522,47 @@ impl DoomViewLayer {
         self.width = 0;
         self.height = 0;
     }
+
+    fn set_filter(&mut self, filter: DoomViewFilter) -> bool {
+        if self.filter == filter {
+            return false;
+        }
+        self.filter = filter;
+        true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DoomViewFilter {
+    Bilinear,
+    Nearest,
+}
+
+impl DoomViewFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bilinear => "bilinear",
+            Self::Nearest => "nearest",
+        }
+    }
+}
+
+struct DoomViewPixelsCell(UnsafeCell<[u32; DOOM_VIEW_MAX_PIXELS]>);
+
+// SAFETY: doom view pixels are accessed only from the single-threaded graphics path.
+unsafe impl Sync for DoomViewPixelsCell {}
+
+static DOOM_VIEW_PIXELS: DoomViewPixelsCell =
+    DoomViewPixelsCell(UnsafeCell::new([0; DOOM_VIEW_MAX_PIXELS]));
+
+fn with_doom_view_pixels<R>(f: impl FnOnce(&[u32; DOOM_VIEW_MAX_PIXELS]) -> R) -> R {
+    // SAFETY: graphics rendering runs on one thread in current milestones.
+    unsafe { f(&*DOOM_VIEW_PIXELS.0.get()) }
+}
+
+fn with_doom_view_pixels_mut<R>(f: impl FnOnce(&mut [u32; DOOM_VIEW_MAX_PIXELS]) -> R) -> R {
+    // SAFETY: graphics rendering runs on one thread in current milestones.
+    unsafe { f(&mut *DOOM_VIEW_PIXELS.0.get()) }
 }
 
 struct GfxState {
@@ -513,6 +600,7 @@ struct GfxState {
     damage_coalesced: u64,
     present_partial: u64,
     present_full: u64,
+    doom_window_open: bool,
     doom_view: DoomViewLayer,
 }
 
@@ -523,6 +611,10 @@ impl GfxState {
         let primary_h = min(290, info.height.saturating_sub(120)).max(180);
         let secondary_w = min(420, info.width.saturating_sub(110)).max(220);
         let secondary_h = min(210, info.height.saturating_sub(150)).max(140);
+        let doom_w = min(560, info.width.saturating_sub(120)).max(340);
+        let doom_h = min(420, info.height.saturating_sub(100)).max(260);
+        let doom_x = info.width.saturating_sub(doom_w) / 2;
+        let doom_y = info.height.saturating_sub(doom_h) / 2;
 
         let windows = [
             UiWindow::new(32, 56, primary_w, primary_h, "ARR0ST SHELL MIRROR"),
@@ -533,6 +625,7 @@ impl GfxState {
                 secondary_h,
                 "ARR0ST FILE MANAGER",
             ),
+            UiWindow::new(doom_x, doom_y, doom_w, doom_h, "ARR0ST DOOM"),
         ];
 
         Self {
@@ -570,24 +663,27 @@ impl GfxState {
             damage_coalesced: 0,
             present_partial: 0,
             present_full: 0,
+            doom_window_open: false,
             doom_view: DoomViewLayer::new(),
         }
     }
 
     fn seed_content(&mut self) {
-        self.windows[0].append_text("M9 desktop online.\n");
-        self.windows[0].append_text("Shell stdout is mirrored here.\n");
-        self.windows[0].append_text("Press TAB to switch focus.\n");
-        self.windows[0].append_text("Mouse left: focus + drag title bar.\n");
-        self.windows[0].append_text("Mouse right: drag window corner to resize.\n");
-        self.windows[0].append_text("Double click title bar to minimize/restore.\n");
-        self.windows[0]
+        self.windows[SHELL_WINDOW_INDEX].append_text("M9 desktop online.\n");
+        self.windows[SHELL_WINDOW_INDEX].append_text("Shell stdout is mirrored here.\n");
+        self.windows[SHELL_WINDOW_INDEX].append_text("Press TAB to switch focus.\n");
+        self.windows[SHELL_WINDOW_INDEX].append_text("Mouse left: focus + drag title bar.\n");
+        self.windows[SHELL_WINDOW_INDEX]
+            .append_text("Mouse right: drag window corner to resize.\n");
+        self.windows[SHELL_WINDOW_INDEX]
+            .append_text("Double click title bar to minimize/restore.\n");
+        self.windows[SHELL_WINDOW_INDEX]
             .append_text("Commands: ui | ui redraw | ui next | ui minimize | fm | doom play/key\n");
 
-        self.windows[1].append_text("fm list\n");
-        self.windows[1].append_text("fm open <file>\n");
-        self.windows[1].append_text("fm copy <src> <dst>\n");
-        self.windows[1].append_text("fm delete <file>\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm list\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm open <file>\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm copy <src> <dst>\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm delete <file>\n");
     }
 
     fn try_enable_backbuffer(&mut self) -> bool {
@@ -623,10 +719,12 @@ impl GfxState {
     }
 
     fn append_mirror_byte_damage(&mut self, byte: u8) -> Option<Rect> {
-        match self.windows[0].append_byte_with_change(byte) {
+        match self.windows[SHELL_WINDOW_INDEX].append_byte_with_change(byte) {
             TextChange::None => None,
-            TextChange::Cell { row, col } => Some(self.window_text_cell_rect(0, row, col)),
-            TextChange::FullText => Some(self.window_text_area_rect(0)),
+            TextChange::Cell { row, col } => {
+                Some(self.window_text_cell_rect(SHELL_WINDOW_INDEX, row, col))
+            }
+            TextChange::FullText => Some(self.window_text_area_rect(SHELL_WINDOW_INDEX)),
         }
     }
 
@@ -666,48 +764,133 @@ impl GfxState {
         }
     }
 
+    fn window_visible(&self, index: usize) -> bool {
+        if index >= WINDOW_COUNT {
+            return false;
+        }
+        if index == DOOM_WINDOW_INDEX {
+            return self.doom_window_open;
+        }
+        true
+    }
+
+    fn open_doom_window(&mut self) {
+        let was_open = self.doom_window_open;
+        self.doom_window_open = true;
+
+        let mut restored_from_minimized = false;
+        {
+            let window = &mut self.windows[DOOM_WINDOW_INDEX];
+            if window.minimized {
+                let max_w = self
+                    .info
+                    .width
+                    .saturating_sub(window.x)
+                    .saturating_sub(DESKTOP_MARGIN)
+                    .max(MIN_WINDOW_WIDTH);
+                let max_h = self
+                    .info
+                    .height
+                    .saturating_sub(window.y)
+                    .saturating_sub(DESKTOP_MARGIN)
+                    .max(MIN_WINDOW_HEIGHT);
+                window.w = window.saved_w.clamp(MIN_WINDOW_WIDTH, max_w);
+                window.h = window.saved_h.clamp(MIN_WINDOW_HEIGHT, max_h);
+                window.minimized = false;
+                window.recalc_text_grid();
+                restored_from_minimized = true;
+            }
+        }
+        let focused_changed = self.set_focus(DOOM_WINDOW_INDEX);
+        if !was_open || restored_from_minimized || focused_changed {
+            self.invalidate_window(DOOM_WINDOW_INDEX);
+        }
+    }
+
+    fn close_doom_window(&mut self) {
+        if !self.doom_window_open {
+            self.doom_view.clear();
+            return;
+        }
+        let previous = self.window_rect(DOOM_WINDOW_INDEX);
+        self.doom_view.clear();
+        self.doom_window_open = false;
+        if self.focused_window == DOOM_WINDOW_INDEX {
+            let previous_focus = self.focused_window;
+            self.focused_window = FILE_MANAGER_WINDOW_INDEX.min(WINDOW_COUNT - 1);
+            self.invalidate_window_chrome(previous_focus);
+            self.invalidate_window_chrome(self.focused_window);
+        }
+        if self.drag.active && self.drag.window_index == DOOM_WINDOW_INDEX {
+            self.drag = DragState::inactive();
+        }
+        if self.resize.active && self.resize.window_index == DOOM_WINDOW_INDEX {
+            self.resize = ResizeState::inactive();
+        }
+        self.invalidate_rect(previous);
+    }
+
     fn set_window_text(&mut self, index: usize, text: &str) {
         if index >= WINDOW_COUNT {
             return;
         }
         self.windows[index].clear_text();
         self.windows[index].append_text(text);
-        let rect = self.window_text_area_rect(index);
-        self.invalidate_rect(rect);
+        if self.window_visible(index) {
+            let rect = self.window_text_area_rect(index);
+            self.invalidate_rect(rect);
+        }
     }
 
-    fn set_doom_view(&mut self, width: usize, height: usize, pixels: &[u8], palette: &[[u8; 3]]) {
-        let window = self.windows[FILE_MANAGER_WINDOW_INDEX];
+    fn set_doom_view(&mut self, width: usize, height: usize, pixels: &[u32]) {
+        self.open_doom_window();
+        let window = self.windows[DOOM_WINDOW_INDEX];
         let previous_damage = if self.doom_view.active {
             self.doom_view_damage_rect(window)
         } else {
             None
         };
-        if self.doom_view.set(width, height, pixels, palette) {
+        if self.doom_view.set(width, height, pixels) {
             let next_damage = self.doom_view_damage_rect(window);
             match (previous_damage, next_damage) {
                 (Some(previous), Some(next)) => self.invalidate_rect(previous.union(next)),
                 (Some(previous), None) => self.invalidate_rect(previous),
                 (None, Some(next)) => self.invalidate_rect(next),
-                (None, None) => self.invalidate_window(FILE_MANAGER_WINDOW_INDEX),
+                (None, None) => self.invalidate_window(DOOM_WINDOW_INDEX),
             }
         }
     }
 
     fn clear_doom_view(&mut self) {
-        if self.doom_view.active {
-            let window = self.windows[FILE_MANAGER_WINDOW_INDEX];
+        self.close_doom_window();
+    }
+
+    fn set_doom_view_filter(&mut self, filter: DoomViewFilter) -> bool {
+        if !self.doom_view.set_filter(filter) {
+            return false;
+        }
+        if self.doom_window_open && self.doom_view.active {
+            let window = self.windows[DOOM_WINDOW_INDEX];
             let damage = self
                 .doom_view_damage_rect(window)
-                .unwrap_or_else(|| self.window_rect(FILE_MANAGER_WINDOW_INDEX));
-            self.doom_view.clear();
+                .unwrap_or_else(|| self.window_rect(DOOM_WINDOW_INDEX));
             self.invalidate_rect(damage);
         }
+        true
+    }
+
+    fn doom_view_filter(&self) -> DoomViewFilter {
+        self.doom_view.filter
     }
 
     fn focus_next_internal(&mut self) {
-        let next = (self.focused_window + 1) % WINDOW_COUNT;
-        let _ = self.set_focus(next);
+        for step in 1..=WINDOW_COUNT {
+            let next = (self.focused_window + step) % WINDOW_COUNT;
+            if self.window_visible(next) {
+                let _ = self.set_focus(next);
+                return;
+            }
+        }
     }
 
     fn handle_mouse(&mut self, event: mouse::MouseEvent) {
@@ -828,10 +1011,13 @@ impl GfxState {
     fn window_at(&self, x: usize, y: usize) -> Option<usize> {
         (0..WINDOW_COUNT)
             .rev()
-            .find(|&index| self.point_in_window(index, x, y))
+            .find(|&index| self.window_visible(index) && self.point_in_window(index, x, y))
     }
 
     fn point_in_window(&self, index: usize, x: usize, y: usize) -> bool {
+        if !self.window_visible(index) {
+            return false;
+        }
         let window = self.windows[index];
         let inside_x = x >= window.x && x < window.x.saturating_add(window.w);
         let inside_y = y >= window.y && y < window.y.saturating_add(window.h);
@@ -862,6 +1048,9 @@ impl GfxState {
     }
 
     fn set_focus(&mut self, index: usize) -> bool {
+        if !self.window_visible(index) {
+            return false;
+        }
         if self.focused_window == index {
             return false;
         }
@@ -1069,6 +1258,9 @@ impl GfxState {
     }
 
     fn invalidate_window(&mut self, index: usize) {
+        if !self.window_visible(index) {
+            return;
+        }
         self.invalidate_rect(self.window_rect(index));
     }
 
@@ -1077,6 +1269,9 @@ impl GfxState {
     }
 
     fn invalidate_window_chrome(&mut self, index: usize) {
+        if !self.window_visible(index) {
+            return;
+        }
         for rect in self.window_chrome_rects(index) {
             self.invalidate_rect(rect);
         }
@@ -1156,6 +1351,9 @@ impl GfxState {
         self.draw_top_bar();
 
         for index in 0..WINDOW_COUNT {
+            if !self.window_visible(index) {
+                continue;
+            }
             let focused = index == self.focused_window;
             self.draw_window(index, self.windows[index], focused);
         }
@@ -1204,8 +1402,14 @@ impl GfxState {
         let minimized_windows = self
             .windows
             .iter()
-            .filter(|window| window.minimized)
+            .enumerate()
+            .filter(|(index, window)| self.window_visible(*index) && window.minimized)
             .count();
+        let focused_minimized = self
+            .windows
+            .get(self.focused_window)
+            .map(|window| window.minimized)
+            .unwrap_or(false);
         GfxStatus {
             width: self.info.width,
             height: self.info.height,
@@ -1226,7 +1430,7 @@ impl GfxState {
             mouse_resize_steps: self.mouse_resize_steps,
             drag_active: self.drag.active,
             resize_active: self.resize.active,
-            focused_minimized: self.windows[self.focused_window].minimized,
+            focused_minimized,
             minimized_windows,
             mouse_minimize_toggles: self.mouse_minimize_toggles,
             partial_redraws: self.partial_redraws,
@@ -1245,6 +1449,9 @@ impl GfxState {
         self.draw_top_bar();
 
         for index in 0..WINDOW_COUNT {
+            if !self.window_visible(index) {
+                continue;
+            }
             let focused = index == self.focused_window;
             self.draw_window(index, self.windows[index], focused);
         }
@@ -1297,7 +1504,7 @@ impl GfxState {
         self.draw_text(
             10,
             8,
-            "ARR0ST M9 APPS | TERMINAL + FILE MANAGER | TAB/MOUSE FOCUS",
+            "ARR0ST M9 APPS | TERMINAL + FILE MANAGER + DOOM | TAB/MOUSE FOCUS",
             Color::rgb(230, 235, 242),
             Some(bar),
         );
@@ -1413,7 +1620,7 @@ impl GfxState {
             }
         }
 
-        if index == FILE_MANAGER_WINDOW_INDEX && self.doom_view.active {
+        if index == DOOM_WINDOW_INDEX && self.doom_view.active {
             self.draw_doom_view(window);
         }
 
@@ -1434,11 +1641,20 @@ impl GfxState {
             return None;
         }
 
-        let scale_x = body_w / self.doom_view.width;
-        let scale_y = body_h / self.doom_view.height;
-        let scale = min(scale_x, scale_y).max(1);
-        let draw_w = self.doom_view.width.saturating_mul(scale);
-        let draw_h = self.doom_view.height.saturating_mul(scale);
+        let src_w = self.doom_view.width as u64;
+        let src_h = self.doom_view.height as u64;
+        let body_w_u64 = body_w as u64;
+        let body_h_u64 = body_h as u64;
+        let (draw_w, draw_h) =
+            if body_w_u64.saturating_mul(src_h) <= body_h_u64.saturating_mul(src_w) {
+                let width = body_w.max(1);
+                let height = ((body_w_u64.saturating_mul(src_h) / src_w) as usize).max(1);
+                (width, height)
+            } else {
+                let height = body_h.max(1);
+                let width = ((body_h_u64.saturating_mul(src_w) / src_h) as usize).max(1);
+                (width, height)
+            };
         if draw_w == 0 || draw_h == 0 {
             return None;
         }
@@ -1467,7 +1683,11 @@ impl GfxState {
         let Some((draw_x, draw_y, draw_w, draw_h)) = self.doom_view_layout(window) else {
             return;
         };
-        let scale = (draw_w / self.doom_view.width).max(1);
+        let src_w = self.doom_view.width;
+        let src_h = self.doom_view.height;
+        if src_w == 0 || src_h == 0 {
+            return;
+        }
 
         let panel_color = Color::rgb(7, 12, 18);
         let border_color = Color::rgb(238, 181, 88);
@@ -1480,22 +1700,83 @@ impl GfxState {
         );
         self.fill_rect(draw_x, draw_y, draw_w, draw_h, panel_color);
 
-        for source_y in 0..self.doom_view.height {
-            for source_x in 0..self.doom_view.width {
-                let source_index = source_y
-                    .saturating_mul(self.doom_view.width)
-                    .saturating_add(source_x);
-                let palette_index = self.doom_view.pixels[source_index] as usize;
-                let rgb = self.doom_view.palette[palette_index % DOOM_VIEW_PALETTE_LEN];
-                self.fill_rect(
-                    draw_x.saturating_add(source_x.saturating_mul(scale)),
-                    draw_y.saturating_add(source_y.saturating_mul(scale)),
-                    scale,
-                    scale,
-                    Color::rgb(rgb[0], rgb[1], rgb[2]),
-                );
+        with_doom_view_pixels(|pixels| {
+            if draw_w == src_w && draw_h == src_h {
+                for y in 0..src_h {
+                    for x in 0..src_w {
+                        let source =
+                            pixels[y.saturating_mul(src_w).saturating_add(x)] & 0x00FF_FFFF;
+                        self.write_pixel(
+                            draw_x.saturating_add(x),
+                            draw_y.saturating_add(y),
+                            color_from_rgb24(source),
+                        );
+                    }
+                }
+            } else {
+                let src_w_last = src_w.saturating_sub(1);
+                let src_h_last = src_h.saturating_sub(1);
+                let draw_w_den = draw_w.saturating_sub(1).max(1) as u64;
+                let draw_h_den = draw_h.saturating_sub(1).max(1) as u64;
+                let step_x_fp =
+                    ((src_w_last as u64).saturating_mul(1u64 << 16) / draw_w_den) as u32;
+                let step_y_fp =
+                    ((src_h_last as u64).saturating_mul(1u64 << 16) / draw_h_den) as u32;
+                let x_last_fp = (src_w_last as u32).saturating_mul(1u32 << 16);
+                let y_last_fp = (src_h_last as u32).saturating_mul(1u32 << 16);
+                let mut sy_fp = 0u32;
+                if self.doom_view.filter == DoomViewFilter::Nearest {
+                    for y in 0..draw_h {
+                        let sy_cur = if y + 1 == draw_h { y_last_fp } else { sy_fp };
+                        let sy = (((sy_cur as u64).saturating_add(1u64 << 15)) >> 16) as usize;
+                        let row = sy.min(src_h_last).saturating_mul(src_w);
+                        let mut sx_fp = 0u32;
+                        for x in 0..draw_w {
+                            let sx_cur = if x + 1 == draw_w { x_last_fp } else { sx_fp };
+                            let sx = (((sx_cur as u64).saturating_add(1u64 << 15)) >> 16) as usize;
+                            let source =
+                                pixels[row.saturating_add(sx.min(src_w_last))] & 0x00FF_FFFF;
+                            self.write_pixel(
+                                draw_x.saturating_add(x),
+                                draw_y.saturating_add(y),
+                                color_from_rgb24(source),
+                            );
+                            sx_fp = sx_fp.saturating_add(step_x_fp);
+                        }
+                        sy_fp = sy_fp.saturating_add(step_y_fp);
+                    }
+                } else {
+                    for y in 0..draw_h {
+                        let sy_cur = if y + 1 == draw_h { y_last_fp } else { sy_fp };
+                        let y0 = ((sy_cur >> 16) as usize).min(src_h_last);
+                        let y1 = (y0 + 1).min(src_h_last);
+                        let wy = sy_cur & 0xFFFF;
+                        let row0 = y0.saturating_mul(src_w);
+                        let row1 = y1.saturating_mul(src_w);
+                        let mut sx_fp = 0u32;
+                        for x in 0..draw_w {
+                            let sx_cur = if x + 1 == draw_w { x_last_fp } else { sx_fp };
+                            let x0 = ((sx_cur >> 16) as usize).min(src_w_last);
+                            let x1 = (x0 + 1).min(src_w_last);
+                            let wx = sx_cur & 0xFFFF;
+
+                            let c00 = pixels[row0.saturating_add(x0)] & 0x00FF_FFFF;
+                            let c10 = pixels[row0.saturating_add(x1)] & 0x00FF_FFFF;
+                            let c01 = pixels[row1.saturating_add(x0)] & 0x00FF_FFFF;
+                            let c11 = pixels[row1.saturating_add(x1)] & 0x00FF_FFFF;
+
+                            self.write_pixel(
+                                draw_x.saturating_add(x),
+                                draw_y.saturating_add(y),
+                                bilinear_rgb24(c00, c10, c01, c11, wx, wy),
+                            );
+                            sx_fp = sx_fp.saturating_add(step_x_fp);
+                        }
+                        sy_fp = sy_fp.saturating_add(step_y_fp);
+                    }
+                }
             }
-        }
+        });
 
         self.draw_text(
             draw_x,
@@ -1796,20 +2077,56 @@ pub fn on_input_byte(byte: u8) {
 
 pub fn set_file_manager_text(text: &str) {
     let _ = with_state_mut(|state| {
-        state.set_window_text(1, text);
+        state.set_window_text(FILE_MANAGER_WINDOW_INDEX, text);
         if state.damage_len > 0 {
             state.flush_damage();
         }
     });
 }
 
-pub fn set_file_manager_doom_view(width: usize, height: usize, pixels: &[u8], palette: &[[u8; 3]]) {
+pub fn set_doom_window_text(text: &str) {
     let _ = with_state_mut(|state| {
-        state.set_doom_view(width, height, pixels, palette);
+        state.open_doom_window();
+        state.set_window_text(DOOM_WINDOW_INDEX, text);
         if state.damage_len > 0 {
             state.flush_damage();
         }
     });
+}
+
+pub fn set_file_manager_doom_overlay(text: &str, width: usize, height: usize, pixels: &[u32]) {
+    let _ = with_state_mut(|state| {
+        state.open_doom_window();
+        state.set_window_text(DOOM_WINDOW_INDEX, text);
+        state.set_doom_view(width, height, pixels);
+        if state.damage_len > 0 {
+            state.flush_damage();
+        }
+    });
+}
+
+pub fn set_file_manager_doom_view(width: usize, height: usize, pixels: &[u32]) {
+    let _ = with_state_mut(|state| {
+        state.set_doom_view(width, height, pixels);
+        if state.damage_len > 0 {
+            state.flush_damage();
+        }
+    });
+}
+
+pub fn set_file_manager_doom_filter(filter: DoomViewFilter) -> bool {
+    with_state_mut(|state| {
+        let changed = state.set_doom_view_filter(filter);
+        if state.damage_len > 0 {
+            state.flush_damage();
+        }
+        changed
+    })
+    .unwrap_or(false)
+}
+
+pub fn file_manager_doom_filter() -> DoomViewFilter {
+    with_state_mut(|state| state.doom_view_filter()).unwrap_or(DoomViewFilter::Bilinear)
 }
 
 pub fn clear_file_manager_doom_view() {

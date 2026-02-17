@@ -12,16 +12,18 @@ ArrOSt uses a framebuffer compositor that keeps serial diagnostics as the primar
 - Windowed text interface with at least:
   - shell window
   - file-manager window
+  - doom window (shown on demand by `doom play` / `doom ui`)
 - Focus, redraw, and minimize controls via shell commands
 - Damage-region tracking to avoid full-screen redraws when possible
 
 ## Doom viewport integration
 
-When Doom runtime is active, the file-manager body is reused as a Doom viewport:
+When Doom runtime is active, a dedicated Doom window is opened for viewport + status:
 
-- color-quantized bridge output
-- bounded viewport scaling
+- true-color (RGB) bridge output
+- aspect-ratio fit with runtime-selectable filter (`nearest` default, `bilinear` optional)
 - damage-limited redraw to improve runtime pacing
+- viewport pixels can be refreshed independently from status text updates to reduce redraw load
 
 ## User-visible commands
 

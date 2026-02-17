@@ -155,7 +155,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -215,11 +215,7 @@ fn map_doom_capture_key(code: keyboard::KeyCode) -> Option<u8> {
         keyboard::KeyCode::ArrowDown => Some(b's'),
         keyboard::KeyCode::ArrowLeft => Some(b'a'),
         keyboard::KeyCode::ArrowRight => Some(b'd'),
-        keyboard::KeyCode::Byte(byte) => match byte {
-            0x08 => None,
-            b'\r' => Some(b'\n'),
-            _ => Some(byte),
-        },
+        keyboard::KeyCode::Byte(byte) => Some(byte),
     }
 }
 
@@ -230,10 +226,6 @@ fn doom_capture_enabled() -> bool {
 }
 
 fn process_byte(byte: u8) {
-    if byte == b'\t' {
-        gfx::on_input_byte(byte);
-    }
-
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
     if shell.doom_capture {
@@ -245,11 +237,11 @@ fn process_byte(byte: u8) {
             print_prompt();
             return;
         }
-        if byte == b'\n' || byte == b'\r' || byte == 0x7f {
-            return;
-        }
         shell.refresh_serial_capture_key(byte, time::ticks());
         return;
+    }
+    if byte == b'\t' {
+        gfx::on_input_byte(byte);
     }
 
     match byte {
@@ -362,6 +354,13 @@ fn run_command(shell: &mut ShellState) {
         serial::write_fmt(format_args!(
             "doom: capture={}\n",
             if doom::capture_enabled() { "on" } else { "off" }
+        ));
+        return;
+    }
+    if input == "doom view" {
+        serial::write_fmt(format_args!(
+            "doom: viewport filter={} (usage: doom view <bilinear|nearest>)\n",
+            gfx::file_manager_doom_filter().as_str()
         ));
         return;
     }
@@ -499,6 +498,26 @@ fn run_command(shell: &mut ShellState) {
         }
         return;
     }
+    if let Some(rest) = input.strip_prefix("doom view ") {
+        let mode = rest.trim();
+        let changed = match mode {
+            "bilinear" | "smooth" => {
+                gfx::set_file_manager_doom_filter(gfx::DoomViewFilter::Bilinear)
+            }
+            "nearest" | "fast" => gfx::set_file_manager_doom_filter(gfx::DoomViewFilter::Nearest),
+            _ => {
+                serial::write_line("usage: doom view <bilinear|nearest>");
+                return;
+            }
+        };
+        serial::write_fmt(format_args!(
+            "doom: viewport filter={}{}\n",
+            gfx::file_manager_doom_filter().as_str(),
+            if changed { "" } else { " (unchanged)" }
+        ));
+        doom::render_ui_status();
+        return;
+    }
     if handle_file_manager_command(input) {
         return;
     }
@@ -506,7 +525,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|pcspk|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
+                "help: help | version | ticks | uptime | user | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|pcspk|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
             );
         }
         "version" => {
@@ -591,7 +610,7 @@ fn run_command(shell: &mut ShellState) {
         }
         "doom ui" => {
             doom::render_ui_status();
-            serial::write_line("doom: ui status pushed to file-manager window");
+            serial::write_line("doom: ui status pushed to doom window");
         }
         "doom reset" => {
             doom::reset(time::ticks());
@@ -642,7 +661,7 @@ fn run_command(shell: &mut ShellState) {
 fn log_doom_audio_status() {
     let status = audio::status();
     serial::write_fmt(format_args!(
-        "doom: audio mode={} backend={} active={} hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x}\n",
+        "doom: audio mode={} backend={} active={} hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_buf={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x}\n",
         status.mode.as_str(),
         status.pcm_backend,
         status.active,
@@ -653,6 +672,7 @@ fn log_doom_audio_status() {
         status.pcm_hz_min,
         status.pcm_hz_max,
         status.pcm_queue_pending,
+        status.pcm_buffered_frames,
         status.pcm_packets_submitted,
         status.pcm_packets_completed,
         status.pcm_packets_dropped,

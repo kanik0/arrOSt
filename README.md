@@ -51,6 +51,7 @@ The project focuses on practical kernel engineering with observable behavior, re
 - `doom play` starts DoomGeneric when sources and WAD are available.
 - Frame output is rendered into the file-manager viewport.
 - Runtime input supports shell injection (`doom key`/`doom keyup`) and capture mode.
+- Viewport filter can be switched at runtime (`doom view bilinear|nearest`, default `nearest`).
 - Minimal `/arr.cfg` persistence is wired through the Doom shim.
 - PCM pipeline is active with runtime metrics (`doom status`, `doom audio status`).
 - Virtio audio long-run smoke checks are available and enforced.
@@ -97,10 +98,19 @@ cargo xtask run
 Useful environment overrides:
 
 - `QEMU_DISPLAY=none|cocoa|gtk|sdl`
+- `QEMU_ACCEL=auto|none|hvf|kvm|whpx|tcg`
+- `QEMU_CPU=auto|host|qemu64|...`
+- `QEMU_SMP=auto|<cores>`
 - `QEMU_AUDIO=auto|none|coreaudio|wav`
 - `QEMU_AUDIO_WAV_PATH=/tmp/arrost.wav`
 - `QEMU_VIRTIO_SND=on|off`
 - `QEMU_PCSPK=auto|on|off`
+
+Suggested Doom performance profile (host-dependent):
+
+```bash
+QEMU_ACCEL=auto QEMU_CPU=auto QEMU_SMP=auto cargo xtask run
+```
 
 ### Doom prerequisites
 

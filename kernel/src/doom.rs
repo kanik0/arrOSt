@@ -12,26 +12,6 @@ const DOOM_APP: &str = match option_env!("ARROST_DOOM_APP") {
     Some(value) => value,
     None => "doom",
 };
-const DOOM_ARTIFACT_HINT: &str = match option_env!("ARROST_DOOM_ARTIFACT_HINT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_ARTIFACT_SIZE: &str = match option_env!("ARROST_DOOM_ARTIFACT_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_C_BACKEND_OBJECT: &str = match option_env!("ARROST_DOOM_C_BACKEND_OBJECT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_C_BACKEND_SIZE: &str = match option_env!("ARROST_DOOM_C_BACKEND_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_C_BACKEND_READY: &str = match option_env!("ARROST_DOOM_C_BACKEND_READY") {
-    Some(value) => value,
-    None => "false",
-};
 const DOOM_GENERIC_READY: &str = match option_env!("ARROST_DOOM_GENERIC_READY") {
     Some(value) => value,
     None => "false",
@@ -83,7 +63,8 @@ const PLAY_RATE_DEN: u64 = time::PIT_HZ as u64;
 const PLAY_AUDIO_OUTPUT_HZ: u64 = 44_100;
 const PLAY_AUDIO_DRAIN_PER_FRAME: u64 = PLAY_AUDIO_OUTPUT_HZ / PLAY_RATE_NUM;
 const PLAY_MAX_STEPS_PER_POLL: u64 = 6;
-const PLAY_UI_STEP_TICKS: u64 = 16;
+const PLAY_VIEW_STEP_TICKS: u64 = 4;
+const PLAY_STATUS_STEP_TICKS: u64 = 20;
 const AUDIO_STEP_TICKS: u64 = 5;
 const PHYSICS_STEP_TICKS: u64 = 2;
 const UI_STEP_TICKS: u64 = FRAME_STEP_TICKS;
@@ -92,7 +73,24 @@ const VIEW_H: usize = 6;
 const VIEWPORT_W: usize = doom_bridge::VIEWPORT_W;
 const VIEWPORT_H: usize = doom_bridge::VIEWPORT_H;
 const VIEWPORT_PIXELS: usize = VIEWPORT_W * VIEWPORT_H;
-const VIEWPORT_PALETTE: [[u8; 3]; 16] = doom_bridge::VIEWPORT_PALETTE;
+const FALLBACK_VIEWPORT_PALETTE: [[u8; 3]; 16] = [
+    [5, 8, 12],      // 0 background
+    [16, 24, 36],    // 1 ceiling dark
+    [24, 34, 50],    // 2 ceiling mid
+    [34, 48, 70],    // 3 ceiling light
+    [25, 18, 14],    // 4 floor dark
+    [41, 30, 24],    // 5 floor mid
+    [63, 45, 34],    // 6 floor light
+    [78, 56, 42],    // 7 floor high
+    [182, 136, 82],  // 8 border
+    [124, 88, 54],   // 9 wall accent
+    [200, 82, 66],   // 10 enemy
+    [248, 204, 96],  // 11 projectile
+    [110, 188, 104], // 12 player
+    [255, 236, 168], // 13 spark
+    [141, 208, 218], // 14 velocity guide
+    [238, 248, 255], // 15 HUD/text mark
+];
 const VIEW_MIN_X: i16 = 1;
 const VIEW_MIN_Y: i16 = 1;
 const VIEW_MAX_X: i16 = (VIEW_W as i16) - 2;
@@ -129,14 +127,7 @@ pub enum PlayStart {
 pub struct DoomStatus {
     pub app: &'static str,
     pub engine: &'static str,
-    pub rust_artifact: &'static str,
-    pub rust_artifact_size: &'static str,
-    pub c_backend: &'static str,
-    pub c_backend_size: &'static str,
-    pub c_ready: &'static str,
     pub doomgeneric_ready: &'static str,
-    pub doomgeneric_core_ready: &'static str,
-    pub doomgeneric_port_ready: &'static str,
     pub wad_present: &'static str,
     pub running: bool,
     pub play_mode: bool,
@@ -184,6 +175,7 @@ struct DoomState {
     runtime_ticks: u64,
     frame_remainder: u64,
     play_rate_accumulator: u64,
+    play_view_remainder: u64,
     audio_remainder: u64,
     physics_remainder: u64,
     ui_remainder: u64,
@@ -222,6 +214,8 @@ struct DoomState {
     mouse_turn_threshold: i16,
     mouse_move_threshold: i16,
     mouse_y_enabled: bool,
+    viewport_rgb: [u32; VIEWPORT_PIXELS],
+    fallback_indexed: [u8; VIEWPORT_PIXELS],
 }
 
 impl DoomState {
@@ -234,6 +228,7 @@ impl DoomState {
             runtime_ticks: 0,
             frame_remainder: 0,
             play_rate_accumulator: 0,
+            play_view_remainder: 0,
             audio_remainder: 0,
             physics_remainder: 0,
             ui_remainder: 0,
@@ -272,6 +267,8 @@ impl DoomState {
             mouse_turn_threshold: DEFAULT_MOUSE_TURN_THRESHOLD,
             mouse_move_threshold: DEFAULT_MOUSE_MOVE_THRESHOLD,
             mouse_y_enabled: false,
+            viewport_rgb: [0; VIEWPORT_PIXELS],
+            fallback_indexed: [0; VIEWPORT_PIXELS],
         }
     }
 
@@ -282,6 +279,7 @@ impl DoomState {
         self.runtime_ticks = 0;
         self.frame_remainder = 0;
         self.play_rate_accumulator = 0;
+        self.play_view_remainder = 0;
         self.audio_remainder = 0;
         self.physics_remainder = 0;
         self.ui_remainder = 0;
@@ -315,6 +313,8 @@ impl DoomState {
         self.mouse_right_button = false;
         self.mouse_motion_x_acc = 0;
         self.mouse_motion_y_acc = 0;
+        self.viewport_rgb = [0; VIEWPORT_PIXELS];
+        self.fallback_indexed = [0; VIEWPORT_PIXELS];
         doom_bridge::reset();
     }
 
@@ -361,15 +361,27 @@ impl DoomState {
             self.audio_mixes = self.audio_mixes.saturating_add(frame_steps / 2);
             self.sync_bridge_stats();
 
-            let ui_acc = self.ui_remainder.saturating_add(delta);
-            let should_render = ui_acc >= PLAY_UI_STEP_TICKS;
-            self.ui_remainder = if should_render {
-                ui_acc % PLAY_UI_STEP_TICKS
+            let view_acc = self.play_view_remainder.saturating_add(delta);
+            let should_render_view = view_acc >= PLAY_VIEW_STEP_TICKS;
+            self.play_view_remainder = if should_render_view {
+                view_acc % PLAY_VIEW_STEP_TICKS
             } else {
-                ui_acc
+                view_acc
             };
-            if should_render {
+            let status_acc = self.ui_remainder.saturating_add(delta);
+            let should_render_status = status_acc >= PLAY_STATUS_STEP_TICKS;
+            self.ui_remainder = if should_render_status {
+                status_acc % PLAY_STATUS_STEP_TICKS
+            } else {
+                status_acc
+            };
+
+            if should_render_view && should_render_status {
                 self.render_ui_status_locked();
+            } else if should_render_view {
+                self.render_viewport_locked();
+            } else if should_render_status {
+                self.render_status_text_locked();
             }
             return;
         }
@@ -442,9 +454,7 @@ impl DoomState {
     }
 
     fn enemy_position(&self) -> (i16, i16) {
-        let ex = 1 + ((self.frames as usize / 6) % (VIEW_W - 2));
-        let ey = 1 + ((self.audio_mixes as usize / 7) % (VIEW_H - 2));
-        (ex as i16, ey as i16)
+        Self::enemy_position_for(self.frames, self.audio_mixes)
     }
 
     fn register_input(&mut self, byte: u8) -> bool {
@@ -606,8 +616,7 @@ impl DoomState {
         }
     }
 
-    fn render_ui_status_locked(&mut self) {
-        self.ui_updates = self.ui_updates.saturating_add(1);
+    fn status_text(&self) -> String {
         let snapshot = self.status();
         let mut text = String::new();
         let _ = writeln!(text, "DOOM RUNTIME M10.6");
@@ -666,19 +675,56 @@ impl DoomState {
             snapshot.dg_has_frame,
             snapshot.play_pace_clamps
         );
-        let _ = writeln!(text, "view: {}x{} indexed color", VIEWPORT_W, VIEWPORT_H);
+        let _ = writeln!(
+            text,
+            "view: {}x{} rgb filter:{}",
+            VIEWPORT_W,
+            VIEWPORT_H,
+            gfx::file_manager_doom_filter().as_str()
+        );
         let _ = writeln!(text, "controls: doom play|run, doom key <dir>, doom reset");
-        gfx::set_file_manager_text(&text);
-
-        let mut pixels = [0u8; VIEWPORT_PIXELS];
-        let has_bridge_frame = self.play_mode && doom_bridge::copy_pixels(&mut pixels);
-        if !has_bridge_frame {
-            self.render_viewport_pixels(&mut pixels);
-        }
-        gfx::set_file_manager_doom_view(VIEWPORT_W, VIEWPORT_H, &pixels, &VIEWPORT_PALETTE);
+        text
     }
 
-    fn render_viewport_pixels(&self, pixels: &mut [u8; VIEWPORT_PIXELS]) {
+    fn refresh_viewport_rgb(&mut self) {
+        let has_bridge_frame = self.play_mode && doom_bridge::copy_pixels(&mut self.viewport_rgb);
+        if !has_bridge_frame {
+            self.render_viewport_pixels();
+            self.convert_fallback_view_to_rgb();
+        }
+    }
+
+    fn render_viewport_locked(&mut self) {
+        self.ui_updates = self.ui_updates.saturating_add(1);
+        self.refresh_viewport_rgb();
+        gfx::set_file_manager_doom_view(VIEWPORT_W, VIEWPORT_H, &self.viewport_rgb);
+    }
+
+    fn render_status_text_locked(&mut self) {
+        self.ui_updates = self.ui_updates.saturating_add(1);
+        let text = self.status_text();
+        gfx::set_doom_window_text(&text);
+    }
+
+    fn render_ui_status_locked(&mut self) {
+        self.ui_updates = self.ui_updates.saturating_add(1);
+        let text = self.status_text();
+        self.refresh_viewport_rgb();
+        gfx::set_file_manager_doom_overlay(&text, VIEWPORT_W, VIEWPORT_H, &self.viewport_rgb);
+    }
+
+    fn render_viewport_pixels(&mut self) {
+        let runtime_ticks = self.runtime_ticks;
+        let frames = self.frames;
+        let audio_mixes = self.audio_mixes;
+        let player_x = self.player_x;
+        let player_y = self.player_y;
+        let velocity_x = self.velocity_x;
+        let velocity_y = self.velocity_y;
+        let collisions = self.collisions;
+        let (enemy_x, enemy_y) = Self::enemy_position_for(frames, audio_mixes);
+        let pixels = &mut self.fallback_indexed;
+
         let horizon = VIEWPORT_H / 2;
         for y in 0..VIEWPORT_H {
             for x in 0..VIEWPORT_W {
@@ -695,58 +741,56 @@ impl DoomState {
         }
 
         for x in 0..VIEWPORT_W {
-            self.put_pixel(pixels, x as i32, 0, 8);
-            self.put_pixel(pixels, x as i32, (VIEWPORT_H - 1) as i32, 8);
+            Self::put_pixel(pixels, x as i32, 0, 8);
+            Self::put_pixel(pixels, x as i32, (VIEWPORT_H - 1) as i32, 8);
         }
         for y in 0..VIEWPORT_H {
-            self.put_pixel(pixels, 0, y as i32, 8);
-            self.put_pixel(pixels, (VIEWPORT_W - 1) as i32, y as i32, 8);
+            Self::put_pixel(pixels, 0, y as i32, 8);
+            Self::put_pixel(pixels, (VIEWPORT_W - 1) as i32, y as i32, 8);
         }
 
-        let wall_phase =
-            ((self.runtime_ticks / 3) as usize) % (VIEWPORT_W.saturating_sub(8).max(1));
+        let wall_phase = ((runtime_ticks / 3) as usize) % (VIEWPORT_W.saturating_sub(8).max(1));
         let wall_x = wall_phase.saturating_add(4) as i32;
         for y in 4..(VIEWPORT_H.saturating_sub(4)) {
-            self.put_pixel(pixels, wall_x, y as i32, 9);
+            Self::put_pixel(pixels, wall_x, y as i32, 9);
         }
 
-        let (enemy_x, enemy_y) = self.enemy_position();
-        let enemy_px = self.map_axis(
+        let enemy_px = Self::map_axis(
             enemy_x,
             VIEW_MIN_X,
             VIEW_MAX_X,
             3,
             VIEWPORT_W.saturating_sub(4),
         );
-        let enemy_py = self.map_axis(
+        let enemy_py = Self::map_axis(
             enemy_y,
             VIEW_MIN_Y,
             VIEW_MAX_Y,
             3,
             VIEWPORT_H.saturating_sub(4),
         );
-        self.draw_disc(pixels, enemy_px as i32, enemy_py as i32, 2, 10);
+        Self::draw_disc(pixels, enemy_px as i32, enemy_py as i32, 2, 10);
 
-        let player_px = self.map_axis(
-            self.player_x,
+        let player_px = Self::map_axis(
+            player_x,
             VIEW_MIN_X,
             VIEW_MAX_X,
             3,
             VIEWPORT_W.saturating_sub(4),
         );
-        let player_py = self.map_axis(
-            self.player_y,
+        let player_py = Self::map_axis(
+            player_y,
             VIEW_MIN_Y,
             VIEW_MAX_Y,
             3,
             VIEWPORT_H.saturating_sub(4),
         );
-        self.draw_cross(pixels, player_px as i32, player_py as i32, 2, 12);
+        Self::draw_cross(pixels, player_px as i32, player_py as i32, 2, 12);
 
-        let velocity_x = self.velocity_x.signum() as i32;
-        let velocity_y = self.velocity_y.signum() as i32;
+        let velocity_x = velocity_x.signum() as i32;
+        let velocity_y = velocity_y.signum() as i32;
         if velocity_x != 0 || velocity_y != 0 {
-            self.draw_line(
+            Self::draw_line(
                 pixels,
                 player_px as i32,
                 player_py as i32,
@@ -754,7 +798,7 @@ impl DoomState {
                 player_py as i32 + velocity_y * 7,
                 14,
             );
-            self.put_pixel(
+            Self::put_pixel(
                 pixels,
                 player_px as i32 + velocity_x * 8,
                 player_py as i32 + velocity_y * 8,
@@ -762,25 +806,18 @@ impl DoomState {
             );
         }
 
-        if self.collisions > 0 && (self.collisions + self.frames).is_multiple_of(2) {
-            self.draw_disc(pixels, enemy_px as i32, enemy_py as i32, 3, 13);
+        if collisions > 0 && (collisions + frames).is_multiple_of(2) {
+            Self::draw_disc(pixels, enemy_px as i32, enemy_py as i32, 3, 13);
         }
 
         let center_x = (VIEWPORT_W / 2) as i32;
         let center_y = (VIEWPORT_H / 2) as i32;
-        self.put_pixel(pixels, center_x, center_y, 15);
-        self.put_pixel(pixels, center_x - 1, center_y, 15);
-        self.put_pixel(pixels, center_x + 1, center_y, 15);
+        Self::put_pixel(pixels, center_x, center_y, 15);
+        Self::put_pixel(pixels, center_x - 1, center_y, 15);
+        Self::put_pixel(pixels, center_x + 1, center_y, 15);
     }
 
-    fn map_axis(
-        &self,
-        value: i16,
-        in_min: i16,
-        in_max: i16,
-        out_min: usize,
-        out_max: usize,
-    ) -> usize {
+    fn map_axis(value: i16, in_min: i16, in_max: i16, out_min: usize, out_max: usize) -> usize {
         if out_min >= out_max || in_min >= in_max {
             return out_min;
         }
@@ -791,7 +828,7 @@ impl DoomState {
         (out_min as i32 + (normalized * out_span) / in_span) as usize
     }
 
-    fn put_pixel(&self, pixels: &mut [u8; VIEWPORT_PIXELS], x: i32, y: i32, color: u8) {
+    fn put_pixel(pixels: &mut [u8; VIEWPORT_PIXELS], x: i32, y: i32, color: u8) {
         if x < 0 || y < 0 || x >= VIEWPORT_W as i32 || y >= VIEWPORT_H as i32 {
             return;
         }
@@ -801,41 +838,26 @@ impl DoomState {
         pixels[index] = color;
     }
 
-    fn draw_disc(
-        &self,
-        pixels: &mut [u8; VIEWPORT_PIXELS],
-        cx: i32,
-        cy: i32,
-        radius: i32,
-        color: u8,
-    ) {
+    fn draw_disc(pixels: &mut [u8; VIEWPORT_PIXELS], cx: i32, cy: i32, radius: i32, color: u8) {
         let radius_sq = radius.saturating_mul(radius);
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let distance = x.saturating_mul(x).saturating_add(y.saturating_mul(y));
                 if distance <= radius_sq {
-                    self.put_pixel(pixels, cx + x, cy + y, color);
+                    Self::put_pixel(pixels, cx + x, cy + y, color);
                 }
             }
         }
     }
 
-    fn draw_cross(
-        &self,
-        pixels: &mut [u8; VIEWPORT_PIXELS],
-        cx: i32,
-        cy: i32,
-        radius: i32,
-        color: u8,
-    ) {
+    fn draw_cross(pixels: &mut [u8; VIEWPORT_PIXELS], cx: i32, cy: i32, radius: i32, color: u8) {
         for step in -radius..=radius {
-            self.put_pixel(pixels, cx + step, cy, color);
-            self.put_pixel(pixels, cx, cy + step, color);
+            Self::put_pixel(pixels, cx + step, cy, color);
+            Self::put_pixel(pixels, cx, cy + step, color);
         }
     }
 
     fn draw_line(
-        &self,
         pixels: &mut [u8; VIEWPORT_PIXELS],
         mut x0: i32,
         mut y0: i32,
@@ -850,7 +872,7 @@ impl DoomState {
         let mut error = dx + dy;
 
         loop {
-            self.put_pixel(pixels, x0, y0, color);
+            Self::put_pixel(pixels, x0, y0, color);
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -867,6 +889,21 @@ impl DoomState {
         }
     }
 
+    fn enemy_position_for(frames: u64, audio_mixes: u64) -> (i16, i16) {
+        let ex = 1 + ((frames as usize / 6) % (VIEW_W - 2));
+        let ey = 1 + ((audio_mixes as usize / 7) % (VIEW_H - 2));
+        (ex as i16, ey as i16)
+    }
+
+    fn convert_fallback_view_to_rgb(&mut self) {
+        for (index, rgb) in self.viewport_rgb.iter_mut().enumerate() {
+            let palette_index =
+                (self.fallback_indexed[index] as usize) % FALLBACK_VIEWPORT_PALETTE.len();
+            let color = FALLBACK_VIEWPORT_PALETTE[palette_index];
+            *rgb = ((color[0] as u32) << 16) | ((color[1] as u32) << 8) | (color[2] as u32);
+        }
+    }
+
     fn status(&self) -> DoomStatus {
         DoomStatus {
             app: DOOM_APP,
@@ -875,14 +912,7 @@ impl DoomState {
             } else {
                 "fallback-sim"
             },
-            rust_artifact: DOOM_ARTIFACT_HINT,
-            rust_artifact_size: DOOM_ARTIFACT_SIZE,
-            c_backend: DOOM_C_BACKEND_OBJECT,
-            c_backend_size: DOOM_C_BACKEND_SIZE,
-            c_ready: DOOM_C_BACKEND_READY,
             doomgeneric_ready: DOOM_GENERIC_READY,
-            doomgeneric_core_ready: DOOM_GENERIC_CORE_READY,
-            doomgeneric_port_ready: DOOM_GENERIC_PORT_READY,
             wad_present: DOOM_WAD_PRESENT,
             running: self.running,
             play_mode: self.play_mode,
@@ -1065,17 +1095,9 @@ pub fn log_status() {
     let status = status();
     let pcm = audio::status();
     serial::write_fmt(format_args!(
-        "doom: app={} engine={} rust_artifact={} ({} bytes) c_backend={} ({} bytes) c_ready={} doomgeneric={} core_ready={} port_ready={} bridge={} running={} play_mode={} capture={} started_tick={} runtime_ticks={} frames={} audio_mixes={} key_events={} mouse_events={} mouse_cfg=(turn:{} move:{} y:{}) inputs={} collisions={} pos=({}, {}) vel=({}, {}) wad_present={} shell_cmds={} ui_updates={} dg_frames={} dg_draw={} dg_nonzero={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_frame={} dg_pace={} pcm_mode={} pcm_backend={} pcm_active={} pcm_hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x} last_key={:#04x}\n",
+        "doom: app={} engine={} bridge={} running={} play_mode={} capture={} started_tick={} runtime_ticks={} frames={} audio_mixes={} key_events={} mouse_events={} mouse_cfg=(turn:{} move:{} y:{}) inputs={} collisions={} pos=({}, {}) vel=({}, {}) wad_present={} shell_cmds={} ui_updates={} dg_frames={} dg_draw={} dg_nonzero={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_frame={} dg_pace={} pcm_mode={} pcm_backend={} pcm_active={} pcm_hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_buf={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x} last_key={:#04x}\n",
         status.app,
         status.engine,
-        status.rust_artifact,
-        status.rust_artifact_size,
-        status.c_backend,
-        status.c_backend_size,
-        status.c_ready,
-        status.doomgeneric_ready,
-        status.doomgeneric_core_ready,
-        status.doomgeneric_port_ready,
         status.dg_bridge,
         status.running,
         status.play_mode,
@@ -1122,6 +1144,7 @@ pub fn log_status() {
         pcm.pcm_hz_min,
         pcm.pcm_hz_max,
         pcm.pcm_queue_pending,
+        pcm.pcm_buffered_frames,
         pcm.pcm_packets_submitted,
         pcm.pcm_packets_completed,
         pcm.pcm_packets_dropped,

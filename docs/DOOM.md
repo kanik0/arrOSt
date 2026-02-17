@@ -31,7 +31,7 @@ Then kernel build embeds Doom metadata and readiness flags.
 
 1. Starts Doom runtime in DoomGeneric mode when ready.
 2. Enables capture mode when supported.
-3. Renders Doom frames into the file-manager viewport.
+3. Opens a dedicated Doom compositor window and renders Doom frames there.
 4. Routes keyboard/capture input to Doom key queue.
 5. Routes PCM output into ArrOSt audio backend.
 
@@ -42,7 +42,12 @@ If DoomGeneric is not ready, ArrOSt falls back to an explicit fallback runtime p
 ### Rendering
 
 - Doom frame conversion and viewport update are active.
+- Bridge output uses a 320x200 RGB framebuffer path (no 16-color quantization).
+- Doom output is shown in a dedicated draggable/resizable Doom window.
+- Viewport presentation uses aspect-ratio fit and bilinear filtering in the compositor.
+- Viewport filter is runtime-selectable (`nearest` default): `doom view bilinear|nearest`.
 - Viewport updates use bounded damage-region redraw, not full-window repaint.
+- Play-mode viewport refresh runs on a tighter cadence than status-text refresh for smoother pacing.
 - Runtime status exposes frame counters and non-zero frame metrics.
 
 ### Input
@@ -50,6 +55,7 @@ If DoomGeneric is not ready, ArrOSt falls back to an explicit fallback runtime p
 - Command-based injection: `doom key` and `doom keyup`.
 - Capture mode: `doom capture on|off`.
 - Automatic capture on `doom play` (when supported).
+- Capture forwards all key input to Doom while active, except `ESC` which exits capture mode.
 - Press/release event flow is active through bridge queue.
 - Serial capture uses temporary key holds with auto-release to reduce missed events.
 
@@ -58,6 +64,11 @@ If DoomGeneric is not ready, ArrOSt falls back to an explicit fallback runtime p
 - PCM audio path is active.
 - Preferred backend: `virtio-sound`.
 - Fallback backend: PC speaker.
+- Virtio backend now uses a software jitter buffer with high-water trimming to reduce crackle/drop under bursty frame timing.
+- Virtio path applies linear resampling for cleaner playback when source/output rates differ.
+- Virtio stream setup now prefers native high-fidelity rates (44.1k/48k when available).
+- Doom mixer applies limiter/soft-clip to reduce hard clipping under heavy mix load.
+- Mixer gain/limiter tuning was tightened to reduce pumping and harsh clipping while keeping output level stable.
 - Runtime audio controls:
   - `doom audio on|off|virtio|pcspk|status|test`
 - Long-run strict smoke checks validate virtio audio stability.
@@ -101,6 +112,7 @@ cargo xtask run
 Useful overrides:
 
 ```bash
+QEMU_ACCEL=auto QEMU_CPU=auto QEMU_SMP=auto cargo xtask run
 QEMU_AUDIO=coreaudio cargo xtask run
 QEMU_AUDIO=wav QEMU_AUDIO_WAV_PATH=/tmp/arrost-doom.wav cargo xtask run
 QEMU_VIRTIO_SND=off cargo xtask run
@@ -142,6 +154,7 @@ doom status
 doom audio status
 doom key left
 doom keyup left
+doom view nearest
 doom capture on
 ```
 

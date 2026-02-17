@@ -65,6 +65,7 @@ pub struct AudioStatus {
     pub pcm_hz_max: u16,
     pub pcm_backend: &'static str,
     pub pcm_queue_pending: u16,
+    pub pcm_buffered_frames: u32,
     pub pcm_packets_submitted: u64,
     pub pcm_packets_completed: u64,
     pub pcm_packets_dropped: u64,
@@ -149,7 +150,7 @@ pub fn status() -> AudioStatus {
         AudioStatus {
             mode: state.mode,
             active: if state.mode == AudioMode::Virtio {
-                virtio.started || virtio.pending_packets > 0
+                virtio.ready
             } else {
                 state.active
             },
@@ -169,6 +170,7 @@ pub fn status() -> AudioStatus {
                 "pc-speaker"
             },
             pcm_queue_pending: virtio.pending_packets,
+            pcm_buffered_frames: virtio.buffered_frames,
             pcm_packets_submitted: virtio.submitted_packets,
             pcm_packets_completed: virtio.completed_packets,
             pcm_packets_dropped: virtio.dropped_packets,
@@ -329,7 +331,7 @@ pub fn poll(now_ticks: u64) {
         virtio_sound::poll();
         if state.mode == AudioMode::Virtio {
             let virt = virtio_sound::status();
-            state.active = virt.started || virt.pending_packets > 0;
+            state.active = virt.ready;
             return;
         }
         if state.mode == AudioMode::Off && state.active {

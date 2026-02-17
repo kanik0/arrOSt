@@ -46,6 +46,11 @@ const MAX_STREAM_CHANNELS: usize = 2;
 const MAX_RESAMPLE_SAMPLES: usize = MAX_RESAMPLE_FRAMES * MAX_STREAM_CHANNELS;
 const TX_PACKET_FRAMES: usize = 1024;
 const TX_PACKET_SAMPLES: usize = TX_PACKET_FRAMES * 2;
+const PCM_BUFFER_PERIODS: u32 = 8;
+const PCM_FIFO_FRAMES: usize = TX_PACKET_FRAMES * 24;
+const PCM_FIFO_SAMPLES: usize = PCM_FIFO_FRAMES * MAX_STREAM_CHANNELS;
+const PCM_FIFO_TARGET_FRAMES: u32 = TX_PACKET_FRAMES as u32 * 6;
+const PCM_FIFO_HIGH_WATER_FRAMES: u32 = TX_PACKET_FRAMES as u32 * 10;
 
 const VIRTIO_SND_R_PCM_INFO: u32 = 0x0100;
 const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
@@ -355,11 +360,11 @@ pub struct VirtioSoundInitReport {
 #[derive(Clone, Copy)]
 pub struct VirtioSoundStatus {
     pub ready: bool,
-    pub started: bool,
     pub stream_id: u32,
     pub sample_rate_hz: u32,
     pub channels: u8,
     pub pending_packets: u16,
+    pub buffered_frames: u32,
     pub submitted_packets: u64,
     pub completed_packets: u64,
     pub dropped_packets: u64,
@@ -395,6 +400,11 @@ struct DriverState {
     tx_slot_busy: [bool; TX_SLOT_COUNT],
     tx_slot_frames: [u16; TX_SLOT_COUNT],
     resample_tmp: [i16; MAX_RESAMPLE_SAMPLES],
+    pcm_fifo: [i16; PCM_FIFO_SAMPLES],
+    pcm_fifo_read: usize,
+    pcm_fifo_write: usize,
+    pcm_fifo_samples: usize,
+    pending_hw_frames: u32,
     ctrl_status: VirtioSndHdr,
     pcm_infos: [VirtioSndPcmInfo; TX_SLOT_COUNT],
     pending_packets: u16,
@@ -436,6 +446,11 @@ impl DriverState {
             tx_slot_busy: [false; TX_SLOT_COUNT],
             tx_slot_frames: [0; TX_SLOT_COUNT],
             resample_tmp: [0; MAX_RESAMPLE_SAMPLES],
+            pcm_fifo: [0; PCM_FIFO_SAMPLES],
+            pcm_fifo_read: 0,
+            pcm_fifo_write: 0,
+            pcm_fifo_samples: 0,
+            pending_hw_frames: 0,
             ctrl_status: VirtioSndHdr { code: 0 },
             pcm_infos: [VirtioSndPcmInfo::EMPTY; TX_SLOT_COUNT],
             pending_packets: 0,
@@ -462,11 +477,11 @@ impl DriverState {
     fn status(&self) -> VirtioSoundStatus {
         VirtioSoundStatus {
             ready: self.ready,
-            started: self.started,
             stream_id: self.stream_id,
             sample_rate_hz: self.stream_rate_hz,
             channels: self.channels,
             pending_packets: self.pending_packets,
+            buffered_frames: self.total_buffered_frames(),
             submitted_packets: self.submitted_packets,
             completed_packets: self.completed_packets,
             dropped_packets: self.dropped_packets,
@@ -500,6 +515,11 @@ impl DriverState {
         self.completed_frames = 0;
         self.dropped_frames = 0;
         self.resample_phase_fp = 0;
+        self.pending_hw_frames = 0;
+        self.pcm_fifo_read = 0;
+        self.pcm_fifo_write = 0;
+        self.pcm_fifo_samples = 0;
+        self.pcm_fifo.fill(0);
     }
 
     fn try_init(&mut self) -> Result<(), &'static str> {
@@ -830,7 +850,7 @@ impl DriverState {
     fn send_set_params(&mut self) -> Result<(), &'static str> {
         let frame_bytes = usize::from(self.channels).saturating_mul(size_of::<i16>());
         let period_bytes = TX_PACKET_FRAMES.saturating_mul(frame_bytes) as u32;
-        let buffer_bytes = period_bytes.saturating_mul(4);
+        let buffer_bytes = period_bytes.saturating_mul(PCM_BUFFER_PERIODS);
         let params = VirtioSndPcmSetParams {
             hdr: VirtioSndHdr {
                 code: VIRTIO_SND_R_PCM_SET_PARAMS,
@@ -887,9 +907,10 @@ impl DriverState {
                 self.tx_slot_busy[slot] = false;
                 self.pending_packets = self.pending_packets.saturating_sub(1);
                 self.completed_packets = self.completed_packets.saturating_add(1);
-                self.completed_frames = self
-                    .completed_frames
-                    .saturating_add(u64::from(self.tx_slot_frames[slot]));
+                let frame_count = u32::from(self.tx_slot_frames[slot]);
+                self.pending_hw_frames = self.pending_hw_frames.saturating_sub(frame_count);
+                self.completed_frames =
+                    self.completed_frames.saturating_add(u64::from(frame_count));
                 self.tx_slot_frames[slot] = 0;
                 // SAFETY: TX packet slot belongs to this driver and is only accessed while serialized.
                 let packet = unsafe { &(*TX_PACKETS.0.get())[slot] };
@@ -917,6 +938,14 @@ impl DriverState {
         };
         if result.is_ok() {
             self.started = enabled;
+            if !enabled {
+                self.pcm_fifo_read = 0;
+                self.pcm_fifo_write = 0;
+                self.pcm_fifo_samples = 0;
+                self.resample_phase_fp = 0;
+            } else {
+                self.pump_fifo_to_tx();
+            }
         }
     }
 
@@ -929,7 +958,7 @@ impl DriverState {
         if src_frames == 0 {
             return 0;
         }
-        self.poll_tx_used();
+        self.pump_fifo_to_tx();
 
         let mut consumed_frames = 0usize;
         let src_step_fp = ((u64::from(src_rate)) << 32) / u64::from(self.stream_rate_hz.max(1));
@@ -953,10 +982,14 @@ impl DriverState {
                     break;
                 }
 
+                let next_idx = (src_idx + 1).min(chunk_frames.saturating_sub(1));
                 let src_base = src_idx.saturating_mul(input_channels);
-                let src_l = chunk[src_base];
+                let next_base = next_idx.saturating_mul(input_channels);
+                let frac = ((phase & 0xFFFF_FFFF) >> 16) as u32;
+
+                let src_l = lerp_i16(chunk[src_base], chunk[next_base], frac);
                 let src_r = if input_channels > 1 {
-                    chunk[src_base + 1]
+                    lerp_i16(chunk[src_base + 1], chunk[next_base + 1], frac)
                 } else {
                     src_l
                 };
@@ -975,17 +1008,13 @@ impl DriverState {
             }
 
             consumed_frames = consumed_frames.saturating_add(chunk_frames);
-            let mut frame_offset = 0usize;
-            while frame_offset < produced_frames {
-                let frame_count = (produced_frames - frame_offset).min(TX_PACKET_FRAMES);
-                if !self.enqueue_tx_packet_from_tmp(frame_offset, frame_count, output_channels) {
-                    self.dropped_packets = self.dropped_packets.saturating_add(1);
-                    self.dropped_frames = self
-                        .dropped_frames
-                        .saturating_add((produced_frames - frame_offset) as u64);
-                    break;
-                }
-                frame_offset += frame_count;
+            let produced_samples = produced_frames.saturating_mul(output_channels);
+            if produced_samples > 0 {
+                let mut local = [0i16; MAX_RESAMPLE_SAMPLES];
+                local[..produced_samples].copy_from_slice(&self.resample_tmp[..produced_samples]);
+                self.push_fifo_samples(&local[..produced_samples], output_channels);
+                self.trim_fifo_if_needed(output_channels);
+                self.pump_fifo_to_tx();
             }
         }
 
@@ -1103,35 +1132,188 @@ impl DriverState {
         self.tx_slot_busy[slot] = true;
         self.tx_slot_frames[slot] = frame_count as u16;
         self.pending_packets = self.pending_packets.saturating_add(1);
+        self.pending_hw_frames = self.pending_hw_frames.saturating_add(frame_count as u32);
         self.submitted_packets = self.submitted_packets.saturating_add(1);
         true
     }
 
-    fn enqueue_tx_packet_from_tmp(
-        &mut self,
-        frame_offset: usize,
-        frame_count: usize,
-        channels: usize,
-    ) -> bool {
-        if frame_count == 0 || frame_count > TX_PACKET_FRAMES {
-            return false;
-        }
-        if channels == 0 || channels > 2 {
-            return false;
-        }
-        let sample_offset = frame_offset.saturating_mul(channels);
-        let sample_count = frame_count.saturating_mul(channels);
-        let sample_end = sample_offset.saturating_add(sample_count);
-        if sample_end > self.resample_tmp.len() || sample_count > TX_PACKET_SAMPLES {
-            return false;
-        }
-        let mut local = [0i16; TX_PACKET_SAMPLES];
-        local[..sample_count].copy_from_slice(&self.resample_tmp[sample_offset..sample_end]);
-        self.enqueue_tx_packet(&local[..sample_count], frame_count, channels)
-    }
-
     fn next_free_slot(&self) -> Option<usize> {
         (0..TX_SLOT_COUNT).find(|&slot| !self.tx_slot_busy[slot])
+    }
+
+    fn total_buffered_frames(&self) -> u32 {
+        let channels = usize::from(self.channels.clamp(1, 2));
+        if channels == 0 {
+            return self.pending_hw_frames;
+        }
+        let fifo_frames = (self.pcm_fifo_samples / channels).min(u32::MAX as usize) as u32;
+        self.pending_hw_frames.saturating_add(fifo_frames)
+    }
+
+    fn fifo_capacity_samples(channels: usize) -> usize {
+        PCM_FIFO_FRAMES.saturating_mul(channels.clamp(1, 2))
+    }
+
+    fn fifo_drop_oldest_samples(&mut self, drop_samples: usize, channels: usize) {
+        if drop_samples == 0 || self.pcm_fifo_samples == 0 {
+            return;
+        }
+        let channels = channels.clamp(1, 2);
+        let capacity = Self::fifo_capacity_samples(channels);
+        if capacity == 0 {
+            return;
+        }
+
+        let aligned_drop = drop_samples - (drop_samples % channels);
+        if aligned_drop == 0 {
+            return;
+        }
+        let dropped = aligned_drop.min(self.pcm_fifo_samples);
+        self.pcm_fifo_read = (self.pcm_fifo_read + dropped) % capacity;
+        self.pcm_fifo_samples = self.pcm_fifo_samples.saturating_sub(dropped);
+        self.dropped_frames = self
+            .dropped_frames
+            .saturating_add((dropped / channels) as u64);
+    }
+
+    fn push_fifo_samples(&mut self, samples: &[i16], channels: usize) {
+        if samples.is_empty() {
+            return;
+        }
+        let channels = channels.clamp(1, 2);
+        let capacity = Self::fifo_capacity_samples(channels);
+        if capacity == 0 {
+            return;
+        }
+
+        let mut sample_count = samples.len() - (samples.len() % channels);
+        if sample_count == 0 {
+            return;
+        }
+
+        let mut source_start = 0usize;
+        if sample_count > capacity {
+            let overflow = sample_count - capacity;
+            self.dropped_frames = self
+                .dropped_frames
+                .saturating_add((overflow / channels) as u64);
+            source_start = overflow;
+            sample_count = capacity;
+        }
+
+        let free = capacity.saturating_sub(self.pcm_fifo_samples);
+        if sample_count > free {
+            self.fifo_drop_oldest_samples(sample_count - free, channels);
+        }
+
+        let mut remaining = sample_count;
+        let mut input_offset = source_start;
+        while remaining > 0 {
+            let contiguous = capacity.saturating_sub(self.pcm_fifo_write);
+            let write_now = remaining.min(contiguous);
+            let write_end = self.pcm_fifo_write + write_now;
+            self.pcm_fifo[self.pcm_fifo_write..write_end]
+                .copy_from_slice(&samples[input_offset..input_offset + write_now]);
+            self.pcm_fifo_write = (self.pcm_fifo_write + write_now) % capacity;
+            self.pcm_fifo_samples = self.pcm_fifo_samples.saturating_add(write_now);
+            input_offset += write_now;
+            remaining -= write_now;
+        }
+    }
+
+    fn copy_fifo_prefix(&self, target: &mut [i16], sample_count: usize, channels: usize) -> bool {
+        if sample_count == 0 || sample_count > target.len() || sample_count > self.pcm_fifo_samples
+        {
+            return false;
+        }
+        let channels = channels.clamp(1, 2);
+        let capacity = Self::fifo_capacity_samples(channels);
+        if capacity == 0 {
+            return false;
+        }
+
+        let mut copied = 0usize;
+        let mut read = self.pcm_fifo_read;
+        while copied < sample_count {
+            let contiguous = capacity.saturating_sub(read);
+            let copy_now = (sample_count - copied).min(contiguous);
+            target[copied..copied + copy_now]
+                .copy_from_slice(&self.pcm_fifo[read..read + copy_now]);
+            read = (read + copy_now) % capacity;
+            copied += copy_now;
+        }
+        true
+    }
+
+    fn consume_fifo_samples(&mut self, sample_count: usize, channels: usize) {
+        if sample_count == 0 {
+            return;
+        }
+        let channels = channels.clamp(1, 2);
+        let capacity = Self::fifo_capacity_samples(channels);
+        if capacity == 0 {
+            return;
+        }
+        let aligned = sample_count - (sample_count % channels);
+        let consumed = aligned.min(self.pcm_fifo_samples);
+        self.pcm_fifo_read = (self.pcm_fifo_read + consumed) % capacity;
+        self.pcm_fifo_samples = self.pcm_fifo_samples.saturating_sub(consumed);
+    }
+
+    fn trim_fifo_if_needed(&mut self, channels: usize) {
+        let channels = channels.clamp(1, 2);
+        let total = self.total_buffered_frames();
+        if total <= PCM_FIFO_HIGH_WATER_FRAMES {
+            return;
+        }
+        let fifo_frames = (self.pcm_fifo_samples / channels).min(u32::MAX as usize) as u32;
+        if fifo_frames == 0 {
+            return;
+        }
+        let mut drop_frames = total.saturating_sub(PCM_FIFO_TARGET_FRAMES);
+        drop_frames = drop_frames.min(fifo_frames);
+        let drop_samples = (drop_frames as usize).saturating_mul(channels);
+        self.fifo_drop_oldest_samples(drop_samples, channels);
+    }
+
+    fn pump_fifo_to_tx(&mut self) {
+        if !self.ready || !self.started {
+            return;
+        }
+        self.poll_tx_used();
+
+        let channels = usize::from(self.channels.clamp(1, 2));
+        if channels == 0 {
+            return;
+        }
+
+        let mut local = [0i16; TX_PACKET_SAMPLES];
+        loop {
+            if self.next_free_slot().is_none() {
+                break;
+            }
+            let available_frames = self.pcm_fifo_samples / channels;
+            if available_frames == 0 {
+                break;
+            }
+
+            let frame_count = available_frames.min(TX_PACKET_FRAMES);
+            let sample_count = frame_count.saturating_mul(channels);
+            if sample_count == 0 || sample_count > local.len() {
+                break;
+            }
+            if !self.copy_fifo_prefix(&mut local, sample_count, channels) {
+                break;
+            }
+            if !self.enqueue_tx_packet(&local[..sample_count], frame_count, channels) {
+                break;
+            }
+            self.consume_fifo_samples(sample_count, channels);
+        }
+    }
+
+    fn poll(&mut self) {
+        self.pump_fifo_to_tx();
     }
 }
 
@@ -1148,7 +1330,7 @@ pub fn reset_runtime_metrics() {
 }
 
 pub fn poll() {
-    with_state_mut(DriverState::poll_tx_used);
+    with_state_mut(DriverState::poll);
 }
 
 pub fn set_enabled(enabled: bool) {
@@ -1164,12 +1346,22 @@ fn with_state_mut<R>(f: impl FnOnce(&mut DriverState) -> R) -> R {
     unsafe { f(&mut *DRIVER_STATE.0.get()) }
 }
 
+fn lerp_i16(a: i16, b: i16, frac: u32) -> i16 {
+    let start = i32::from(a);
+    let delta = i32::from(b).saturating_sub(start);
+    let scaled =
+        ((i64::from(delta).saturating_mul(i64::from(frac))).saturating_add(1i64 << 15)) >> 16;
+    start
+        .saturating_add(scaled.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
 fn choose_rate(rates_mask: u64) -> Option<(u8, u32)> {
     let candidates: &[(u8, u32)] = &[
-        (RATE_ENUM_11025, 11_025),
-        (RATE_ENUM_22050, 22_050),
         (RATE_ENUM_44100, 44_100),
         (RATE_ENUM_48000, 48_000),
+        (RATE_ENUM_22050, 22_050),
+        (RATE_ENUM_11025, 11_025),
     ];
     for (rate_enum, rate_hz) in candidates {
         if (rates_mask & (1u64 << *rate_enum)) != 0 {

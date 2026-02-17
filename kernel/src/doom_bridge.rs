@@ -10,34 +10,17 @@ mod wad_embed {
     include!(concat!(env!("OUT_DIR"), "/doom_wad_embed.rs"));
 }
 
-pub const VIEWPORT_W: usize = 64;
-pub const VIEWPORT_H: usize = 40;
+pub const VIEWPORT_W: usize = 320;
+pub const VIEWPORT_H: usize = 200;
 pub const VIEWPORT_PIXELS: usize = VIEWPORT_W * VIEWPORT_H;
-pub const VIEWPORT_PALETTE: [[u8; 3]; 16] = [
-    [5, 8, 12],      // 0 background
-    [16, 24, 36],    // 1 ceiling dark
-    [24, 34, 50],    // 2 ceiling mid
-    [34, 48, 70],    // 3 ceiling light
-    [25, 18, 14],    // 4 floor dark
-    [41, 30, 24],    // 5 floor mid
-    [63, 45, 34],    // 6 floor light
-    [78, 56, 42],    // 7 floor high
-    [182, 136, 82],  // 8 border
-    [124, 88, 54],   // 9 wall accent
-    [200, 82, 66],   // 10 enemy
-    [248, 204, 96],  // 11 projectile
-    [110, 188, 104], // 12 player
-    [255, 236, 168], // 13 spark
-    [141, 208, 218], // 14 velocity guide
-    [238, 248, 255], // 15 HUD/text mark
-];
 
 const KEY_QUEUE_CAP: usize = 256;
 const TITLE_CAP: usize = 64;
 const MAX_SOURCE_PIXELS: usize = 1024 * 768;
 const CFG_PATH: &str = "/arr.cfg";
 const CFG_PERSIST_MAX: usize = fs::MAX_FILE_BYTES;
-const AUDIO_QUEUE_CAP_SAMPLES: u32 = 8192;
+const AUDIO_QUEUE_CAP_SAMPLES: u32 = 32_768;
+const NOISY_RATE_CONTROL_LOG: &[u8] = b"Resetting rate control";
 const KEY_LEFTARROW: u8 = 0xac;
 const KEY_UPARROW: u8 = 0xad;
 const KEY_RIGHTARROW: u8 = 0xae;
@@ -47,6 +30,7 @@ const KEY_FIRE: u8 = 0xa3;
 const KEY_ESCAPE: u8 = 27;
 const KEY_ENTER: u8 = 13;
 const KEY_TAB: u8 = 9;
+const KEY_BACKSPACE: u8 = 0x7f;
 
 struct BridgeCell(UnsafeCell<BridgeState>);
 
@@ -74,7 +58,7 @@ pub struct BridgeStats {
 }
 
 struct BridgeState {
-    pixels: [u8; VIEWPORT_PIXELS],
+    pixels: [u32; VIEWPORT_PIXELS],
     has_frame: bool,
     key_queue: [u16; KEY_QUEUE_CAP],
     key_head: usize,
@@ -207,8 +191,8 @@ fn map_input_key(byte: u8) -> Option<u8> {
         b' ' => Some(KEY_FIRE),
         b'\t' => Some(KEY_TAB),
         b'\r' | b'\n' => Some(KEY_ENTER),
+        0x08 | 0x7f => Some(KEY_BACKSPACE),
         0x1b => Some(KEY_ESCAPE),
-        b'x' | b'X' | b'q' | b'Q' => Some(KEY_ESCAPE),
         _ => {
             if byte.is_ascii_graphic() {
                 Some(byte.to_ascii_uppercase())
@@ -221,22 +205,6 @@ fn map_input_key(byte: u8) -> Option<u8> {
 
 fn current_tick_millis() -> u64 {
     time::ticks().saturating_mul(10)
-}
-
-fn quantize_to_palette(r: u8, g: u8, b: u8) -> u8 {
-    let mut best = 0u8;
-    let mut best_distance = u32::MAX;
-    for (index, color) in VIEWPORT_PALETTE.iter().enumerate() {
-        let dr = i32::from(r) - i32::from(color[0]);
-        let dg = i32::from(g) - i32::from(color[1]);
-        let db = i32::from(b) - i32::from(color[2]);
-        let distance = (dr * dr + dg * dg + db * db) as u32;
-        if distance < best_distance {
-            best_distance = distance;
-            best = index as u8;
-        }
-    }
-    best
 }
 
 pub fn reset() {
@@ -257,7 +225,7 @@ pub fn enqueue_key_release(byte: u8) -> bool {
     with_bridge_mut(|state| state.queue_push_event(mapped, false))
 }
 
-pub fn copy_pixels(target: &mut [u8; VIEWPORT_PIXELS]) -> bool {
+pub fn copy_pixels(target: &mut [u32; VIEWPORT_PIXELS]) -> bool {
     with_bridge_mut(|state| {
         if !state.has_frame {
             return false;
@@ -323,25 +291,101 @@ pub extern "C" fn arr_dg_draw_frame(frame: *const u32, width: u32, height: u32) 
         // SAFETY: caller provides a valid frame pointer with `width * height` pixels.
         let source = unsafe { core::slice::from_raw_parts(frame, source_len) };
         let mut nonzero_pixels = 0u32;
-        for y in 0..VIEWPORT_H {
-            let sy = y.saturating_mul(height) / VIEWPORT_H.max(1);
-            for x in 0..VIEWPORT_W {
-                let sx = x.saturating_mul(width) / VIEWPORT_W.max(1);
-                let src = source[sy.saturating_mul(width).saturating_add(sx)];
-                let r = ((src >> 16) & 0xff) as u8;
-                let g = ((src >> 8) & 0xff) as u8;
-                let b = (src & 0xff) as u8;
-                let palette_index = quantize_to_palette(r, g, b);
-                if palette_index != 0 {
+        if width == VIEWPORT_W && height == VIEWPORT_H {
+            for (index, pixel) in source.iter().take(VIEWPORT_PIXELS).enumerate() {
+                let rgb = *pixel & 0x00FF_FFFF;
+                if rgb != 0 {
                     nonzero_pixels = nonzero_pixels.saturating_add(1);
                 }
-                state.pixels[y * VIEWPORT_W + x] = palette_index;
+                state.pixels[index] = rgb;
+            }
+            state.has_frame = true;
+            state.draw_calls = state.draw_calls.saturating_add(1);
+            state.last_nonzero_pixels = nonzero_pixels;
+            return;
+        }
+
+        for y in 0..VIEWPORT_H {
+            let sy_fp = if VIEWPORT_H > 1 {
+                ((y as u64)
+                    .saturating_mul((height.saturating_sub(1)) as u64)
+                    .saturating_mul(1u64 << 16)
+                    / ((VIEWPORT_H - 1) as u64)) as u32
+            } else {
+                0
+            };
+            let y0 = ((sy_fp >> 16) as usize).min(height.saturating_sub(1));
+            let y1 = (y0 + 1).min(height.saturating_sub(1));
+            let wy = sy_fp & 0xFFFF;
+            for x in 0..VIEWPORT_W {
+                let sx_fp = if VIEWPORT_W > 1 {
+                    ((x as u64)
+                        .saturating_mul((width.saturating_sub(1)) as u64)
+                        .saturating_mul(1u64 << 16)
+                        / ((VIEWPORT_W - 1) as u64)) as u32
+                } else {
+                    0
+                };
+                let x0 = ((sx_fp >> 16) as usize).min(width.saturating_sub(1));
+                let x1 = (x0 + 1).min(width.saturating_sub(1));
+                let wx = sx_fp & 0xFFFF;
+
+                let c00 = source[y0.saturating_mul(width).saturating_add(x0)] & 0x00FF_FFFF;
+                let c10 = source[y0.saturating_mul(width).saturating_add(x1)] & 0x00FF_FFFF;
+                let c01 = source[y1.saturating_mul(width).saturating_add(x0)] & 0x00FF_FFFF;
+                let c11 = source[y1.saturating_mul(width).saturating_add(x1)] & 0x00FF_FFFF;
+
+                let r = bilinear_channel(
+                    ((c00 >> 16) & 0xFF) as u8,
+                    ((c10 >> 16) & 0xFF) as u8,
+                    ((c01 >> 16) & 0xFF) as u8,
+                    ((c11 >> 16) & 0xFF) as u8,
+                    wx,
+                    wy,
+                );
+                let g = bilinear_channel(
+                    ((c00 >> 8) & 0xFF) as u8,
+                    ((c10 >> 8) & 0xFF) as u8,
+                    ((c01 >> 8) & 0xFF) as u8,
+                    ((c11 >> 8) & 0xFF) as u8,
+                    wx,
+                    wy,
+                );
+                let b = bilinear_channel(
+                    (c00 & 0xFF) as u8,
+                    (c10 & 0xFF) as u8,
+                    (c01 & 0xFF) as u8,
+                    (c11 & 0xFF) as u8,
+                    wx,
+                    wy,
+                );
+                let rgb = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                if rgb != 0 {
+                    nonzero_pixels = nonzero_pixels.saturating_add(1);
+                }
+                state.pixels[y * VIEWPORT_W + x] = rgb;
             }
         }
         state.has_frame = true;
         state.draw_calls = state.draw_calls.saturating_add(1);
         state.last_nonzero_pixels = nonzero_pixels;
     });
+}
+
+fn bilinear_channel(c00: u8, c10: u8, c01: u8, c11: u8, wx: u32, wy: u32) -> u8 {
+    let one = 1u64 << 16;
+    let inv_wx = one.saturating_sub(wx as u64);
+    let inv_wy = one.saturating_sub(wy as u64);
+
+    let top = ((u64::from(c00).saturating_mul(inv_wx) + u64::from(c10).saturating_mul(wx as u64))
+        .saturating_add(1u64 << 15))
+        >> 16;
+    let bottom = ((u64::from(c01).saturating_mul(inv_wx)
+        + u64::from(c11).saturating_mul(wx as u64))
+    .saturating_add(1u64 << 15))
+        >> 16;
+    (((top.saturating_mul(inv_wy) + bottom.saturating_mul(wy as u64)).saturating_add(1u64 << 15))
+        >> 16) as u8
 }
 
 #[unsafe(no_mangle)]
@@ -472,6 +516,12 @@ pub extern "C" fn arr_dg_log(bytes: *const u8, len: usize) {
     let capped = len.min(2048);
     // SAFETY: C caller provides a valid buffer for `len` bytes; we bound-copy to avoid log flooding.
     let slice = unsafe { core::slice::from_raw_parts(bytes, capped) };
+    if slice
+        .windows(NOISY_RATE_CONTROL_LOG.len())
+        .any(|window| window == NOISY_RATE_CONTROL_LOG)
+    {
+        return;
+    }
     for byte in slice {
         serial::write_byte(*byte);
     }

@@ -96,6 +96,138 @@ else
   fi
 fi
 
+AVAILABLE_ACCELERATORS="$(qemu-system-x86_64 -accel help 2>/dev/null || true)"
+accel_available() {
+  local accel="$1"
+  grep -Eq "(^|[[:space:]])${accel}($|[[:space:]])" <<<"$AVAILABLE_ACCELERATORS"
+}
+
+AVAILABLE_CPU_MODELS="$(qemu-system-x86_64 -cpu help 2>/dev/null || true)"
+cpu_model_available() {
+  local model="$1"
+  grep -Eq "^[[:space:]]+${model}([[:space:]]|$)" <<<"$AVAILABLE_CPU_MODELS"
+}
+
+pick_auto_accel() {
+  if [[ "${OSTYPE:-}" == darwin* ]] && accel_available "hvf"; then
+    echo "hvf"
+    return 0
+  fi
+  if [[ "${OSTYPE:-}" == linux* ]] && accel_available "kvm" && [[ -e /dev/kvm ]]; then
+    echo "kvm"
+    return 0
+  fi
+  if accel_available "hvf"; then
+    echo "hvf"
+    return 0
+  fi
+  if accel_available "kvm" && [[ -e /dev/kvm ]]; then
+    echo "kvm"
+    return 0
+  fi
+  if accel_available "whpx"; then
+    echo "whpx"
+    return 0
+  fi
+  if accel_available "tcg"; then
+    echo "tcg"
+    return 0
+  fi
+  echo "none"
+}
+
+QEMU_ACCEL_MODE="${QEMU_ACCEL:-auto}"
+QEMU_CPU_MODE="${QEMU_CPU:-auto}"
+QEMU_SMP_MODE="${QEMU_SMP:-auto}"
+QEMU_SMP_CORES="1"
+ACCEL_MODE="none"
+ACCEL_SPEC=""
+CPU_SPEC="qemu64"
+
+if [[ "$QEMU_ACCEL_MODE" == "auto" ]]; then
+  ACCEL_MODE="$(pick_auto_accel)"
+elif [[ "$QEMU_ACCEL_MODE" == "none" ]]; then
+  ACCEL_MODE="none"
+elif accel_available "$QEMU_ACCEL_MODE"; then
+  ACCEL_MODE="$QEMU_ACCEL_MODE"
+else
+  echo "Requested QEMU accelerator not available: $QEMU_ACCEL_MODE"
+  echo "Falling back to auto acceleration selection."
+  ACCEL_MODE="$(pick_auto_accel)"
+fi
+
+if [[ "$ACCEL_MODE" != "none" ]]; then
+  ACCEL_SPEC="$ACCEL_MODE"
+fi
+
+if [[ "$QEMU_CPU_MODE" == "auto" ]]; then
+  case "$ACCEL_MODE" in
+    hvf | kvm | whpx)
+      CPU_SPEC="host"
+      ;;
+    *)
+      if cpu_model_available "max"; then
+        CPU_SPEC="max"
+      else
+        CPU_SPEC="qemu64"
+      fi
+      ;;
+  esac
+else
+  CPU_SPEC="$QEMU_CPU_MODE"
+fi
+
+if [[ "$CPU_SPEC" == "host" ]]; then
+  case "$ACCEL_MODE" in
+    hvf | kvm | whpx)
+      ;;
+    *)
+      if cpu_model_available "max"; then
+        echo "QEMU_CPU=host requires hardware acceleration; using max."
+        CPU_SPEC="max"
+      else
+        echo "QEMU_CPU=host requires hardware acceleration; using qemu64."
+        CPU_SPEC="qemu64"
+      fi
+      ;;
+  esac
+fi
+
+if [[ -n "$CPU_SPEC" ]] && ! cpu_model_available "$CPU_SPEC"; then
+  echo "Requested CPU model not available: $CPU_SPEC"
+  if cpu_model_available "max"; then
+    echo "Falling back to CPU model: max"
+    CPU_SPEC="max"
+  elif cpu_model_available "qemu64"; then
+    echo "Falling back to CPU model: qemu64"
+    CPU_SPEC="qemu64"
+  else
+    echo "Falling back to machine default CPU model."
+    CPU_SPEC=""
+  fi
+fi
+
+if [[ "$QEMU_SMP_MODE" == "auto" ]]; then
+  case "$ACCEL_MODE" in
+    hvf | kvm | whpx)
+      QEMU_SMP_CORES=2
+      ;;
+    *)
+      QEMU_SMP_CORES=1
+      ;;
+  esac
+else
+  QEMU_SMP_CORES="$QEMU_SMP_MODE"
+fi
+
+if ! [[ "$QEMU_SMP_CORES" =~ ^[0-9]+$ ]]; then
+  echo "Invalid QEMU_SMP value: $QEMU_SMP_CORES (using 1)"
+  QEMU_SMP_CORES=1
+elif [[ "$QEMU_SMP_CORES" -lt 1 ]]; then
+  echo "Invalid QEMU_SMP value: $QEMU_SMP_CORES (using 1)"
+  QEMU_SMP_CORES=1
+fi
+
 AVAILABLE_AUDIO_DRIVERS="$(qemu-system-x86_64 -audiodev help 2>/dev/null || true)"
 audio_driver_available() {
   local driver="$1"
@@ -213,6 +345,17 @@ fi
 NETDEV_ARGS=(-netdev "$NETDEV_SPEC")
 
 echo "Using QEMU display backend: $DISPLAY_BACKEND"
+if [[ "$ACCEL_MODE" == "none" ]]; then
+  echo "Using QEMU acceleration: none"
+else
+  echo "Using QEMU acceleration: $ACCEL_SPEC"
+fi
+if [[ -n "$CPU_SPEC" ]]; then
+  echo "Using QEMU CPU model: $CPU_SPEC"
+else
+  echo "Using QEMU CPU model: machine-default"
+fi
+echo "Using QEMU SMP cores: $QEMU_SMP_CORES"
 echo "Using QEMU audio backend: $AUDIO_BACKEND"
 if [[ ${#VIRTIO_SOUND_ARGS[@]} -gt 0 ]]; then
   echo "Using QEMU virtio-sound: on (streams=$QEMU_VIRTIO_SND_STREAMS)"
@@ -240,7 +383,12 @@ fi
 
 QEMU_BASE_ARGS=(
   -machine "$MACHINE_SPEC"
-  -cpu qemu64
+)
+if [[ -n "$ACCEL_SPEC" ]]; then
+  QEMU_BASE_ARGS+=(-accel "$ACCEL_SPEC")
+fi
+QEMU_BASE_ARGS+=(
+  -smp "$QEMU_SMP_CORES"
   -m 512M
   -serial stdio
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_PATH"
@@ -251,6 +399,9 @@ QEMU_BASE_ARGS=(
   "${NETDEV_ARGS[@]}"
   -device virtio-net-pci,netdev=arr_net,disable-modern=on,disable-legacy=off
 )
+if [[ -n "$CPU_SPEC" ]]; then
+  QEMU_BASE_ARGS+=(-cpu "$CPU_SPEC")
+fi
 
 if [[ "$AUDIO_BACKEND" != "none" ]]; then
   exec qemu-system-x86_64 \
