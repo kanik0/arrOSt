@@ -102,6 +102,17 @@ accel_available() {
   grep -Eq "(^|[[:space:]])${accel}($|[[:space:]])" <<<"$AVAILABLE_ACCELERATORS"
 }
 
+kvm_accessible() {
+  [[ -c /dev/kvm ]] || return 1
+  # Verify that this process can actually open /dev/kvm (CI may expose
+  # the device node without allowing access to it).
+  if exec {kvm_fd}<>/dev/kvm 2>/dev/null; then
+    exec {kvm_fd}>&-
+    return 0
+  fi
+  return 1
+}
+
 AVAILABLE_CPU_MODELS="$(qemu-system-x86_64 -cpu help 2>/dev/null || true)"
 cpu_model_available() {
   local model="$1"
@@ -113,15 +124,20 @@ pick_auto_accel() {
     echo "hvf"
     return 0
   fi
-  if [[ "${OSTYPE:-}" == linux* ]] && accel_available "kvm" && [[ -e /dev/kvm ]]; then
-    echo "kvm"
-    return 0
+  if [[ "${OSTYPE:-}" == linux* ]] && accel_available "kvm"; then
+    if kvm_accessible; then
+      echo "kvm"
+      return 0
+    fi
+    if [[ -c /dev/kvm ]]; then
+      echo "KVM unavailable: /dev/kvm is present but not accessible; falling back." >&2
+    fi
   fi
   if accel_available "hvf"; then
     echo "hvf"
     return 0
   fi
-  if accel_available "kvm" && [[ -e /dev/kvm ]]; then
+  if accel_available "kvm" && kvm_accessible; then
     echo "kvm"
     return 0
   fi

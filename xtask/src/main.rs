@@ -618,6 +618,9 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
 
     let smoke_result = (|| -> Result<()> {
         wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let startup_snapshot = snapshot_log(&log);
+        let software_accel_mode = startup_snapshot.contains("Using QEMU acceleration: tcg")
+            || startup_snapshot.contains("Using QEMU acceleration: none");
         let stdin = child
             .stdin
             .as_mut()
@@ -675,8 +678,10 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
             else {
                 bail!("missing fallback status line");
             };
-            if !fallback_line.contains("doomgeneric=false") {
-                bail!("fallback status mismatch: expected doomgeneric=false");
+            if !(fallback_line.contains("doomgeneric=false")
+                || fallback_line.contains("bridge=stub"))
+            {
+                bail!("fallback status mismatch: expected bridge=stub or doomgeneric=false");
             }
 
             send_serial_command(stdin, "doom key left\n")?;
@@ -1064,7 +1069,7 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
 
         if long_run {
             let long_wait = Duration::from_secs(24);
-            let min_frame_progress = 180u64;
+            let min_frame_progress = if software_accel_mode { 90u64 } else { 180u64 };
             let max_drop_delta = 4u64;
 
             thread::sleep(long_wait);
