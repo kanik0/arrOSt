@@ -55,6 +55,9 @@ jobs:
           components: rust-src, llvm-tools-preview, rustfmt, clippy
           targets: x86_64-unknown-none
 
+      - name: Vendor DoomGeneric Sources
+        run: bash scripts/vendor_doomgeneric.sh
+
       - name: Build Image
         run: cargo xtask build
 
