@@ -14,6 +14,8 @@ Use the helper script to fetch/populate DoomGeneric sources:
 scripts/vendor_doomgeneric.sh
 ```
 
+The helper is idempotent and can recover from incomplete checkouts by re-vendoring the directory.
+
 ## Notes
 
 - Third-party code is kept separate from ArrOSt kernel sources.

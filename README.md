@@ -7,6 +7,7 @@
 </p>
 
 ArrOSt is an educational 64-bit operating system written in Rust (`no_std`) and designed to run on QEMU with UEFI firmware.
+The current runtime target is `x86_64-unknown-none`.
 
 The project focuses on practical kernel engineering with observable behavior, reproducible headless tests, and incremental subsystem bring-up.
 
@@ -120,6 +121,8 @@ QEMU_ACCEL=auto QEMU_CPU=auto QEMU_SMP=auto cargo xtask run
 scripts/vendor_doomgeneric.sh
 ```
 
+The script is idempotent and also repairs incomplete/inconsistent local checkouts of `user/doom/third_party/doomgeneric`.
+
 - Place WAD at:
 
 ```text
@@ -133,7 +136,7 @@ user/doom/wad/doom1.wad
 ```bash
 cargo fmt --all
 cargo clippy -p xtask -- -D warnings
-cargo clippy -p arrost-kernel --target x86_64-unknown-none -- -D warnings
+cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
 ```
 
 ### Unit tests

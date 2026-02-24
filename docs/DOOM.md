@@ -20,7 +20,7 @@ The current execution path is kernel-integrated and QEMU-focused:
 
 - Doom user metadata crate (`arrost-user-doom`)
 - C backend object (`user/doom/c/doom_backend.c`)
-- DoomGeneric core object (`third_party/doomgeneric/.../doomgeneric.c`)
+- DoomGeneric core object (`user/doom/third_party/doomgeneric/.../doomgeneric.c`)
 - ArrOSt DoomGeneric port object (`user/doom/c/doomgeneric_arrost.c`)
 
 Then kernel build embeds Doom metadata and readiness flags.
@@ -94,6 +94,11 @@ Vendor helper:
 ```bash
 scripts/vendor_doomgeneric.sh
 ```
+
+Notes:
+
+- The helper is idempotent.
+- If an incomplete `user/doom/third_party/doomgeneric` checkout is present (for example in CI), the helper re-vendors it.
 
 ## Build and run
 
@@ -193,6 +198,12 @@ Key indicators in status output:
 - Ensure DoomGeneric sources are vendored.
 - Ensure `user/doom/wad/doom1.wad` exists.
 - Rebuild with `cargo xtask build`.
+- If status/logs report `core_size=32` or `core_ready=false` for DoomGeneric, run `scripts/vendor_doomgeneric.sh` and rebuild.
+
+### Slow CI long-run smoke in software emulation
+
+- On runners without KVM access, QEMU uses `tcg` software acceleration.
+- `smoke-doom-long` keeps functional checks active but uses a lower frame-progression floor under `tcg`/`none` to avoid host-load false negatives.
 
 ## Relevant files
 
