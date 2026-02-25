@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, bail};
+use arrost_user_doom as user_doom;
+use arrost_user_init as user_init;
+use arrostd::syscall::{self as abi_syscall, errno as abi_errno, shim as abi_shim};
 use bootloader::DiskImageBuilder;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -89,18 +92,114 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("build") => build(),
+        Some("abi-check") => abi_check(parse_abi_check_arch_args(args)?),
         Some("run") => run_qemu(parse_run_arch_arg(args)?),
         Some("smoke-doom") => smoke_doom(parse_run_arch_arg(args)?),
         Some("smoke-doom-long") => smoke_doom_long(parse_run_arch_arg(args)?),
         Some("smoke-doom-virtio") => smoke_doom_virtio(parse_run_arch_arg(args)?),
         Some("smoke-doom-fallback") => smoke_doom_fallback(parse_run_arch_arg(args)?),
+        Some("smoke-proc-caps") => smoke_proc_caps(parse_run_arch_arg(args)?),
+        Some("smoke-proc-spawn") => smoke_proc_spawn(parse_run_arch_arg(args)?),
         _ => {
             eprintln!(
-                "Usage: cargo xtask <build|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]>"
+                "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]>"
             );
             Ok(())
         }
     }
+}
+
+fn abi_check(arch_targets: Vec<RuntimeArch>) -> Result<()> {
+    run_cargo_checked(&["test", "-p", "arrostd"], "arrostd ABI tests")?;
+    run_cargo_checked(&["test", "-p", "arrost-user-init"], "user init ABI tests")?;
+    run_cargo_checked(&["test", "-p", "arrost-user-doom"], "user doom ABI tests")?;
+
+    for arch in arch_targets {
+        let started = Instant::now();
+        let packages = run_target_abi_build_checks(arch)?;
+        println!(
+            "abi-check: target={} packages={} status=ok elapsed_ms={}",
+            arch.as_str(),
+            packages,
+            started.elapsed().as_millis()
+        );
+    }
+
+    println!("abi-check: PASS");
+    Ok(())
+}
+
+fn run_cargo_checked(args: &[&str], stage: &str) -> Result<()> {
+    let status = Command::new("cargo")
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run cargo for {stage}"))?;
+    if !status.success() {
+        bail!("{stage} failed");
+    }
+    Ok(())
+}
+
+fn run_target_abi_build_checks(arch: RuntimeArch) -> Result<usize> {
+    let target = arch.kernel_target();
+    let arch_name = arch.as_str();
+    let packages = [USER_INIT_PACKAGE, USER_DOOM_PACKAGE, KERNEL_PACKAGE];
+    let mut checked = 0usize;
+    for package in packages {
+        let stage = format!("{package} ABI build check ({arch_name})");
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                package,
+                "--target",
+                target,
+                BUILD_STD,
+                BUILD_STD_FEATURES,
+            ])
+            .status()
+            .with_context(|| format!("failed to run cargo for {stage}"))?;
+        if !status.success() {
+            bail!("{stage} failed");
+        }
+        checked = checked.saturating_add(1);
+    }
+    Ok(checked)
+}
+
+fn parse_abi_check_arch_args(args: impl Iterator<Item = String>) -> Result<Vec<RuntimeArch>> {
+    let mut parsed = Vec::<RuntimeArch>::new();
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        let value = match arg.as_str() {
+            "--arch" => iter
+                .next()
+                .context("missing value for --arch (expected x86_64 or aarch64)")?,
+            _ => {
+                if let Some(value) = arg.strip_prefix("--arch=") {
+                    if value.is_empty() {
+                        bail!("missing value for --arch= (expected x86_64 or aarch64)");
+                    }
+                    value.to_string()
+                } else {
+                    bail!("unsupported argument: {arg} (supported: --arch <x86_64|aarch64>)");
+                }
+            }
+        };
+        parsed.push(resolve_runtime_arch(Some(value))?);
+    }
+
+    if parsed.is_empty() {
+        return Ok(vec![RuntimeArch::X86_64, RuntimeArch::Aarch64]);
+    }
+
+    let mut dedup = Vec::<RuntimeArch>::new();
+    for arch in parsed {
+        if !dedup.contains(&arch) {
+            dedup.push(arch);
+        }
+    }
+    Ok(dedup)
 }
 
 fn build() -> Result<()> {
@@ -916,6 +1015,398 @@ fn smoke_doom_fallback(arch_override: Option<String>) -> Result<()> {
             Err(smoke_err)
         }
     }
+}
+
+fn smoke_proc_caps(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_proc_caps_impl(arch)
+}
+
+fn smoke_proc_caps_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-proc-caps";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let time_denied_pattern = format!(
+        "number={} ({}) denied",
+        abi_shim::TIME_MS.number,
+        abi_syscall::name(abi_shim::TIME_MS.number)
+    );
+    let socket_denied_pattern = format!(
+        "number={} ({}) denied",
+        abi_syscall::SYS_SOCKET,
+        abi_syscall::name(abi_syscall::SYS_SOCKET)
+    );
+    let drop_core_denied_pattern = format!("drop_core_rc={}", abi_errno::EPERM);
+
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "[init] caps smoke: PASS",
+            Duration::from_secs(8),
+            "init capability smoke pass marker",
+        )?;
+        wait_for_log(
+            &log,
+            &time_denied_pattern,
+            Duration::from_secs(8),
+            "time capability denial",
+        )?;
+        wait_for_log(
+            &log,
+            &socket_denied_pattern,
+            Duration::from_secs(8),
+            "network capability denial",
+        )?;
+        wait_for_log(
+            &log,
+            &drop_core_denied_pattern,
+            Duration::from_secs(8),
+            "core capability drop denial",
+        )?;
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "[init] caps smoke: PASS") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, &socket_denied_pattern) {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, &time_denied_pattern) {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, &drop_core_denied_pattern) {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+fn smoke_proc_spawn(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_proc_spawn_impl(arch)
+}
+
+fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-proc-spawn";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let init_exit_code = user_init::cooperative_exit_code();
+    let doom_exit_code = user_doom::cooperative_exit_code();
+
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "[init] spawn/wait smoke: PASS",
+            Duration::from_secs(12),
+            "init spawn/wait smoke pass marker",
+        )?;
+
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+        send_serial_command(stdin, "user apps\n")?;
+        let init_registry_line = format!(
+            "user(app): id={} name={} caps={:#x} sleep={} exit={}",
+            abi_syscall::app::INIT,
+            user_init::app_name(),
+            user_init::required_caps(),
+            user_init::cooperative_sleep_ticks(),
+            init_exit_code
+        );
+        wait_for_log(
+            &log,
+            &init_registry_line,
+            Duration::from_secs(8),
+            "init app registry contract line",
+        )?;
+        let doom_registry_line = format!(
+            "user(app): id={} name={} caps={:#x} sleep={} exit={}",
+            abi_syscall::app::DOOM,
+            user_doom::app_name(),
+            user_doom::required_caps(),
+            user_doom::cooperative_sleep_ticks(),
+            doom_exit_code
+        );
+        wait_for_log(
+            &log,
+            &doom_registry_line,
+            Duration::from_secs(8),
+            "doom app registry contract line",
+        )?;
+
+        send_serial_command(stdin, "spawn init\n")?;
+        wait_for_log(
+            &log,
+            "user(spawn): app=init pid=",
+            Duration::from_secs(8),
+            "spawn command output",
+        )?;
+        wait_for_log(
+            &log,
+            "[uinit] init: ready (syscall ABI",
+            Duration::from_secs(8),
+            "init userland boot marker",
+        )?;
+
+        let spawn_snapshot = snapshot_log(&log);
+        let Some(spawn_line) = last_matching_line(&spawn_snapshot, "user(spawn): app=init pid=")
+        else {
+            bail!("missing spawn confirmation line");
+        };
+        let Some(child_pid_u64) = parse_metric_value(spawn_line, "pid=") else {
+            bail!("missing child pid in spawn confirmation");
+        };
+        let Ok(child_pid) = u32::try_from(child_pid_u64) else {
+            bail!("invalid child pid in spawn confirmation: {child_pid_u64}");
+        };
+
+        send_serial_command(stdin, "wait all\n")?;
+        wait_for_log(
+            &log,
+            "user(wait): all reaped=0 running=1",
+            Duration::from_secs(8),
+            "wait all running init confirmation",
+        )?;
+
+        send_serial_command(stdin, &format!("wait {child_pid}\n"))?;
+        let wait_running = format!("user(wait): pid={child_pid} running");
+        wait_for_log(
+            &log,
+            &wait_running,
+            Duration::from_secs(8),
+            "wait running confirmation",
+        )?;
+
+        thread::sleep(Duration::from_millis(1800));
+        send_serial_command(stdin, "wait any\n")?;
+        let wait_exit = format!("user(wait): any pid={child_pid} exit={init_exit_code}");
+        wait_for_log(
+            &log,
+            &wait_exit,
+            Duration::from_secs(8),
+            "wait any init exit confirmation",
+        )?;
+
+        send_serial_command(stdin, "wait all\n")?;
+        wait_for_log(
+            &log,
+            "user(wait): all reaped=0 running=0",
+            Duration::from_secs(8),
+            "wait all init drained confirmation",
+        )?;
+
+        send_serial_command(stdin, &format!("wait {child_pid}\n"))?;
+        let wait_reaped = format!(
+            "user(wait): failed pid={child_pid} rc={}",
+            abi_errno::EINVAL
+        );
+        wait_for_log(
+            &log,
+            &wait_reaped,
+            Duration::from_secs(8),
+            "wait reaped confirmation",
+        )?;
+
+        send_serial_command(stdin, "spawn doom\n")?;
+        wait_for_log(
+            &log,
+            "user(spawn): app=doom pid=",
+            Duration::from_secs(8),
+            "spawn doom command output",
+        )?;
+        wait_for_log(
+            &log,
+            "[udoom] doom: rust+c userland toolchain smoke ready",
+            Duration::from_secs(8),
+            "doom userland boot marker",
+        )?;
+        let spawn_snapshot = snapshot_log(&log);
+        let Some(spawn_line) = last_matching_line(&spawn_snapshot, "user(spawn): app=doom pid=")
+        else {
+            bail!("missing doom spawn confirmation line");
+        };
+        let Some(doom_pid_u64) = parse_metric_value(spawn_line, "pid=") else {
+            bail!("missing doom child pid in spawn confirmation");
+        };
+        let Ok(doom_pid) = u32::try_from(doom_pid_u64) else {
+            bail!("invalid doom child pid in spawn confirmation: {doom_pid_u64}");
+        };
+
+        send_serial_command(stdin, "wait all\n")?;
+        wait_for_log(
+            &log,
+            "user(wait): all reaped=0 running=1",
+            Duration::from_secs(8),
+            "wait all running doom confirmation",
+        )?;
+
+        send_serial_command(stdin, &format!("wait {doom_pid}\n"))?;
+        let wait_running = format!("user(wait): pid={doom_pid} running");
+        wait_for_log(
+            &log,
+            &wait_running,
+            Duration::from_secs(8),
+            "wait doom running confirmation",
+        )?;
+
+        thread::sleep(Duration::from_millis(2400));
+        send_serial_command(stdin, "wait any\n")?;
+        let wait_exit = format!("user(wait): any pid={doom_pid} exit={doom_exit_code}");
+        wait_for_log(
+            &log,
+            &wait_exit,
+            Duration::from_secs(8),
+            "wait any doom exit confirmation",
+        )?;
+
+        send_serial_command(stdin, "wait all\n")?;
+        wait_for_log(
+            &log,
+            "user(wait): all reaped=0 running=0",
+            Duration::from_secs(8),
+            "wait all doom drained confirmation",
+        )?;
+
+        send_serial_command(stdin, &format!("wait {doom_pid}\n"))?;
+        let wait_reaped = format!("user(wait): failed pid={doom_pid} rc={}", abi_errno::EINVAL);
+        wait_for_log(
+            &log,
+            &wait_reaped,
+            Duration::from_secs(8),
+            "wait doom reaped confirmation",
+        )?;
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "[init] spawn/wait smoke: PASS") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "user(app): id=") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "user(spawn): app=init pid=") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "user(spawn): app=doom pid=") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "user(wait): pid=") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
 }
 
 fn smoke_doom_impl(
@@ -1790,4 +2281,57 @@ fn ensure_storage_disk_image() -> Result<PathBuf> {
     file.set_len(M6_DISK_SIZE_BYTES)
         .with_context(|| format!("failed to size {}", disk_path.display()))?;
     Ok(disk_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_owned_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn abi_check_arch_args_default_to_both_targets() {
+        let parsed = parse_abi_check_arch_args(Vec::<String>::new().into_iter())
+            .expect("default abi-check args should parse");
+        assert!(parsed == vec![RuntimeArch::X86_64, RuntimeArch::Aarch64]);
+    }
+
+    #[test]
+    fn abi_check_arch_args_preserve_order_and_dedup() {
+        let parsed = parse_abi_check_arch_args(
+            to_owned_args(&["--arch", "aarch64", "--arch", "x86_64", "--arch", "aarch64"])
+                .into_iter(),
+        )
+        .expect("multi-arch abi-check args should parse");
+        assert!(parsed == vec![RuntimeArch::Aarch64, RuntimeArch::X86_64]);
+    }
+
+    #[test]
+    fn abi_check_arch_args_support_equals_syntax() {
+        let parsed = parse_abi_check_arch_args(to_owned_args(&["--arch=x86_64"]).into_iter())
+            .expect("--arch=<value> should parse");
+        assert!(parsed == vec![RuntimeArch::X86_64]);
+    }
+
+    #[test]
+    fn abi_check_arch_args_reject_unknown_flags() {
+        let error = match parse_abi_check_arch_args(to_owned_args(&["--bad"]).into_iter()) {
+            Ok(_) => panic!("unknown flags must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("unsupported argument"));
+    }
+
+    #[test]
+    fn abi_check_arch_args_require_value_after_flag() {
+        let error = match parse_abi_check_arch_args(to_owned_args(&["--arch"]).into_iter()) {
+            Ok(_) => panic!("missing --arch value must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("missing value for --arch"));
+    }
 }

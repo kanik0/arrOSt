@@ -23,6 +23,8 @@ dependencies = [
 name = "arrost-kernel"
 version = "0.1.0"
 dependencies = [
+ "arrost-user-doom",
+ "arrost-user-init",
  "arrostd",
  "bootloader_api",
  "cc",
@@ -695,6 +697,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrost-user-doom",
+ "arrost-user-init",
+ "arrostd",
  "bootloader",
 ]
 

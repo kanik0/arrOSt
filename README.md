@@ -32,6 +32,9 @@ The project focuses on practical kernel engineering with observable behavior, re
 - Physical memory mapping, paging setup, kernel heap, and allocation smoke checks.
 - `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling.
 - `aarch64` interrupt path: EL1 vectors + GICv2 virtual timer IRQ with automatic runtime fallback to counter polling when unexpected IRQ sources are observed.
+- Cooperative scheduler syscall ABI includes `getpid`, `time_ms`, `cap_get`, `cap_drop`, `spawn`, `waitpid`, and per-task capability enforcement diagnostics.
+- Cooperative user task lifecycle supports `spawn/waitpid` for `init` and `doom` app IDs in shared-address-space runtime.
+- Shell command `user apps` exposes cooperative userland app contracts (`id/name/caps/sleep/exit`) sourced from user crates.
 - In-kernel shell with filesystem, UI, network, and Doom control commands.
 - Framebuffer compositor with shell and file-manager windows.
 - Virtio block storage backend with persistent disk image.
@@ -172,6 +175,12 @@ cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,comp
 ### Unit tests
 
 ```bash
+cargo xtask abi-check
+# opzionale: limita ai check ABI build-only di una singola architettura
+cargo xtask abi-check --arch x86_64
+cargo xtask abi-check --arch aarch64
+# opzionale: multi-target esplicito (equivalente al default)
+cargo xtask abi-check --arch x86_64 --arch aarch64
 cargo test -p xtask
 cargo test -p arrost-user-init
 cargo test -p arrost-user-doom
@@ -187,6 +196,10 @@ cargo xtask smoke-doom-long --arch aarch64
 cargo xtask smoke-doom-virtio --arch aarch64
 cargo xtask smoke-doom-fallback --arch x86_64
 cargo xtask smoke-doom-fallback --arch aarch64
+cargo xtask smoke-proc-caps --arch x86_64
+cargo xtask smoke-proc-caps --arch aarch64
+cargo xtask smoke-proc-spawn --arch x86_64
+cargo xtask smoke-proc-spawn --arch aarch64
 ```
 
 ## Documentation index

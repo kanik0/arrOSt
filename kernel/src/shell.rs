@@ -12,6 +12,7 @@ use crate::storage;
 use crate::time;
 use alloc::string::String;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP, shell_prompt};
+use arrostd::syscall::{app, errno};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::str;
@@ -155,7 +156,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, spawn, wait, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -522,7 +523,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
+                "help: help | version | ticks | uptime | user | user apps | spawn <init|doom> | wait <pid|any|all> | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
             );
         }
         "version" => {
@@ -544,9 +545,88 @@ fn run_command(shell: &mut ShellState) {
         }
         "user" => {
             serial::write_fmt(format_args!(
-                "userland: app={} abi=v{} status=cooperative runtime (ring3 pending)\n",
+                "userland: app={} abi=v{} status=cooperative runtime (ring3 pending); use `user apps`\n",
                 USERLAND_INIT_APP, USERLAND_ABI_REVISION
             ));
+        }
+        "user apps" => proc::log_user_app_registry(),
+        "spawn" => {
+            serial::write_line("usage: spawn <init|doom>");
+        }
+        _ if input.starts_with("spawn ") => {
+            let target = input.trim_start_matches("spawn ").trim();
+            let app_id = match target {
+                "init" => Some(app::INIT),
+                "doom" => Some(app::DOOM),
+                _ => None,
+            };
+            let Some(app_id) = app_id else {
+                serial::write_line("usage: spawn <init|doom>");
+                return;
+            };
+            let spawned = proc::spawn_user_app(app_id);
+            if spawned > 0 {
+                serial::write_fmt(format_args!(
+                    "user(spawn): app={} pid={}\n",
+                    app::name(app_id),
+                    spawned
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "user(spawn): failed app={} rc={} ({})\n",
+                    app::name(app_id),
+                    spawned,
+                    errno::name(spawned)
+                ));
+            }
+        }
+        "wait" => {
+            serial::write_line("usage: wait <pid|any|all>");
+        }
+        "wait any" => match proc::wait_any_user() {
+            proc::UserWaitAny::Exited { pid, code } => {
+                serial::write_fmt(format_args!("user(wait): any pid={} exit={}\n", pid, code));
+            }
+            proc::UserWaitAny::Running => {
+                serial::write_line("user(wait): any running");
+            }
+            proc::UserWaitAny::NoChildren => {
+                serial::write_line("user(wait): any no-children");
+            }
+        },
+        "wait all" => {
+            let report = proc::wait_all_user();
+            serial::write_fmt(format_args!(
+                "user(wait): all reaped={} running={}\n",
+                report.reaped, report.running
+            ));
+        }
+        _ if input.starts_with("wait ") => {
+            let Some(pid_text) = input.strip_prefix("wait ") else {
+                serial::write_line("usage: wait <pid|any|all>");
+                return;
+            };
+            let Some(pid) = pid_text.trim().parse::<u32>().ok() else {
+                serial::write_line("usage: wait <pid|any|all>");
+                return;
+            };
+            if pid == 0 {
+                serial::write_line("usage: wait <pid|any|all>");
+                return;
+            }
+            let waited = proc::wait_user_pid(pid);
+            if waited == errno::EAGAIN {
+                serial::write_fmt(format_args!("user(wait): pid={} running\n", pid));
+            } else if waited >= 0 {
+                serial::write_fmt(format_args!("user(wait): pid={} exit={}\n", pid, waited));
+            } else {
+                serial::write_fmt(format_args!(
+                    "user(wait): failed pid={} rc={} ({})\n",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                ));
+            }
         }
         "ps" => {
             proc::log_process_table();
