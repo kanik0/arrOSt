@@ -8,7 +8,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  checks:
+  checks-host:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,7 +19,6 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview, rustfmt, clippy
-          targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -27,8 +26,40 @@ jobs:
       - name: Clippy xtask
         run: cargo clippy -p xtask --all-targets -- -D warnings
 
-      - name: Clippy kernel
+      - name: Test xtask
+        run: cargo test -p xtask
+
+      - name: Test arrostd
+        run: cargo test -p arrostd
+
+  checks-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview, clippy
+          targets: x86_64-unknown-none
+
+      - name: Clippy kernel x86_64
         run: cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+
+  checks-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview
+          targets: aarch64-unknown-none,aarch64-unknown-uefi
 
       - name: Build kernel aarch64
         run: cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
@@ -36,15 +67,13 @@ jobs:
       - name: Build UEFI loader aarch64
         run: cargo build -p arrost-aarch64-uefi-loader --target aarch64-unknown-uefi
 
-      - name: Test xtask
-        run: cargo test -p xtask
-
-      - name: Test arrostd
-        run: cargo test -p arrostd
-
-  doom-smoke:
+  doom-smoke-x86_64:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs:
+      - checks-host
+      - checks-x86_64
+      - checks-aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,13 +81,13 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-efi-aarch64 ovmf lsof clang
+          sudo apt-get install -y qemu-system-x86 ovmf lsof clang
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: rust-src, llvm-tools-preview, rustfmt, clippy
+          components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
 
       - name: Vendor DoomGeneric Sources
@@ -76,8 +105,40 @@ jobs:
       - name: Smoke DOOM Fallback x86_64
         run: timeout 180s cargo xtask smoke-doom-fallback --arch x86_64
 
+  doom-smoke-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs:
+      - checks-host
+      - checks-x86_64
+      - checks-aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 lsof clang
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
+
+      - name: Vendor DoomGeneric Sources
+        run: bash scripts/vendor_doomgeneric.sh
+
+      - name: Build Image
+        run: cargo xtask build
+
       - name: Smoke DOOM aarch64
         run: timeout 180s cargo xtask smoke-doom --arch aarch64
+
+      - name: Smoke DOOM Long aarch64
+        run: timeout 240s cargo xtask smoke-doom-long --arch aarch64
 
       - name: Smoke DOOM Virtio aarch64
         run: timeout 180s cargo xtask smoke-doom-virtio --arch aarch64
