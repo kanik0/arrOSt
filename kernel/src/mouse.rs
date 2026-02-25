@@ -1,5 +1,5 @@
 // kernel/src/mouse.rs: PS/2 mouse init + packet decode + event queue for M8.1.
-use crate::arch::x86_64::port;
+use crate::arch::port;
 use crate::serial;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -71,6 +71,7 @@ static EVENT_TAIL: AtomicUsize = AtomicUsize::new(0);
 static PACKET_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 static READY: AtomicBool = AtomicBool::new(false);
+static BACKEND_KIND: AtomicUsize = AtomicUsize::new(0);
 static HAS_LAST_EVENT: AtomicBool = AtomicBool::new(false);
 
 static BYTES_RX: AtomicU64 = AtomicU64::new(0);
@@ -93,9 +94,13 @@ pub fn init() -> MouseInitReport {
     BAD_SYNC.store(0, Ordering::Relaxed);
     HAS_LAST_EVENT.store(false, Ordering::Relaxed);
     READY.store(false, Ordering::Relaxed);
+    BACKEND_KIND.store(0, Ordering::Relaxed);
 
     let report = init_ps2_controller();
     READY.store(report.ready, Ordering::Release);
+    if report.ready {
+        BACKEND_KIND.store(1, Ordering::Release);
+    }
     CTRL_BEFORE.store(report.controller_before as usize, Ordering::Release);
     CTRL_AFTER.store(report.controller_after as usize, Ordering::Release);
     ACK_DEFAULTS.store(report.ack_defaults as usize, Ordering::Release);
@@ -149,6 +154,11 @@ pub fn pop_event() -> Option<MouseEvent> {
 
 pub fn log_info() {
     let ready = READY.load(Ordering::Acquire);
+    let backend = match BACKEND_KIND.load(Ordering::Acquire) {
+        1 => "ps2",
+        2 => "virtio-input",
+        _ => "none",
+    };
     let bytes = BYTES_RX.load(Ordering::Relaxed);
     let packets = PACKETS_RX.load(Ordering::Relaxed);
     let dropped = EVENTS_DROPPED.load(Ordering::Relaxed);
@@ -162,7 +172,8 @@ pub fn log_info() {
         // SAFETY: last event is written by IRQ producer before setting HAS_LAST_EVENT.
         let last = unsafe { *LAST_EVENT.0.get() };
         serial::write_fmt(format_args!(
-            "mouse: backend=ps2 ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=dx:{} dy:{} l:{} r:{} m:{}\n",
+            "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=dx:{} dy:{} l:{} r:{} m:{}\n",
+            backend,
             ready,
             bytes,
             packets,
@@ -180,7 +191,8 @@ pub fn log_info() {
         ));
     } else {
         serial::write_fmt(format_args!(
-            "mouse: backend=ps2 ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=none\n",
+            "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=none\n",
+            backend,
             ready,
             bytes,
             packets,
@@ -192,6 +204,17 @@ pub fn log_info() {
             ack_enable
         ));
     }
+}
+
+pub fn inject_event(event: MouseEvent) {
+    BACKEND_KIND.store(2, Ordering::Release);
+    READY.store(true, Ordering::Release);
+    push_event(event);
+}
+
+pub fn set_virtual_backend_ready() {
+    BACKEND_KIND.store(2, Ordering::Release);
+    READY.store(true, Ordering::Release);
 }
 
 fn push_event(event: MouseEvent) {

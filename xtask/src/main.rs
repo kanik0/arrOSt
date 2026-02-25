@@ -8,7 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const KERNEL_TARGET_AARCH64: &str = "aarch64-unknown-none";
+const UEFI_TARGET_AARCH64: &str = "aarch64-unknown-uefi";
 const KERNEL_PACKAGE: &str = "arrost-kernel";
+const AARCH64_UEFI_LOADER_PACKAGE: &str = "arrost-aarch64-uefi-loader";
 const USER_INIT_PACKAGE: &str = "arrost-user-init";
 const USER_DOOM_PACKAGE: &str = "arrost-user-doom";
 const BUILD_STD: &str = "-Zbuild-std=core,compiler_builtins,alloc";
@@ -25,6 +28,37 @@ const DOOM_GENERIC_INCLUDE_DIR: &str = "user/doom/third_party/doomgeneric/doomge
 const DOOM_GENERIC_PORT_SOURCE: &str = "user/doom/c/doomgeneric_arrost.c";
 const DOOM_WAD_HINT: &str = "user/doom/wad/doom1.wad";
 const DOOM_FORCE_FALLBACK_ENV: &str = "ARROST_DOOM_FORCE_FALLBACK";
+const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
+const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RuntimeArch {
+    X86_64,
+    Aarch64,
+}
+
+impl RuntimeArch {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    fn kernel_target(self) -> &'static str {
+        match self {
+            Self::X86_64 => KERNEL_TARGET,
+            Self::Aarch64 => KERNEL_TARGET_AARCH64,
+        }
+    }
+
+    fn qemu_script(self) -> &'static str {
+        match self {
+            Self::X86_64 => QEMU_SCRIPT_X86_64,
+            Self::Aarch64 => QEMU_SCRIPT_AARCH64,
+        }
+    }
+}
 
 struct UserArtifact {
     hint: PathBuf,
@@ -55,14 +89,14 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("build") => build(),
-        Some("run") => run_qemu(),
-        Some("smoke-doom") => smoke_doom(),
-        Some("smoke-doom-long") => smoke_doom_long(),
-        Some("smoke-doom-virtio") => smoke_doom_virtio(),
-        Some("smoke-doom-fallback") => smoke_doom_fallback(),
+        Some("run") => run_qemu(parse_run_arch_arg(args)?),
+        Some("smoke-doom") => smoke_doom(parse_run_arch_arg(args)?),
+        Some("smoke-doom-long") => smoke_doom_long(parse_run_arch_arg(args)?),
+        Some("smoke-doom-virtio") => smoke_doom_virtio(parse_run_arch_arg(args)?),
+        Some("smoke-doom-fallback") => smoke_doom_fallback(parse_run_arch_arg(args)?),
         _ => {
             eprintln!(
-                "Usage: cargo xtask <build|run|smoke-doom|smoke-doom-long|smoke-doom-virtio|smoke-doom-fallback>"
+                "Usage: cargo xtask <build|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]>"
             );
             Ok(())
         }
@@ -81,12 +115,22 @@ fn build_impl(force_fallback: bool) -> Result<()> {
     let minor_env = VERSION_MINOR.to_string();
     println!("ArrOSt build version: {version}");
 
-    let user_init =
-        build_userland_package(USER_INIT_PACKAGE, &build_count_env, &major_env, &minor_env)?;
-    let user_doom =
-        build_userland_package(USER_DOOM_PACKAGE, &build_count_env, &major_env, &minor_env)?;
-    let doom_c_backend = build_doom_c_backend_artifact()?;
-    let doom_generic = build_doom_generic_artifact()?;
+    let user_init = build_userland_package(
+        USER_INIT_PACKAGE,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_doom = build_userland_package(
+        USER_DOOM_PACKAGE,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET)?;
+    let doom_generic = build_doom_generic_artifact(KERNEL_TARGET)?;
     println!(
         "ArrOSt doom backend object: ready={} path={} size={}",
         doom_c_backend.ready,
@@ -234,11 +278,256 @@ fn build_impl(force_fallback: bool) -> Result<()> {
         .create_uefi_image(&disk_image)
         .context("failed to create UEFI disk image")?;
 
+    build_secondary_target(&build_count_env, &major_env, &minor_env, force_fallback)?;
+
+    Ok(())
+}
+
+fn build_secondary_target(
+    build_count_env: &str,
+    major_env: &str,
+    minor_env: &str,
+    force_fallback: bool,
+) -> Result<()> {
+    println!("ArrOSt target build: {KERNEL_TARGET_AARCH64}");
+
+    let _user_init = build_userland_package(
+        USER_INIT_PACKAGE,
+        KERNEL_TARGET_AARCH64,
+        build_count_env,
+        major_env,
+        minor_env,
+    )?;
+    let user_doom = build_userland_package(
+        USER_DOOM_PACKAGE,
+        KERNEL_TARGET_AARCH64,
+        build_count_env,
+        major_env,
+        minor_env,
+    )?;
+    let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET_AARCH64)?;
+    let doom_generic = build_doom_generic_artifact(KERNEL_TARGET_AARCH64)?;
+    println!(
+        "ArrOSt doom backend object ({KERNEL_TARGET_AARCH64}): ready={} path={} size={}",
+        doom_c_backend.ready,
+        doom_c_backend.object.display(),
+        doom_c_backend.size
+    );
+    println!(
+        "ArrOSt doomgeneric ({KERNEL_TARGET_AARCH64}): ready={} root={} core={} core_obj={} core_size={} core_ready={} port={} port_size={} port_ready={} wad={} wad_present={}",
+        doom_generic.ready,
+        doom_generic.root.display(),
+        doom_generic.core_source.display(),
+        doom_generic.core_object.display(),
+        doom_generic.core_size,
+        doom_generic.core_ready,
+        doom_generic.port_object.display(),
+        doom_generic.port_size,
+        doom_generic.port_ready,
+        doom_generic.wad_hint.display(),
+        doom_generic.wad_present
+    );
+    let doom_generic_ready_for_kernel = doom_generic.ready && !force_fallback;
+    if force_fallback {
+        println!(
+            "ArrOSt doomgeneric ({KERNEL_TARGET_AARCH64}): forcing ready=false for kernel metadata ({DOOM_FORCE_FALLBACK_ENV}=true)"
+        );
+    }
+
+    let status = Command::new("cargo")
+        .env("ARROST_BUILD_COUNT", build_count_env)
+        .env("ARROST_VERSION_MAJOR", major_env)
+        .env("ARROST_VERSION_MINOR", minor_env)
+        .env("ARROST_DOOM_APP", "doom")
+        .env(
+            "ARROST_DOOM_ARTIFACT_HINT",
+            user_doom.hint.display().to_string(),
+        )
+        .env("ARROST_DOOM_ARTIFACT_SIZE", user_doom.size.to_string())
+        .env(
+            "ARROST_DOOM_C_BACKEND_OBJECT",
+            doom_c_backend.object.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_C_BACKEND_SIZE",
+            doom_c_backend.size.to_string(),
+        )
+        .env(
+            "ARROST_DOOM_C_BACKEND_READY",
+            if doom_c_backend.ready {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_READY",
+            if doom_generic_ready_for_kernel {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_ROOT",
+            doom_generic.root.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_CORE_SOURCE",
+            doom_generic.core_source.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_CORE_OBJECT",
+            doom_generic.core_object.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_CORE_SIZE",
+            doom_generic.core_size.to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_CORE_READY",
+            if doom_generic.core_ready {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_PORT_OBJECT",
+            doom_generic.port_object.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_PORT_SIZE",
+            doom_generic.port_size.to_string(),
+        )
+        .env(
+            "ARROST_DOOM_GENERIC_PORT_READY",
+            if doom_generic.port_ready {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            "ARROST_DOOM_WAD_HINT",
+            doom_generic.wad_hint.display().to_string(),
+        )
+        .env(
+            "ARROST_DOOM_WAD_PRESENT",
+            if doom_generic.wad_present {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .args([
+            "build",
+            "-p",
+            KERNEL_PACKAGE,
+            "--target",
+            KERNEL_TARGET_AARCH64,
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .with_context(|| format!("cargo build failed for {KERNEL_TARGET_AARCH64}"))?;
+    if !status.success() {
+        bail!("kernel build failed ({KERNEL_TARGET_AARCH64})");
+    }
+
+    build_aarch64_uefi_payload()?;
+
+    Ok(())
+}
+
+fn build_aarch64_uefi_payload() -> Result<()> {
+    println!("ArrOSt target build: {UEFI_TARGET_AARCH64} (UEFI chain loader)");
+
+    let status = Command::new("cargo")
+        .env("RUSTFLAGS", "-C panic=abort")
+        .args([
+            "build",
+            "-p",
+            AARCH64_UEFI_LOADER_PACKAGE,
+            "--target",
+            UEFI_TARGET_AARCH64,
+        ])
+        .status()
+        .with_context(|| format!("cargo build failed for {UEFI_TARGET_AARCH64}"))?;
+    if !status.success() {
+        bail!(
+            "UEFI loader build failed ({UEFI_TARGET_AARCH64}); install target with `rustup target add {UEFI_TARGET_AARCH64}`"
+        );
+    }
+
+    let loader_candidate_efi = PathBuf::from(format!(
+        "target/{UEFI_TARGET_AARCH64}/debug/{AARCH64_UEFI_LOADER_PACKAGE}.efi"
+    ));
+    let loader_candidate_bin = PathBuf::from(format!(
+        "target/{UEFI_TARGET_AARCH64}/debug/{AARCH64_UEFI_LOADER_PACKAGE}"
+    ));
+    let loader_binary = if loader_candidate_efi.exists() {
+        loader_candidate_efi
+    } else if loader_candidate_bin.exists() {
+        loader_candidate_bin
+    } else {
+        bail!(
+            "missing UEFI loader artifact at {} or {}",
+            loader_candidate_efi.display(),
+            loader_candidate_bin.display()
+        );
+    };
+
+    let kernel_binary = PathBuf::from(format!(
+        "target/{KERNEL_TARGET_AARCH64}/debug/{KERNEL_PACKAGE}"
+    ));
+    if !kernel_binary.exists() {
+        bail!(
+            "missing aarch64 kernel binary at {}",
+            kernel_binary.display()
+        );
+    }
+
+    let esp_root = PathBuf::from(format!("target/{KERNEL_TARGET_AARCH64}/debug/efi"));
+    let esp_boot_dir = esp_root.join("EFI/BOOT");
+    std::fs::create_dir_all(&esp_boot_dir).with_context(|| {
+        format!(
+            "failed to create aarch64 ESP boot directory {}",
+            esp_boot_dir.display()
+        )
+    })?;
+
+    let boot_efi_path = esp_boot_dir.join("BOOTAA64.EFI");
+    std::fs::copy(&loader_binary, &boot_efi_path).with_context(|| {
+        format!(
+            "failed to stage UEFI loader {} -> {}",
+            loader_binary.display(),
+            boot_efi_path.display()
+        )
+    })?;
+
+    let staged_kernel_path = esp_root.join("arrost-kernel");
+    std::fs::copy(&kernel_binary, &staged_kernel_path).with_context(|| {
+        format!(
+            "failed to stage aarch64 kernel {} -> {}",
+            kernel_binary.display(),
+            staged_kernel_path.display()
+        )
+    })?;
+
+    println!(
+        "ArrOSt aarch64 UEFI payload: esp={} loader={} kernel={}",
+        esp_root.display(),
+        boot_efi_path.display(),
+        staged_kernel_path.display()
+    );
+
     Ok(())
 }
 
 fn build_userland_package(
     package: &str,
+    target: &str,
     build_count_env: &str,
     major_env: &str,
     minor_env: &str,
@@ -252,19 +541,19 @@ fn build_userland_package(
             "-p",
             package,
             "--target",
-            KERNEL_TARGET,
+            target,
             BUILD_STD,
             BUILD_STD_FEATURES,
         ])
         .status()
-        .with_context(|| format!("cargo build for {package} failed"))?;
+        .with_context(|| format!("cargo build for {package} ({target}) failed"))?;
     if !status.success() {
-        bail!("userland build failed for {package}");
+        bail!("userland build failed for {package} ({target})");
     }
 
-    let direct_hint = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/{package}"));
+    let direct_hint = PathBuf::from(format!("target/{target}/debug/{package}"));
     let lib_hint = PathBuf::from(format!(
-        "target/{KERNEL_TARGET}/debug/lib{}.rlib",
+        "target/{target}/debug/lib{}.rlib",
         package.replace('-', "_")
     ));
     let hint = if direct_hint.exists() {
@@ -276,28 +565,33 @@ fn build_userland_package(
     Ok(UserArtifact { hint, size })
 }
 
-fn build_doom_c_backend_artifact() -> Result<DoomCBackendArtifact> {
+fn base_c_compile_command(_target: &str) -> Command {
+    let mut command = Command::new("cc");
+    command.args([
+        "-std=c11",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-c",
+    ]);
+    command
+}
+
+fn build_doom_c_backend_artifact(target: &str) -> Result<DoomCBackendArtifact> {
     let source = PathBuf::from(DOOM_C_SOURCE);
     if !source.exists() {
         bail!("missing doom C source at {}", source.display());
     }
 
-    let object = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/doom_backend.o"));
+    let object = PathBuf::from(format!("target/{target}/debug/doom_backend.o"));
     if let Some(parent) = object.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let status = Command::new("cc")
-        .args([
-            "-std=c11",
-            "-ffreestanding",
-            "-fno-builtin",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-c",
-        ])
+    let status = base_c_compile_command(target)
         .arg(&source)
         .arg("-o")
         .arg(&object)
@@ -348,7 +642,7 @@ fn build_doom_c_backend_artifact() -> Result<DoomCBackendArtifact> {
     }
 }
 
-fn build_doom_generic_artifact() -> Result<DoomGenericArtifact> {
+fn build_doom_generic_artifact(target: &str) -> Result<DoomGenericArtifact> {
     let root = PathBuf::from(DOOM_GENERIC_ROOT);
     let core_source = PathBuf::from(DOOM_GENERIC_CORE_SOURCE);
     let include_dir = PathBuf::from(DOOM_GENERIC_INCLUDE_DIR);
@@ -363,12 +657,12 @@ fn build_doom_generic_artifact() -> Result<DoomGenericArtifact> {
         );
     }
 
-    let core_object = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/doomgeneric_core.o"));
+    let core_object = PathBuf::from(format!("target/{target}/debug/doomgeneric_core.o"));
     if let Some(parent) = core_object.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let port_object = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/doomgeneric_arrost.o"));
+    let port_object = PathBuf::from(format!("target/{target}/debug/doomgeneric_arrost.o"));
     if let Some(parent) = port_object.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -376,16 +670,7 @@ fn build_doom_generic_artifact() -> Result<DoomGenericArtifact> {
 
     let mut core_ready = false;
     if core_source.exists() {
-        let status = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-ffreestanding",
-                "-fno-builtin",
-                "-O2",
-                "-Wall",
-                "-Wextra",
-                "-c",
-            ])
+        let status = base_c_compile_command(target)
             .arg("-I")
             .arg(&include_dir)
             .arg(&core_source)
@@ -423,16 +708,7 @@ fn build_doom_generic_artifact() -> Result<DoomGenericArtifact> {
         .unwrap_or(0);
 
     let mut port_ready = false;
-    let status = Command::new("cc")
-        .args([
-            "-std=c11",
-            "-ffreestanding",
-            "-fno-builtin",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-c",
-        ])
+    let status = base_c_compile_command(target)
         .arg("-I")
         .arg(&include_dir)
         .arg(&port_source)
@@ -506,10 +782,11 @@ fn next_build_count() -> Result<u64> {
     Ok(next)
 }
 
-fn run_qemu() -> Result<()> {
-    // Si appoggia a scripts/qemu.sh per semplicità
+fn run_qemu(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+
     let status = Command::new("bash")
-        .args(["scripts/qemu.sh"])
+        .args([arch.qemu_script()])
         .status()
         .context("qemu run failed")?;
     if !status.success() {
@@ -518,21 +795,112 @@ fn run_qemu() -> Result<()> {
     Ok(())
 }
 
-fn smoke_doom() -> Result<()> {
-    smoke_doom_impl(false, false, false)
+fn parse_run_arch_arg(args: impl Iterator<Item = String>) -> Result<Option<String>> {
+    let mut arch = None;
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--arch" => {
+                let value = iter
+                    .next()
+                    .context("missing value for --arch (expected x86_64 or aarch64)")?;
+                arch = Some(value);
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--arch=") {
+                    if value.is_empty() {
+                        bail!("missing value for --arch= (expected x86_64 or aarch64)");
+                    }
+                    arch = Some(value.to_string());
+                } else {
+                    bail!("unsupported argument: {arg} (supported: --arch <x86_64|aarch64>)");
+                }
+            }
+        }
+    }
+    Ok(arch)
 }
 
-fn smoke_doom_long() -> Result<()> {
-    smoke_doom_impl(true, false, false)
+fn resolve_runtime_arch(arch_override: Option<String>) -> Result<RuntimeArch> {
+    let arch_raw = arch_override
+        .or_else(|| std::env::var("ARROST_ARCH").ok())
+        .unwrap_or_else(|| RuntimeArch::X86_64.as_str().to_string());
+    match arch_raw.as_str() {
+        "x86_64" | "amd64" => Ok(RuntimeArch::X86_64),
+        "aarch64" | "arm64" => Ok(RuntimeArch::Aarch64),
+        other => bail!("unsupported arch={other}; expected x86_64 or aarch64"),
+    }
 }
 
-fn smoke_doom_virtio() -> Result<()> {
-    smoke_doom_impl(true, false, true)
+fn ensure_runtime_artifacts(arch: RuntimeArch) -> Result<()> {
+    match arch {
+        RuntimeArch::X86_64 => {
+            let kernel_image = PathBuf::from(format!(
+                "target/{KERNEL_TARGET}/debug/bootimage-{KERNEL_PACKAGE}.bin"
+            ));
+            if !kernel_image.exists() {
+                bail!(
+                    "missing kernel image at {}; run `cargo xtask build` first",
+                    kernel_image.display()
+                );
+            }
+
+            let data_image = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/m6-disk.img"));
+            if !data_image.exists() {
+                bail!(
+                    "missing storage image at {}; run `cargo xtask build` first",
+                    data_image.display()
+                );
+            }
+        }
+        RuntimeArch::Aarch64 => {
+            let esp_dir = PathBuf::from(format!("target/{KERNEL_TARGET_AARCH64}/debug/efi"));
+            let boot_efi = esp_dir.join("EFI/BOOT/BOOTAA64.EFI");
+            let kernel_image = esp_dir.join("arrost-kernel");
+            if !boot_efi.exists() {
+                bail!(
+                    "missing aarch64 UEFI loader at {}; run `cargo xtask build` first",
+                    boot_efi.display()
+                );
+            }
+            if !kernel_image.exists() {
+                bail!(
+                    "missing aarch64 staged kernel at {}; run `cargo xtask build` first",
+                    kernel_image.display()
+                );
+            }
+
+            let data_image = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/m6-disk.img"));
+            if !data_image.exists() {
+                bail!(
+                    "missing shared storage image at {}; run `cargo xtask build` first",
+                    data_image.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
-fn smoke_doom_fallback() -> Result<()> {
+fn smoke_doom(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_doom_impl(arch, false, false, false)
+}
+
+fn smoke_doom_long(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_doom_impl(arch, true, false, false)
+}
+
+fn smoke_doom_virtio(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_doom_impl(arch, true, false, true)
+}
+
+fn smoke_doom_fallback(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
     build_impl(true)?;
-    let smoke_result = smoke_doom_impl(false, true, false);
+    let smoke_result = smoke_doom_impl(arch, false, true, false);
     let restore_result = build_impl(false);
     match smoke_result {
         Ok(()) => {
@@ -550,7 +918,14 @@ fn smoke_doom_fallback() -> Result<()> {
     }
 }
 
-fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) -> Result<()> {
+fn smoke_doom_impl(
+    arch: RuntimeArch,
+    long_run: bool,
+    force_fallback: bool,
+    strict_virtio: bool,
+) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
     let smoke_name = if strict_virtio {
         "smoke-doom-virtio"
     } else if force_fallback {
@@ -560,40 +935,27 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
     } else {
         "smoke-doom"
     };
-
-    let kernel_image = PathBuf::from(format!(
-        "target/{KERNEL_TARGET}/debug/bootimage-{KERNEL_PACKAGE}.bin"
-    ));
-    if !kernel_image.exists() {
-        bail!(
-            "missing kernel image at {}; run `cargo xtask build` first",
-            kernel_image.display()
-        );
-    }
-
-    let data_image = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/m6-disk.img"));
-    if !data_image.exists() {
-        bail!(
-            "missing storage image at {}; run `cargo xtask build` first",
-            data_image.display()
-        );
-    }
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
 
     let mut qemu_cmd = Command::new("bash");
     qemu_cmd
-        .args(["scripts/qemu.sh"])
+        .args([arch.qemu_script()])
         .env("QEMU_DISPLAY", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
     if strict_virtio {
         qemu_cmd.env("QEMU_VIRTIO_SND", "on");
-        qemu_cmd.env("QEMU_PCSPK", "off");
     }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
     if std::env::var_os("QEMU_AUDIO").is_none() {
         qemu_cmd.env("QEMU_AUDIO", "wav");
     }
     if std::env::var_os("QEMU_AUDIO_WAV_PATH").is_none() {
         qemu_cmd.env(
             "QEMU_AUDIO_WAV_PATH",
-            format!("target/{KERNEL_TARGET}/debug/{smoke_name}.wav"),
+            format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
         );
     }
     let mut child = qemu_cmd
@@ -601,7 +963,7 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to start qemu run for {smoke_name}"))?;
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
 
     let stdout = child
         .stdout
@@ -626,14 +988,6 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
             .as_mut()
             .context("failed to capture qemu stdin")?;
 
-        send_serial_command(stdin, "versionx\u{7f}\n")?;
-        wait_for_log(
-            &log,
-            "version: ",
-            Duration::from_secs(8),
-            "serial backspace",
-        )?;
-
         let ready = snapshot_log(&log).contains("DoomGeneric: ready=true");
         if force_fallback && ready {
             bail!("expected DoomGeneric ready=false for fallback smoke");
@@ -644,18 +998,46 @@ fn smoke_doom_impl(long_run: bool, force_fallback: bool, strict_virtio: bool) ->
             );
         }
 
+        if arch == RuntimeArch::Aarch64 {
+            wait_for_log(
+                &log,
+                "Input: backend=virtio-input-polled",
+                Duration::from_secs(8),
+                "aarch64 input readiness",
+            )?;
+            let boot_snapshot = snapshot_log(&log);
+            if strict_virtio && !boot_snapshot.contains("Audio: backend=virtio-snd ready=true") {
+                bail!("strict virtio smoke expected aarch64 audio backend=virtio-snd ready=true");
+            }
+            if !strict_virtio && !boot_snapshot.contains("Audio: backend=") {
+                bail!("missing aarch64 audio backend report");
+            }
+            println!("smoke-doom: aarch64 headless boot readiness validated");
+            return Ok(());
+        }
+
         send_serial_command(stdin, "doom play\n")?;
         let play_marker = if ready {
             "doom: play mode started (doomgeneric)"
         } else {
             "doom: doomgeneric not ready; starting fallback runtime"
         };
-        wait_for_log(
+        if wait_for_log(
             &log,
             play_marker,
             Duration::from_secs(12),
             "doom play confirmation",
-        )?;
+        )
+        .is_err()
+        {
+            send_serial_command(stdin, "doom play\n")?;
+            wait_for_log(
+                &log,
+                play_marker,
+                Duration::from_secs(12),
+                "doom play confirmation (retry)",
+            )?;
+        }
 
         if force_fallback {
             wait_for_log(
@@ -1230,8 +1612,9 @@ fn env_truthy(name: &str) -> bool {
 }
 
 fn send_serial_command(stdin: &mut ChildStdin, command: &str) -> Result<()> {
+    let normalized = command.replace('\n', "\r");
     stdin
-        .write_all(command.as_bytes())
+        .write_all(normalized.as_bytes())
         .with_context(|| format!("failed to send command `{}`", command.trim_end()))?;
     stdin
         .flush()

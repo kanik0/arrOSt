@@ -1,5 +1,5 @@
 // kernel/src/net/mod.rs: M7 virtio-net legacy driver + minimal IPv4/ARP/ICMP/UDP stack.
-use crate::arch::x86_64::port;
+use crate::arch::port;
 use crate::mem;
 use crate::serial;
 use crate::time;
@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, Ordering, fence};
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 const VIRTIO_NET_TRANSITIONAL_ID: u16 = 0x1000;
 const VIRTIO_NET_MODERN_ID: u16 = 0x1041;
+const FALLBACK_IO_BASE: u16 = 0x1200;
 
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -39,6 +40,9 @@ const TX_QUEUE_INDEX: u16 = 1;
 const MAX_QUEUE_SIZE: u16 = 256;
 const MAX_QUEUE_SIZE_USIZE: usize = MAX_QUEUE_SIZE as usize;
 const VRING_ALIGN: usize = 4096;
+#[cfg(target_arch = "aarch64")]
+const MAX_POLL_SPINS: usize = 50_000_000;
+#[cfg(not(target_arch = "aarch64"))]
 const MAX_POLL_SPINS: usize = 2_000_000;
 
 const NET_HDR_SIZE: usize = size_of::<VirtioNetHdr>();
@@ -438,7 +442,6 @@ pub enum NetError {
     NotReady,
     NotFound,
     QueueUnavailable,
-    QueueTooLarge,
     AddressTranslationFailed,
     FrameTooLarge,
     IoTimeout,
@@ -452,7 +455,6 @@ impl NetError {
             Self::NotReady => "not_ready",
             Self::NotFound => "not_found",
             Self::QueueUnavailable => "queue_unavailable",
-            Self::QueueTooLarge => "queue_too_large",
             Self::AddressTranslationFailed => "address_translation_failed",
             Self::FrameTooLarge => "frame_too_large",
             Self::IoTimeout => "io_timeout",
@@ -623,7 +625,25 @@ impl NetState {
         );
         self.ready = true;
 
-        if !self.try_dhcp()? {
+        let dhcp_ok = match self.try_dhcp() {
+            Ok(ok) => ok,
+            Err(error) => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    serial::write_fmt(format_args!(
+                        "Net: DHCP error ({}) -> using static 10.0.2.15/24 gw 10.0.2.2\n",
+                        error.as_str()
+                    ));
+                    false
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    return Err(error);
+                }
+            }
+        };
+
+        if !dhcp_ok {
             self.config_source = IpConfigSource::Static;
             serial::write_line("Net: DHCP unavailable, using static 10.0.2.15/24 gw 10.0.2.2");
         } else {
@@ -652,14 +672,19 @@ impl NetState {
 
     fn setup_queue(&mut self, queue: u16) -> Result<(), NetError> {
         self.virtio_write_u16(VIRTIO_PCI_QUEUE_SEL, queue);
-        let size = self.virtio_read_u16(VIRTIO_PCI_QUEUE_NUM);
-        if size == 0 {
+        let queue_max = self.virtio_read_u16(VIRTIO_PCI_QUEUE_NUM);
+        if queue_max == 0 {
             self.virtio_write_status(VIRTIO_STATUS_FAILED);
             return Err(NetError::QueueUnavailable);
         }
-        if size > MAX_QUEUE_SIZE {
+        let negotiated = queue_max.min(MAX_QUEUE_SIZE);
+        self.virtio_write_u16(VIRTIO_PCI_QUEUE_NUM, negotiated);
+        let size = self
+            .virtio_read_u16(VIRTIO_PCI_QUEUE_NUM)
+            .min(MAX_QUEUE_SIZE);
+        if size == 0 {
             self.virtio_write_status(VIRTIO_STATUS_FAILED);
-            return Err(NetError::QueueTooLarge);
+            return Err(NetError::QueueUnavailable);
         }
 
         // SAFETY: `NET_LOCK` serializes exclusive access to queue memory.
@@ -2410,7 +2435,23 @@ fn tx_frame_ptr() -> *mut u8 {
     unsafe { (*TX_BUFFER.0.get()).frame.as_mut_ptr() }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn find_virtio_net_pci() -> Option<PciLocation> {
+    port::virtio_net_io_base().map(|io_base| PciLocation {
+        bus: 0,
+        device: 0,
+        function: 0,
+        device_id: VIRTIO_NET_TRANSITIONAL_ID,
+        io_base,
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn find_virtio_net_pci() -> Option<PciLocation> {
+    find_virtio_net_pci_scan()
+}
+
+fn find_virtio_net_pci_scan() -> Option<PciLocation> {
     for bus in 0u16..=255u16 {
         for device in 0u16..32u16 {
             for function in 0u16..8u16 {
@@ -2429,8 +2470,18 @@ fn find_virtio_net_pci() -> Option<PciLocation> {
                     continue;
                 }
 
-                let bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
-                if (bar0 & 0x1) == 0 {
+                let mut bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
+                if (bar0 & 0x1) == 0 || (bar0 & !0x3) == 0 {
+                    pci_write_u32(
+                        bus as u8,
+                        device as u8,
+                        function as u8,
+                        0x10,
+                        u32::from(FALLBACK_IO_BASE) | 0x1,
+                    );
+                    bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
+                }
+                if (bar0 & 0x1) == 0 || (bar0 & !0x3) == 0 {
                     continue;
                 }
                 let io_base = (bar0 & !0x3) as u16;

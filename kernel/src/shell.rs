@@ -369,7 +369,7 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
     if input == "doom audio" {
-        serial::write_line("usage: doom audio <on|off|virtio|pcspk|status|test>");
+        serial::write_line("usage: doom audio <on|off|virtio|status|test>");
         return;
     }
     if input == "doom audio status" {
@@ -482,10 +482,7 @@ fn run_command(shell: &mut ShellState) {
                 let mode = audio::set_mode(audio::AudioMode::Virtio);
                 serial::write_fmt(format_args!("doom: audio mode set to {}\n", mode.as_str()));
             }
-            "pcspk" | "pcspeaker" => {
-                let _ = audio::set_mode(audio::AudioMode::PcSpeaker);
-                serial::write_line("doom: audio mode set to pcspk");
-            }
+            "pcspk" | "pcspeaker" => serial::write_line("doom: pcspk mode not supported"),
             "status" => log_doom_audio_status(),
             "test" => {
                 if audio::play_test_tone() {
@@ -494,7 +491,7 @@ fn run_command(shell: &mut ShellState) {
                     serial::write_line("doom: audio test unavailable (mode=off)");
                 }
             }
-            _ => serial::write_line("usage: doom audio <on|off|virtio|pcspk|status|test>"),
+            _ => serial::write_line("usage: doom audio <on|off|virtio|status|test>"),
         }
         return;
     }
@@ -525,7 +522,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|pcspk|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
+                "help: help | version | ticks | uptime | user | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
             );
         }
         "version" => {

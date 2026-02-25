@@ -174,6 +174,23 @@ impl Rect {
             .max(other.y.saturating_add(other.h));
         Self::new(x0, y0, x1 - x0, y1 - y0)
     }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = self
+            .x
+            .saturating_add(self.w)
+            .min(other.x.saturating_add(other.w));
+        let y1 = self
+            .y
+            .saturating_add(self.h)
+            .min(other.y.saturating_add(other.h));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Self::new(x0, y0, x1 - x0, y1 - y0))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -408,6 +425,7 @@ impl<const CAPACITY: usize> ByteQueue<CAPACITY> {
 
 #[derive(Clone, Copy)]
 struct GfxStatus {
+    backend: &'static str,
     width: usize,
     height: usize,
     stride: usize,
@@ -566,6 +584,7 @@ fn with_doom_view_pixels_mut<R>(f: impl FnOnce(&mut [u32; DOOM_VIEW_MAX_PIXELS])
 }
 
 struct GfxState {
+    backend: &'static str,
     buffer_ptr: *mut u8,
     buffer_len: usize,
     backbuffer: Option<Vec<u8>>,
@@ -605,13 +624,24 @@ struct GfxState {
 }
 
 impl GfxState {
-    fn new(buffer_ptr: *mut u8, buffer_len: usize, info: FrameBufferInfo) -> Self {
+    fn new(
+        backend: &'static str,
+        buffer_ptr: *mut u8,
+        buffer_len: usize,
+        info: FrameBufferInfo,
+    ) -> Self {
         let backbuffer = None;
         let primary_w = min(640, info.width.saturating_sub(80)).max(280);
         let primary_h = min(290, info.height.saturating_sub(120)).max(180);
         let secondary_w = min(420, info.width.saturating_sub(110)).max(220);
         let secondary_h = min(210, info.height.saturating_sub(150)).max(140);
+        #[cfg(target_arch = "aarch64")]
+        let doom_w = min(360, info.width.saturating_sub(140)).max(280);
+        #[cfg(not(target_arch = "aarch64"))]
         let doom_w = min(560, info.width.saturating_sub(120)).max(340);
+        #[cfg(target_arch = "aarch64")]
+        let doom_h = min(260, info.height.saturating_sub(140)).max(200);
+        #[cfg(not(target_arch = "aarch64"))]
         let doom_h = min(420, info.height.saturating_sub(100)).max(260);
         let doom_x = info.width.saturating_sub(doom_w) / 2;
         let doom_y = info.height.saturating_sub(doom_h) / 2;
@@ -629,6 +659,7 @@ impl GfxState {
         ];
 
         Self {
+            backend,
             buffer_ptr,
             buffer_len,
             backbuffer,
@@ -1196,6 +1227,22 @@ impl GfxState {
         )
     }
 
+    fn rect_inside_rect(rect: Rect, bounds: Rect) -> bool {
+        let rect_x1 = rect.x.saturating_add(rect.w);
+        let rect_y1 = rect.y.saturating_add(rect.h);
+        let bounds_x1 = bounds.x.saturating_add(bounds.w);
+        let bounds_y1 = bounds.y.saturating_add(bounds.h);
+        rect.x >= bounds.x && rect.y >= bounds.y && rect_x1 <= bounds_x1 && rect_y1 <= bounds_y1
+    }
+
+    fn rect_inside_window(&self, index: usize, rect: Rect) -> bool {
+        if index >= WINDOW_COUNT || !self.window_visible(index) {
+            return false;
+        }
+        let window = self.window_rect(index);
+        Self::rect_inside_rect(rect, window)
+    }
+
     fn window_text_area_rect(&self, index: usize) -> Rect {
         let window = self.windows[index];
         let x = window.x.saturating_add(WINDOW_PADDING);
@@ -1347,17 +1394,42 @@ impl GfxState {
 
     fn redraw_region(&mut self, rect: Rect) {
         self.clip = Some(rect);
-        self.draw_desktop_background();
-        self.draw_top_bar();
-
-        for index in 0..WINDOW_COUNT {
-            if !self.window_visible(index) {
-                continue;
+        let mut rendered = false;
+        if self.doom_window_open
+            && self.doom_view.active
+            && self.focused_window == DOOM_WINDOW_INDEX
+        {
+            let doom_window = self.windows[DOOM_WINDOW_INDEX];
+            let viewport_only = self
+                .doom_view_damage_rect(doom_window)
+                .map(|damage| Self::rect_inside_rect(rect, damage))
+                .unwrap_or(false);
+            if viewport_only {
+                // Doom focused + viewport-only damage: skip full window text/chrome redraw.
+                self.draw_doom_view(doom_window);
+                self.draw_pointer();
+                rendered = true;
+            } else if self.rect_inside_window(DOOM_WINDOW_INDEX, rect) {
+                let focused = true;
+                self.draw_window(DOOM_WINDOW_INDEX, doom_window, focused);
+                self.draw_pointer();
+                rendered = true;
             }
-            let focused = index == self.focused_window;
-            self.draw_window(index, self.windows[index], focused);
         }
-        self.draw_pointer();
+
+        if !rendered {
+            self.draw_desktop_background();
+            self.draw_top_bar();
+
+            for index in 0..WINDOW_COUNT {
+                if !self.window_visible(index) {
+                    continue;
+                }
+                let focused = index == self.focused_window;
+                self.draw_window(index, self.windows[index], focused);
+            }
+            self.draw_pointer();
+        }
 
         self.clip = None;
         self.present_rect(rect);
@@ -1411,6 +1483,7 @@ impl GfxState {
             .map(|window| window.minimized)
             .unwrap_or(false);
         GfxStatus {
+            backend: self.backend,
             width: self.info.width,
             height: self.info.height,
             stride: self.info.stride,
@@ -1645,7 +1718,7 @@ impl GfxState {
         let src_h = self.doom_view.height as u64;
         let body_w_u64 = body_w as u64;
         let body_h_u64 = body_h as u64;
-        let (draw_w, draw_h) =
+        let (mut draw_w, mut draw_h) =
             if body_w_u64.saturating_mul(src_h) <= body_h_u64.saturating_mul(src_w) {
                 let width = body_w.max(1);
                 let height = ((body_w_u64.saturating_mul(src_h) / src_w) as usize).max(1);
@@ -1655,6 +1728,13 @@ impl GfxState {
                 let width = ((body_h_u64.saturating_mul(src_w) / src_h) as usize).max(1);
                 (width, height)
             };
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Keep viewport at native Doom resolution on aarch64 to avoid
+            // expensive upscaling in software emulation (TCG).
+            draw_w = draw_w.min(self.doom_view.width.max(1));
+            draw_h = draw_h.min(self.doom_view.height.max(1));
+        }
         if draw_w == 0 || draw_h == 0 {
             return None;
         }
@@ -1665,18 +1745,115 @@ impl GfxState {
 
     fn doom_view_damage_rect(&self, window: UiWindow) -> Option<Rect> {
         let (draw_x, draw_y, draw_w, draw_h) = self.doom_view_layout(window)?;
-        let title_y = draw_y.saturating_sub(11);
         let x0 = draw_x.saturating_sub(2);
-        let y0 = title_y.saturating_sub(1);
+        let y0 = draw_y.saturating_sub(2);
         let x1 = draw_x.saturating_add(draw_w).saturating_add(2);
-        let y1 = draw_y
-            .saturating_add(draw_h)
-            .saturating_add(2)
-            .max(title_y.saturating_add(CHAR_H));
+        let y1 = draw_y.saturating_add(draw_h).saturating_add(2);
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
         Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    fn clip_rect_in_framebuffer(&self, rect: Rect) -> Option<Rect> {
+        let mut clipped = rect.clamped(self.info.width, self.info.height)?;
+        if let Some(active_clip) = self.clip {
+            let active_clip = active_clip.clamped(self.info.width, self.info.height)?;
+            clipped = clipped.intersection(active_clip)?;
+        }
+        Some(clipped)
+    }
+
+    fn blit_doom_native_rgb(
+        &mut self,
+        draw_x: usize,
+        draw_y: usize,
+        draw_w: usize,
+        draw_h: usize,
+        src_w: usize,
+        src_h: usize,
+        pixels: &[u32; DOOM_VIEW_MAX_PIXELS],
+    ) -> bool {
+        if draw_w != src_w || draw_h != src_h {
+            return false;
+        }
+        if self.info.bytes_per_pixel < 3 {
+            return false;
+        }
+
+        let Some(target) = self.clip_rect_in_framebuffer(Rect::new(draw_x, draw_y, draw_w, draw_h))
+        else {
+            return true;
+        };
+
+        let stride = self.info.stride;
+        let bytes_per_pixel = self.info.bytes_per_pixel;
+        let pixel_format = self.info.pixel_format;
+        let row_width = target.w;
+        let source_x_offset = target.x.saturating_sub(draw_x);
+        let row_bytes = row_width.saturating_mul(bytes_per_pixel);
+
+        let blit_into = |buffer: &mut [u8]| -> bool {
+            for y in target.y..target.y.saturating_add(target.h) {
+                let source_y = y.saturating_sub(draw_y);
+                if source_y >= src_h {
+                    return false;
+                }
+                let source_row = source_y
+                    .saturating_mul(src_w)
+                    .saturating_add(source_x_offset);
+                let pixel_index = y.saturating_mul(stride).saturating_add(target.x);
+                let byte_offset = pixel_index.saturating_mul(bytes_per_pixel);
+                if byte_offset.saturating_add(row_bytes) > buffer.len() {
+                    return false;
+                }
+
+                let mut source = source_row;
+                let mut out = byte_offset;
+                for _ in 0..row_width {
+                    if source >= src_w.saturating_mul(src_h) {
+                        return false;
+                    }
+                    let rgb = pixels[source] & 0x00FF_FFFF;
+                    match pixel_format {
+                        PixelFormat::Bgr => {
+                            buffer[out] = (rgb & 0xFF) as u8;
+                            buffer[out + 1] = ((rgb >> 8) & 0xFF) as u8;
+                            buffer[out + 2] = ((rgb >> 16) & 0xFF) as u8;
+                        }
+                        PixelFormat::U8 => {
+                            let r = ((rgb >> 16) & 0xFF) as u16;
+                            let g = ((rgb >> 8) & 0xFF) as u16;
+                            let b = (rgb & 0xFF) as u16;
+                            buffer[out] = ((r + g + b) / 3) as u8;
+                            if bytes_per_pixel > 1 {
+                                buffer[out + 1] = buffer[out];
+                            }
+                            if bytes_per_pixel > 2 {
+                                buffer[out + 2] = buffer[out];
+                            }
+                        }
+                        _ => {
+                            buffer[out] = ((rgb >> 16) & 0xFF) as u8;
+                            buffer[out + 1] = ((rgb >> 8) & 0xFF) as u8;
+                            buffer[out + 2] = (rgb & 0xFF) as u8;
+                        }
+                    }
+                    source = source.saturating_add(1);
+                    out = out.saturating_add(bytes_per_pixel);
+                }
+            }
+            true
+        };
+
+        if let Some(backbuffer) = self.backbuffer.as_mut() {
+            return blit_into(backbuffer);
+        }
+
+        // SAFETY: framebuffer pointer/len are owned by this state and validated at init.
+        let framebuffer =
+            unsafe { core::slice::from_raw_parts_mut(self.buffer_ptr, self.buffer_len) };
+        blit_into(framebuffer)
     }
 
     fn draw_doom_view(&mut self, window: UiWindow) {
@@ -1698,9 +1875,12 @@ impl GfxState {
             draw_h.saturating_add(4),
             border_color,
         );
-        self.fill_rect(draw_x, draw_y, draw_w, draw_h, panel_color);
 
         with_doom_view_pixels(|pixels| {
+            if self.blit_doom_native_rgb(draw_x, draw_y, draw_w, draw_h, src_w, src_h, pixels) {
+                return;
+            }
+            self.fill_rect(draw_x, draw_y, draw_w, draw_h, panel_color);
             if draw_w == src_w && draw_h == src_h {
                 for y in 0..src_h {
                     for x in 0..src_w {
@@ -2013,36 +2193,30 @@ unsafe impl Sync for GfxCell {}
 
 static GFX_STATE: GfxCell = GfxCell(UnsafeCell::new(None));
 
-pub fn init(boot_info: &mut BootInfo) -> GfxInitReport {
-    let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
-        return GfxInitReport {
-            backend: "none",
-            ready: false,
-            width: 0,
-            height: 0,
-            stride: 0,
-            bytes_per_pixel: 0,
-            pixel_format: "none",
-            windows: 0,
-        };
-    };
+fn headless_report() -> GfxInitReport {
+    GfxInitReport {
+        backend: "none",
+        ready: false,
+        width: 0,
+        height: 0,
+        stride: 0,
+        bytes_per_pixel: 0,
+        pixel_format: "none",
+        windows: 0,
+    }
+}
 
-    let info = framebuffer.info();
-    let buffer = framebuffer.buffer_mut();
-    if buffer.is_empty() || info.width == 0 || info.height == 0 {
-        return GfxInitReport {
-            backend: "none",
-            ready: false,
-            width: 0,
-            height: 0,
-            stride: 0,
-            bytes_per_pixel: 0,
-            pixel_format: "none",
-            windows: 0,
-        };
+fn init_framebuffer(
+    backend: &'static str,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+    info: FrameBufferInfo,
+) -> GfxInitReport {
+    if buffer_len == 0 || info.width == 0 || info.height == 0 {
+        return headless_report();
     }
 
-    let mut state = GfxState::new(buffer.as_mut_ptr(), buffer.len(), info);
+    let mut state = GfxState::new(backend, buffer_ptr, buffer_len, info);
     state.seed_content();
     state.redraw();
 
@@ -2052,7 +2226,7 @@ pub fn init(boot_info: &mut BootInfo) -> GfxInitReport {
     }
 
     GfxInitReport {
-        backend: "uefi-gop",
+        backend,
         ready: true,
         width: info.width,
         height: info.height,
@@ -2061,6 +2235,31 @@ pub fn init(boot_info: &mut BootInfo) -> GfxInitReport {
         pixel_format: pixel_format_name(info.pixel_format),
         windows: WINDOW_COUNT,
     }
+}
+
+pub fn init(boot_info: &mut BootInfo) -> GfxInitReport {
+    let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
+        return headless_report();
+    };
+
+    let info = framebuffer.info();
+    let buffer = framebuffer.buffer_mut();
+    init_framebuffer("uefi-gop", buffer.as_mut_ptr(), buffer.len(), info)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn init_aarch64_framebuffer(
+    backend: &'static str,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+    info: FrameBufferInfo,
+) -> GfxInitReport {
+    init_framebuffer(backend, buffer_ptr, buffer_len, info)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn init_headless() -> GfxInitReport {
+    headless_report()
 }
 
 pub fn poll() {
@@ -2167,7 +2366,8 @@ pub fn log_info() {
     match status {
         Some(status) => {
             serial::write_fmt(format_args!(
-                "ui: backend=uefi-gop ready=true {}x{} stride={} bpp={} fmt={} focused={} events={} dropped={} stdout_events={} stdout_dropped={} frames={} full_redraws={} partial_redraws={} present_full={} present_partial={} damage_dropped={} damage_coalesced={} double_buffer={} mouse=({}, {}) mouse_events={} mouse_focus_clicks={} drag_steps={} resize_steps={} minimize_toggles={} drag_active={} resize_active={} focused_minimized={} minimized_windows={}\n",
+                "ui: backend={} ready=true {}x{} stride={} bpp={} fmt={} focused={} events={} dropped={} stdout_events={} stdout_dropped={} frames={} full_redraws={} partial_redraws={} present_full={} present_partial={} damage_dropped={} damage_coalesced={} double_buffer={} mouse=({}, {}) mouse_events={} mouse_focus_clicks={} drag_steps={} resize_steps={} minimize_toggles={} drag_active={} resize_active={} focused_minimized={} minimized_windows={}\n",
+                status.backend,
                 status.width,
                 status.height,
                 status.stride,

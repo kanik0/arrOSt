@@ -1,13 +1,19 @@
-// kernel/src/audio.rs: audio runtime (virtio-sound PCM preferred, pc-speaker fallback).
-use crate::arch::x86_64::port;
+// kernel/src/audio.rs: audio runtime (virtio-sound PCM preferred).
+#[cfg(target_arch = "x86_64")]
+use crate::arch::port;
 use core::cell::UnsafeCell;
 
 mod virtio_sound;
 
+#[cfg(target_arch = "x86_64")]
 const PIT_INPUT_HZ: u32 = 1_193_182;
+#[cfg(target_arch = "x86_64")]
 const PIT_COMMAND: u16 = 0x43;
+#[cfg(target_arch = "x86_64")]
 const PIT_CHANNEL_2: u16 = 0x42;
+#[cfg(target_arch = "x86_64")]
 const SPEAKER_PORT: u16 = 0x61;
+#[cfg(target_arch = "x86_64")]
 const PIT_MODE_CHANNEL2_SQUARE: u8 = 0xB6;
 const PCM_MAX_HOLD_TICKS: u64 = 24;
 const PCM_MIN_HOLD_TICKS: u64 = 3;
@@ -96,7 +102,7 @@ impl AudioState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            mode: AudioMode::PcSpeaker,
+            mode: AudioMode::Off,
             active: false,
             tone_hz: 0,
             next_tone_update_tick: 0,
@@ -134,10 +140,10 @@ pub fn init() -> AudioInitReport {
                 detail: "ok",
             }
         } else {
-            state.mode = AudioMode::PcSpeaker;
+            state.mode = AudioMode::Off;
             AudioInitReport {
-                backend: "pc-speaker",
-                ready: true,
+                backend: "none",
+                ready: false,
                 detail: virtio.reason,
             }
         }
@@ -164,11 +170,7 @@ pub fn status() -> AudioStatus {
             pcm_tone_switches: state.pcm_tone_switches,
             pcm_hz_min: state.pcm_hz_min,
             pcm_hz_max: state.pcm_hz_max,
-            pcm_backend: if virtio.ready {
-                "virtio-snd"
-            } else {
-                "pc-speaker"
-            },
+            pcm_backend: if virtio.ready { "virtio-snd" } else { "off" },
             pcm_queue_pending: virtio.pending_packets,
             pcm_buffered_frames: virtio.buffered_frames,
             pcm_packets_submitted: virtio.submitted_packets,
@@ -242,8 +244,11 @@ pub fn set_mode(mode: AudioMode) -> AudioMode {
         }
 
         let mut selected = mode;
+        if selected == AudioMode::PcSpeaker {
+            selected = AudioMode::Off;
+        }
         if mode == AudioMode::Virtio && !virtio_sound::status().ready {
-            selected = AudioMode::PcSpeaker;
+            selected = AudioMode::Off;
         }
 
         match selected {
@@ -294,34 +299,7 @@ pub fn submit_pcm_i16(samples: &[i16], sample_rate: u32, channels: u8) -> usize 
                 state.active = queued > 0 || virtio_sound::status().pending_packets > 0;
                 samples.len()
             }
-            AudioMode::PcSpeaker => {
-                let Some(tone_hz) = estimate_tone_from_pcm(samples, sample_rate, src_channels)
-                else {
-                    return samples.len();
-                };
-                if state.pcm_hz_min == 0 || tone_hz < state.pcm_hz_min {
-                    state.pcm_hz_min = tone_hz;
-                }
-                if tone_hz > state.pcm_hz_max {
-                    state.pcm_hz_max = tone_hz;
-                }
-                if state.pcm_last_est_hz != 0 && state.pcm_last_est_hz != tone_hz {
-                    state.pcm_tone_switches = state.pcm_tone_switches.saturating_add(1);
-                }
-                state.pcm_last_est_hz = tone_hz;
-
-                let frame_count = samples
-                    .len()
-                    .checked_div(src_channels as usize)
-                    .unwrap_or(0)
-                    .max(1);
-                let safe_rate = sample_rate.max(1);
-                let hold_ticks = ((frame_count as u64) * u64::from(crate::time::PIT_HZ))
-                    .div_ceil(u64::from(safe_rate))
-                    .clamp(PCM_MIN_HOLD_TICKS, PCM_MAX_HOLD_TICKS);
-                apply_tone(state, tone_hz, hold_ticks);
-                samples.len()
-            }
+            AudioMode::PcSpeaker => samples.len(),
         }
     })
 }
@@ -446,9 +424,18 @@ fn apply_tone(state: &mut AudioState, tone_hz: u16, hold_ticks: u64) {
 }
 
 fn program_channel2(hz: u16) {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = hz;
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     let requested_hz = u32::from(hz.max(1));
+    #[cfg(target_arch = "x86_64")]
     let divisor = (PIT_INPUT_HZ / requested_hz).clamp(1, u32::from(u16::MAX)) as u16;
 
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: programming PIT channel 2 uses fixed legacy x86 ports.
     unsafe {
         port::outb(PIT_COMMAND, PIT_MODE_CHANNEL2_SQUARE);
@@ -458,6 +445,12 @@ fn program_channel2(hz: u16) {
 }
 
 fn enable_speaker() {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: port 0x61 controls the legacy PC speaker gate/data bits.
     unsafe {
         let value = port::inb(SPEAKER_PORT);
@@ -468,6 +461,12 @@ fn enable_speaker() {
 }
 
 fn disable_speaker() {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: port 0x61 controls the legacy PC speaker gate/data bits.
     unsafe {
         let value = port::inb(SPEAKER_PORT);

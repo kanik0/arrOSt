@@ -7,7 +7,14 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["kernel", "xtask", "crates/arrostd", "user/init", "user/doom"]
+members = [
+    "kernel",
+    "xtask",
+    "crates/arrostd",
+    "user/init",
+    "user/doom",
+    "boot/aarch64-uefi-loader",
+]
 
 [workspace.package]
 edition = "2024"

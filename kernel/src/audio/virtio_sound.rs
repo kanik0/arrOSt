@@ -1,15 +1,64 @@
 // kernel/src/audio/virtio_sound.rs: modern virtio-sound playback backend (PCM TX queue).
-use crate::arch::x86_64::port;
+use crate::arch::port;
 use crate::mem;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::mem::size_of;
+#[cfg(target_arch = "aarch64")]
+use core::ptr::without_provenance_mut;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 const VIRTIO_SOUND_MODERN_ID: u16 = 0x1059;
 const VIRTIO_SOUND_TRANSITIONAL_ID: u16 = 0x1018;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_PCI_MMIO_FALLBACK_BASE: u64 = 0x1000_0000;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_PCI_MMIO_FALLBACK_STRIDE: u64 = 0x0100_0000;
+
+#[cfg(target_arch = "aarch64")]
+const MMIO_VERSION: usize = 0x004;
+#[cfg(target_arch = "aarch64")]
+const MMIO_DEVICE_FEATURES: usize = 0x010;
+#[cfg(target_arch = "aarch64")]
+const MMIO_DEVICE_FEATURES_SEL: usize = 0x014;
+#[cfg(target_arch = "aarch64")]
+const MMIO_DRIVER_FEATURES: usize = 0x020;
+#[cfg(target_arch = "aarch64")]
+const MMIO_DRIVER_FEATURES_SEL: usize = 0x024;
+#[cfg(target_arch = "aarch64")]
+const MMIO_GUEST_PAGE_SIZE: usize = 0x028;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_SEL: usize = 0x030;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_NUM_MAX: usize = 0x034;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_NUM: usize = 0x038;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_ALIGN: usize = 0x03c;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_PFN: usize = 0x040;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_READY: usize = 0x044;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_NOTIFY: usize = 0x050;
+#[cfg(target_arch = "aarch64")]
+const MMIO_STATUS: usize = 0x070;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DESC_LOW: usize = 0x080;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DESC_HIGH: usize = 0x084;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DRIVER_LOW: usize = 0x090;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DRIVER_HIGH: usize = 0x094;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DEVICE_LOW: usize = 0x0A0;
+#[cfg(target_arch = "aarch64")]
+const MMIO_QUEUE_DEVICE_HIGH: usize = 0x0A4;
+#[cfg(target_arch = "aarch64")]
+const MMIO_CONFIG: usize = 0x100;
 
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -26,6 +75,7 @@ const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 const VIRTIO_STATUS_FAILED: u8 = 128;
+const VIRTIO_F_VERSION_1: u32 = 1;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -135,18 +185,38 @@ impl<const N: usize> VirtqUsed<N> {
     }
 }
 
+const LEGACY_VRING_ALIGN: usize = 4096;
+
+const fn align_up_usize(value: usize, align: usize) -> usize {
+    (value + (align - 1)) & !(align - 1)
+}
+
+const CTRL_DESC_BYTES: usize = size_of::<VirtqDesc>() * CTRL_QUEUE_SIZE;
+const CTRL_AVAIL_BYTES: usize = size_of::<VirtqAvail<CTRL_QUEUE_SIZE>>();
+const CTRL_QUEUE_PAD_BYTES: usize =
+    align_up_usize(CTRL_DESC_BYTES + CTRL_AVAIL_BYTES, LEGACY_VRING_ALIGN)
+        - (CTRL_DESC_BYTES + CTRL_AVAIL_BYTES);
+
+const TX_DESC_BYTES: usize = size_of::<VirtqDesc>() * TX_QUEUE_SIZE;
+const TX_AVAIL_BYTES: usize = size_of::<VirtqAvail<TX_QUEUE_SIZE>>();
+const TX_QUEUE_PAD_BYTES: usize =
+    align_up_usize(TX_DESC_BYTES + TX_AVAIL_BYTES, LEGACY_VRING_ALIGN)
+        - (TX_DESC_BYTES + TX_AVAIL_BYTES);
+
 #[repr(C, align(4096))]
-struct QueueMemory<const N: usize> {
+struct QueueMemory<const N: usize, const PAD: usize> {
     desc: [VirtqDesc; N],
     avail: VirtqAvail<N>,
+    pad: [u8; PAD],
     used: VirtqUsed<N>,
 }
 
-impl<const N: usize> QueueMemory<N> {
+impl<const N: usize, const PAD: usize> QueueMemory<N, PAD> {
     const fn new() -> Self {
         Self {
             desc: [VirtqDesc::EMPTY; N],
             avail: VirtqAvail::new(),
+            pad: [0; PAD],
             used: VirtqUsed::new(),
         }
     }
@@ -157,6 +227,7 @@ impl<const N: usize> QueueMemory<N> {
         self.avail.idx = 0;
         self.avail.ring.fill(0);
         self.avail.used_event = 0;
+        self.pad.fill(0);
         self.used.flags = 0;
         self.used.idx = 0;
         self.used.ring.fill(VirtqUsedElem::EMPTY);
@@ -164,15 +235,18 @@ impl<const N: usize> QueueMemory<N> {
     }
 }
 
-struct QueueMemoryCell<const N: usize>(UnsafeCell<QueueMemory<N>>);
+type CtrlQueueMemory = QueueMemory<CTRL_QUEUE_SIZE, CTRL_QUEUE_PAD_BYTES>;
+type TxQueueMemory = QueueMemory<TX_QUEUE_SIZE, TX_QUEUE_PAD_BYTES>;
+
+struct QueueMemoryCell<Q>(UnsafeCell<Q>);
 
 // SAFETY: access is serialized by the single-threaded kernel main loop.
-unsafe impl<const N: usize> Sync for QueueMemoryCell<N> {}
+unsafe impl<Q> Sync for QueueMemoryCell<Q> {}
 
-static CTRL_QUEUE_MEMORY: QueueMemoryCell<CTRL_QUEUE_SIZE> =
-    QueueMemoryCell(UnsafeCell::new(QueueMemory::new()));
-static TX_QUEUE_MEMORY: QueueMemoryCell<TX_QUEUE_SIZE> =
-    QueueMemoryCell(UnsafeCell::new(QueueMemory::new()));
+static CTRL_QUEUE_MEMORY: QueueMemoryCell<CtrlQueueMemory> =
+    QueueMemoryCell(UnsafeCell::new(CtrlQueueMemory::new()));
+static TX_QUEUE_MEMORY: QueueMemoryCell<TxQueueMemory> =
+    QueueMemoryCell(UnsafeCell::new(TxQueueMemory::new()));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -389,6 +463,12 @@ struct DriverState {
     notify_base: *mut u8,
     notify_multiplier: u32,
     device_cfg: *const VirtioSndConfig,
+    #[cfg(target_arch = "aarch64")]
+    mmio_base: usize,
+    #[cfg(target_arch = "aarch64")]
+    use_mmio: bool,
+    #[cfg(target_arch = "aarch64")]
+    mmio_version: u32,
     ctrl_queue: QueueHandle,
     tx_queue: QueueHandle,
     stream_id: u32,
@@ -427,6 +507,12 @@ impl DriverState {
             notify_base: core::ptr::null_mut(),
             notify_multiplier: 0,
             device_cfg: core::ptr::null(),
+            #[cfg(target_arch = "aarch64")]
+            mmio_base: 0,
+            #[cfg(target_arch = "aarch64")]
+            use_mmio: false,
+            #[cfg(target_arch = "aarch64")]
+            mmio_version: 0,
             ctrl_queue: QueueHandle {
                 size: 0,
                 notify_off: 0,
@@ -523,43 +609,106 @@ impl DriverState {
     }
 
     fn try_init(&mut self) -> Result<(), &'static str> {
-        let (pci, caps) = find_virtio_sound_pci().ok_or("virtio_snd_not_found")?;
-        self.pci_device_id = pci.device_id;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mmio_base = port::virtio_sound_mmio_base().ok_or("virtio_snd_not_found")?;
+            self.use_mmio = true;
+            self.mmio_base = mmio_base;
+            self.mmio_version = self.mmio_read_u32(MMIO_VERSION);
+            if self.mmio_version == 0 {
+                return Err("virtio_snd_mmio_bad_version");
+            }
+            self.pci_device_id = VIRTIO_SOUND_MODERN_ID;
+            self.common_cfg = core::ptr::null_mut();
+            self.notify_base = core::ptr::null_mut();
+            self.notify_multiplier = 0;
+            self.device_cfg =
+                without_provenance_mut::<VirtioSndConfig>(mmio_base + MMIO_CONFIG) as *const _;
 
-        let common_cfg_ptr = map_cap_region(&pci, caps.common).ok_or("virtio_snd_common_map")?;
-        let notify_ptr = map_cap_region(&pci, caps.notify).ok_or("virtio_snd_notify_map")?;
-        let device_cfg_ptr = map_cap_region(&pci, caps.device).ok_or("virtio_snd_device_map")?;
-        let _isr_ptr = caps.isr.and_then(|region| map_cap_region(&pci, region));
+            self.mmio_write_u32(MMIO_STATUS, 0);
+            self.mmio_write_u32(MMIO_STATUS, u32::from(VIRTIO_STATUS_ACK));
+            self.mmio_write_u32(
+                MMIO_STATUS,
+                u32::from(VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER),
+            );
+            if self.mmio_version > 1 {
+                self.mmio_write_u32(MMIO_DEVICE_FEATURES_SEL, 1);
+                let host_features_hi = self.mmio_read_u32(MMIO_DEVICE_FEATURES);
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES_SEL, 0);
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES, 0);
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES_SEL, 1);
+                let mut guest_features_hi = 0u32;
+                if (host_features_hi & VIRTIO_F_VERSION_1) != 0 {
+                    guest_features_hi |= VIRTIO_F_VERSION_1;
+                }
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES, guest_features_hi);
+                self.mmio_write_u32(
+                    MMIO_STATUS,
+                    u32::from(VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK),
+                );
+                let status = self.mmio_read_u32(MMIO_STATUS) as u8;
+                if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
+                    return Err("virtio_snd_features_rejected");
+                }
+            } else {
+                self.mmio_write_u32(MMIO_DEVICE_FEATURES_SEL, 0);
+                let _host_features_lo = self.mmio_read_u32(MMIO_DEVICE_FEATURES);
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES_SEL, 0);
+                self.mmio_write_u32(MMIO_DRIVER_FEATURES, 0);
+            }
+        }
 
-        self.common_cfg = common_cfg_ptr as *mut VirtioPciCommonCfg;
-        self.notify_base = notify_ptr;
-        self.notify_multiplier = caps.notify_multiplier.max(2);
-        self.device_cfg = device_cfg_ptr as *const VirtioSndConfig;
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let (pci, caps) = find_virtio_sound_pci().ok_or("virtio_snd_not_found")?;
+            self.pci_device_id = pci.device_id;
 
-        // SAFETY: pointers come from validated PCI capabilities and remain stable after init.
-        unsafe {
-            write_volatile(addr_of_mut!((*self.common_cfg).device_status), 0);
-            write_volatile(
-                addr_of_mut!((*self.common_cfg).device_status),
-                VIRTIO_STATUS_ACK,
-            );
-            write_volatile(
-                addr_of_mut!((*self.common_cfg).device_status),
-                VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER,
-            );
-            write_volatile(addr_of_mut!((*self.common_cfg).device_feature_select), 0);
-            let _ = read_volatile(addr_of!((*self.common_cfg).device_feature));
-            write_volatile(addr_of_mut!((*self.common_cfg).guest_feature_select), 0);
-            write_volatile(addr_of_mut!((*self.common_cfg).guest_feature), 0);
-            write_volatile(addr_of_mut!((*self.common_cfg).guest_feature_select), 1);
-            write_volatile(addr_of_mut!((*self.common_cfg).guest_feature), 0);
-            write_volatile(
-                addr_of_mut!((*self.common_cfg).device_status),
-                VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
-            );
-            let status = read_volatile(addr_of!((*self.common_cfg).device_status));
-            if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
-                return Err("virtio_snd_features_rejected");
+            let common_cfg_ptr =
+                map_cap_region(&pci, caps.common).ok_or("virtio_snd_common_map")?;
+            let notify_ptr = map_cap_region(&pci, caps.notify).ok_or("virtio_snd_notify_map")?;
+            let device_cfg_ptr =
+                map_cap_region(&pci, caps.device).ok_or("virtio_snd_device_map")?;
+            let _isr_ptr = caps.isr.and_then(|region| map_cap_region(&pci, region));
+
+            self.common_cfg = common_cfg_ptr as *mut VirtioPciCommonCfg;
+            self.notify_base = notify_ptr;
+            self.notify_multiplier = caps.notify_multiplier.max(2);
+            self.device_cfg = device_cfg_ptr as *const VirtioSndConfig;
+
+            // SAFETY: pointers come from validated PCI capabilities and remain stable after init.
+            unsafe {
+                write_volatile(addr_of_mut!((*self.common_cfg).device_status), 0);
+                write_volatile(
+                    addr_of_mut!((*self.common_cfg).device_status),
+                    VIRTIO_STATUS_ACK,
+                );
+                write_volatile(
+                    addr_of_mut!((*self.common_cfg).device_status),
+                    VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER,
+                );
+                write_volatile(addr_of_mut!((*self.common_cfg).device_feature_select), 0);
+                let _host_features_lo = read_volatile(addr_of!((*self.common_cfg).device_feature));
+                write_volatile(addr_of_mut!((*self.common_cfg).device_feature_select), 1);
+                let host_features_hi = read_volatile(addr_of!((*self.common_cfg).device_feature));
+                write_volatile(addr_of_mut!((*self.common_cfg).guest_feature_select), 0);
+                write_volatile(addr_of_mut!((*self.common_cfg).guest_feature), 0);
+                write_volatile(addr_of_mut!((*self.common_cfg).guest_feature_select), 1);
+                let mut guest_features_hi = 0u32;
+                if (host_features_hi & VIRTIO_F_VERSION_1) != 0 {
+                    guest_features_hi |= VIRTIO_F_VERSION_1;
+                }
+                write_volatile(
+                    addr_of_mut!((*self.common_cfg).guest_feature),
+                    guest_features_hi,
+                );
+                write_volatile(
+                    addr_of_mut!((*self.common_cfg).device_status),
+                    VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
+                );
+                let status = read_volatile(addr_of!((*self.common_cfg).device_status));
+                if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
+                    return Err("virtio_snd_features_rejected");
+                }
             }
         }
 
@@ -569,14 +718,47 @@ impl DriverState {
             (*TX_QUEUE_MEMORY.0.get()).reset();
         }
 
-        self.ctrl_queue =
-            self.setup_queue::<CTRL_QUEUE_SIZE>(CTRL_QUEUE_INDEX, CTRL_QUEUE_SIZE_U16, unsafe {
-                &mut *CTRL_QUEUE_MEMORY.0.get()
-            })?;
-        self.tx_queue =
-            self.setup_queue::<TX_QUEUE_SIZE>(TX_QUEUE_INDEX, TX_QUEUE_SIZE_U16, unsafe {
-                &mut *TX_QUEUE_MEMORY.0.get()
-            })?;
+        self.ctrl_queue = self.setup_queue::<CTRL_QUEUE_SIZE, CTRL_QUEUE_PAD_BYTES>(
+            CTRL_QUEUE_INDEX,
+            CTRL_QUEUE_SIZE_U16,
+            unsafe { &mut *CTRL_QUEUE_MEMORY.0.get() },
+        )?;
+        self.tx_queue = self.setup_queue::<TX_QUEUE_SIZE, TX_QUEUE_PAD_BYTES>(
+            TX_QUEUE_INDEX,
+            TX_QUEUE_SIZE_U16,
+            unsafe { &mut *TX_QUEUE_MEMORY.0.get() },
+        )?;
+
+        #[cfg(target_arch = "aarch64")]
+        if self.use_mmio {
+            let mut status = VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK;
+            if self.mmio_version > 1 {
+                status |= VIRTIO_STATUS_FEATURES_OK;
+            }
+            self.mmio_write_u32(MMIO_STATUS, u32::from(status));
+        } else {
+            // SAFETY: same invariants as above for common cfg access.
+            unsafe {
+                write_volatile(
+                    addr_of_mut!((*self.common_cfg).device_status),
+                    VIRTIO_STATUS_ACK
+                        | VIRTIO_STATUS_DRIVER
+                        | VIRTIO_STATUS_FEATURES_OK
+                        | VIRTIO_STATUS_DRIVER_OK,
+                );
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        unsafe {
+            write_volatile(
+                addr_of_mut!((*self.common_cfg).device_status),
+                VIRTIO_STATUS_ACK
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK,
+            );
+        }
 
         let cfg = self.read_device_cfg();
         if cfg.streams == 0 {
@@ -601,21 +783,17 @@ impl DriverState {
         self.reason = "ok";
         self.ready = true;
 
-        // SAFETY: same invariants as above for common cfg access.
-        unsafe {
-            write_volatile(
-                addr_of_mut!((*self.common_cfg).device_status),
-                VIRTIO_STATUS_ACK
-                    | VIRTIO_STATUS_DRIVER
-                    | VIRTIO_STATUS_FEATURES_OK
-                    | VIRTIO_STATUS_DRIVER_OK,
-            );
-        }
-
         Ok(())
     }
 
     fn fail_device(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        if self.use_mmio {
+            let status = self.mmio_read_u32(MMIO_STATUS) as u8;
+            self.mmio_write_u32(MMIO_STATUS, u32::from(status | VIRTIO_STATUS_FAILED));
+            return;
+        }
+
         if self.common_cfg.is_null() {
             return;
         }
@@ -634,12 +812,71 @@ impl DriverState {
         unsafe { read_volatile(self.device_cfg) }
     }
 
-    fn setup_queue<const N: usize>(
+    fn setup_queue<const N: usize, const PAD: usize>(
         &mut self,
         queue_index: u16,
         desired_size: u16,
-        memory: &mut QueueMemory<N>,
+        memory: &mut QueueMemory<N, PAD>,
     ) -> Result<QueueHandle, &'static str> {
+        #[cfg(target_arch = "aarch64")]
+        if self.use_mmio {
+            self.mmio_write_u32(MMIO_QUEUE_SEL, u32::from(queue_index));
+            let max_size = self.mmio_read_u32(MMIO_QUEUE_NUM_MAX) as u16;
+            if max_size == 0 {
+                return Err("virtio_snd_queue_unavailable");
+            }
+
+            let size = floor_pow2(max_size.min(desired_size));
+            if size == 0 {
+                return Err("virtio_snd_queue_size_zero");
+            }
+            if usize::from(size) > N {
+                return Err("virtio_snd_queue_size_too_big");
+            }
+
+            self.mmio_write_u32(MMIO_QUEUE_NUM, u32::from(size));
+
+            if self.mmio_version <= 1 {
+                let queue_base_ptr = memory as *mut QueueMemory<N, PAD> as usize;
+                let queue_phys =
+                    mem::virt_to_phys(queue_base_ptr).ok_or("virtio_snd_desc_phys_missing")?;
+                if !queue_phys.is_multiple_of(LEGACY_VRING_ALIGN as u64) {
+                    return Err("virtio_snd_desc_phys_unaligned");
+                }
+                self.mmio_write_u32(MMIO_GUEST_PAGE_SIZE, 4096);
+                self.mmio_write_u32(MMIO_QUEUE_ALIGN, LEGACY_VRING_ALIGN as u32);
+                self.mmio_write_u32(MMIO_QUEUE_PFN, (queue_phys >> 12) as u32);
+                if self.mmio_read_u32(MMIO_QUEUE_PFN) == 0 {
+                    return Err("virtio_snd_queue_unavailable");
+                }
+            } else {
+                let desc_ptr = addr_of_mut!(memory.desc) as *mut VirtqDesc;
+                let avail_ptr = addr_of_mut!(memory.avail);
+                let used_ptr = addr_of_mut!(memory.used);
+
+                let desc_phys =
+                    mem::virt_to_phys(desc_ptr as usize).ok_or("virtio_snd_desc_phys_missing")?;
+                let avail_phys =
+                    mem::virt_to_phys(avail_ptr as usize).ok_or("virtio_snd_avail_phys_missing")?;
+                let used_phys =
+                    mem::virt_to_phys(used_ptr as usize).ok_or("virtio_snd_used_phys_missing")?;
+
+                self.mmio_write_u32(MMIO_QUEUE_DESC_LOW, desc_phys as u32);
+                self.mmio_write_u32(MMIO_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
+                self.mmio_write_u32(MMIO_QUEUE_DRIVER_LOW, avail_phys as u32);
+                self.mmio_write_u32(MMIO_QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32);
+                self.mmio_write_u32(MMIO_QUEUE_DEVICE_LOW, used_phys as u32);
+                self.mmio_write_u32(MMIO_QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32);
+                self.mmio_write_u32(MMIO_QUEUE_READY, 1);
+            }
+
+            return Ok(QueueHandle {
+                size,
+                notify_off: queue_index,
+                last_used_idx: 0,
+            });
+        }
+
         // SAFETY: common_cfg pointer was validated during init and queue access is serialized.
         unsafe {
             write_volatile(addr_of_mut!((*self.common_cfg).queue_select), queue_index);
@@ -683,6 +920,13 @@ impl DriverState {
     }
 
     fn notify_queue(&self, queue_index: u16, notify_off: u16) {
+        #[cfg(target_arch = "aarch64")]
+        if self.use_mmio {
+            let _ = notify_off;
+            self.mmio_write_u32(MMIO_QUEUE_NOTIFY, u32::from(queue_index));
+            return;
+        }
+
         let offset = usize::from(notify_off).saturating_mul(self.notify_multiplier as usize);
         // SAFETY: notify_base maps the virtio notify region and offset comes from device queue cfg.
         let notify_ptr = unsafe { self.notify_base.add(offset) as *mut u16 };
@@ -690,6 +934,23 @@ impl DriverState {
         unsafe {
             write_volatile(notify_ptr, queue_index);
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn mmio_read_u32(&self, offset: usize) -> u32 {
+        // SAFETY: caller ensures `mmio_base` points to a valid virtio-mmio device region.
+        unsafe { read_volatile(without_provenance_mut::<u32>(self.mmio_base + offset)) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn mmio_write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: caller ensures `mmio_base` points to a valid virtio-mmio device region.
+        unsafe {
+            write_volatile(
+                without_provenance_mut::<u32>(self.mmio_base + offset),
+                value,
+            )
+        };
     }
 
     fn send_ctrl(
@@ -767,6 +1028,15 @@ impl DriverState {
                 return Ok(status);
             }
             spin_loop();
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if self.use_mmio {
+            return if self.mmio_version <= 1 {
+                Err("virtio_snd_ctrl_timeout_mmio_v1")
+            } else {
+                Err("virtio_snd_ctrl_timeout_mmio_v2")
+            };
         }
 
         Err("virtio_snd_ctrl_timeout")
@@ -1517,10 +1787,67 @@ fn map_cap_region(location: &PciLocation, cap: CapRegion) -> Option<*mut u8> {
     if cap.length == 0 {
         return None;
     }
-    let bar_base = pci_bar_phys(location, cap.bar)?;
+    let mut bar_base = pci_bar_phys(location, cap.bar)?;
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bar_base == 0 {
+            if !assign_pci_bar_fallback(location, cap.bar) {
+                return None;
+            }
+            bar_base = pci_bar_phys(location, cap.bar)?;
+        }
+    }
     let phys = bar_base.checked_add(u64::from(cap.offset))?;
     let virt = mem::phys_to_virt(phys)?;
     Some(virt as *mut u8)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn assign_pci_bar_fallback(location: &PciLocation, bar: u8) -> bool {
+    if bar >= 6 {
+        return false;
+    }
+
+    let offset = 0x10u8.saturating_add(bar.saturating_mul(4));
+    let low = pci_read_u32(location.bus, location.device, location.function, offset);
+    if (low & 0x1) != 0 {
+        return false;
+    }
+
+    let assigned = AARCH64_PCI_MMIO_FALLBACK_BASE
+        .saturating_add(u64::from(bar).saturating_mul(AARCH64_PCI_MMIO_FALLBACK_STRIDE));
+    let low_value = ((assigned as u32) & !0xFu32) | (low & 0xFu32);
+
+    if (low & 0x6) == 0x4 {
+        if bar >= 5 {
+            return false;
+        }
+        let high_offset = offset.saturating_add(4);
+        pci_write_u32(
+            location.bus,
+            location.device,
+            location.function,
+            offset,
+            low_value,
+        );
+        pci_write_u32(
+            location.bus,
+            location.device,
+            location.function,
+            high_offset,
+            (assigned >> 32) as u32,
+        );
+    } else {
+        pci_write_u32(
+            location.bus,
+            location.device,
+            location.function,
+            offset,
+            low_value,
+        );
+    }
+
+    true
 }
 
 fn pci_bar_phys(location: &PciLocation, bar: u8) -> Option<u64> {

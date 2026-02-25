@@ -204,6 +204,15 @@ fn map_input_key(byte: u8) -> Option<u8> {
 }
 
 fn current_tick_millis() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // On aarch64 the PIT-compatible ticks are polled from the main loop.
+        // Doom init/tick can run while the shell command path is executing,
+        // so pump pending timer ticks here to keep Doom timing progressing.
+        for _ in 0..crate::arch::poll_timer_ticks() {
+            let _ = time::on_timer_tick();
+        }
+    }
     time::ticks().saturating_mul(10)
 }
 

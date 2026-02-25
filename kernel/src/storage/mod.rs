@@ -1,5 +1,5 @@
 // kernel/src/storage/mod.rs: M6 virtio-blk (legacy PCI) storage backend for QEMU.
-use crate::arch::x86_64::port;
+use crate::arch::port;
 use crate::mem;
 use crate::serial;
 use core::cell::UnsafeCell;
@@ -12,10 +12,14 @@ pub const SECTOR_SIZE: usize = 512;
 const MAX_QUEUE_SIZE: u16 = 256;
 const MAX_QUEUE_SIZE_USIZE: usize = MAX_QUEUE_SIZE as usize;
 const VRING_ALIGN: usize = 4096;
+#[cfg(target_arch = "aarch64")]
+const MAX_POLL_SPINS: usize = 50_000_000;
+#[cfg(not(target_arch = "aarch64"))]
 const MAX_POLL_SPINS: usize = 2_000_000;
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 const VIRTIO_BLK_TRANSITIONAL_ID: u16 = 0x1001;
 const VIRTIO_BLK_MODERN_ID: u16 = 0x1042;
+const FALLBACK_IO_BASE: u16 = 0x1000;
 
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -144,7 +148,6 @@ pub struct StorageInitReport {
 pub enum StorageError {
     NotReady,
     NotFound,
-    QueueTooSmall,
     QueueUnavailable,
     AddressTranslationFailed,
     OutOfRange,
@@ -157,7 +160,6 @@ impl StorageError {
         match self {
             Self::NotReady => "not_ready",
             Self::NotFound => "not_found",
-            Self::QueueTooSmall => "queue_too_small",
             Self::QueueUnavailable => "queue_unavailable",
             Self::AddressTranslationFailed => "address_translation_failed",
             Self::OutOfRange => "out_of_range",
@@ -269,14 +271,19 @@ impl StorageState {
         self.virtio_write_u32(VIRTIO_PCI_GUEST_FEATURES, host_features);
 
         self.virtio_write_u16(VIRTIO_PCI_QUEUE_SEL, 0);
-        let queue_size = self.virtio_read_u16(VIRTIO_PCI_QUEUE_NUM);
-        if queue_size == 0 {
+        let queue_max = self.virtio_read_u16(VIRTIO_PCI_QUEUE_NUM);
+        if queue_max == 0 {
             self.virtio_write_status(VIRTIO_STATUS_FAILED);
             return Err(StorageError::QueueUnavailable);
         }
-        if queue_size > MAX_QUEUE_SIZE {
+        let queue_size = queue_max.min(MAX_QUEUE_SIZE);
+        self.virtio_write_u16(VIRTIO_PCI_QUEUE_NUM, queue_size);
+        let queue_size = self
+            .virtio_read_u16(VIRTIO_PCI_QUEUE_NUM)
+            .min(MAX_QUEUE_SIZE);
+        if queue_size == 0 {
             self.virtio_write_status(VIRTIO_STATUS_FAILED);
-            return Err(StorageError::QueueTooSmall);
+            return Err(StorageError::QueueUnavailable);
         }
         self.queue_size = queue_size;
 
@@ -570,7 +577,23 @@ fn request_status_ptr() -> *mut u8 {
     unsafe { addr_of_mut!((*REQUEST_MEMORY.0.get()).status) }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn find_virtio_blk_pci() -> Option<PciLocation> {
+    port::virtio_blk_io_base().map(|io_base| PciLocation {
+        bus: 0,
+        device: 0,
+        function: 0,
+        device_id: VIRTIO_BLK_TRANSITIONAL_ID,
+        io_base,
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn find_virtio_blk_pci() -> Option<PciLocation> {
+    find_virtio_blk_pci_scan()
+}
+
+fn find_virtio_blk_pci_scan() -> Option<PciLocation> {
     for bus in 0u16..=255u16 {
         for device in 0u16..32u16 {
             for function in 0u16..8u16 {
@@ -589,8 +612,18 @@ fn find_virtio_blk_pci() -> Option<PciLocation> {
                     continue;
                 }
 
-                let bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
-                if (bar0 & 0x1) == 0 {
+                let mut bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
+                if (bar0 & 0x1) == 0 || (bar0 & !0x3) == 0 {
+                    pci_write_u32(
+                        bus as u8,
+                        device as u8,
+                        function as u8,
+                        0x10,
+                        u32::from(FALLBACK_IO_BASE) | 0x1,
+                    );
+                    bar0 = pci_read_u32(bus as u8, device as u8, function as u8, 0x10);
+                }
+                if (bar0 & 0x1) == 0 || (bar0 & !0x3) == 0 {
                     continue;
                 }
 

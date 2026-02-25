@@ -1,6 +1,6 @@
 // kernel/src/arch/x86_64/interrupts.rs: IDT and interrupt handlers for M3.
 use crate::arch::x86_64::{gdt, pic, pit, port};
-use crate::{keyboard, mouse, serial, time};
+use crate::{input, keyboard, mouse, serial, time};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::instructions::{hlt, interrupts};
@@ -65,8 +65,21 @@ pub fn init() -> InterruptInitReport {
         }
     }
 
-    let pic_report = pic::init();
-    let mouse_report = mouse::init();
+    let virtio_input_ready = input::virtio_ready();
+    let ps2_irqs = !virtio_input_ready;
+    let pic_report = pic::init(ps2_irqs);
+    let mouse_report = if ps2_irqs {
+        mouse::init()
+    } else {
+        mouse::MouseInitReport {
+            backend: "virtio-input-polled",
+            ready: true,
+            controller_before: 0,
+            controller_after: 0,
+            ack_defaults: 0,
+            ack_enable: 0,
+        }
+    };
     let pit_divisor = pit::init(time::PIT_HZ);
     interrupts::enable();
 
@@ -80,7 +93,11 @@ pub fn init() -> InterruptInitReport {
         pic_slave_mask: pic_report.slave_mask,
         pit_hz: time::PIT_HZ,
         pit_divisor,
-        mouse_backend: mouse_report.backend,
+        mouse_backend: if ps2_irqs {
+            mouse_report.backend
+        } else {
+            "virtio-input-polled+pic-timer-irq"
+        },
         mouse_ready: mouse_report.ready,
         mouse_ack_defaults: mouse_report.ack_defaults,
         mouse_ack_enable: mouse_report.ack_enable,

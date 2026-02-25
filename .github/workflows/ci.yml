@@ -19,7 +19,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview, rustfmt, clippy
-          targets: x86_64-unknown-none
+          targets: x86_64-unknown-none,aarch64-unknown-none
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -29,6 +29,9 @@ jobs:
 
       - name: Clippy kernel
         run: cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+
+      - name: Build kernel aarch64
+        run: cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 
       - name: Test xtask
         run: cargo test -p xtask

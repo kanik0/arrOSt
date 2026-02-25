@@ -257,15 +257,16 @@ audio_driver_available() {
 QEMU_AUDIO_MODE="${QEMU_AUDIO:-auto}"
 QEMU_VIRTIO_SND_MODE="${QEMU_VIRTIO_SND:-auto}"
 QEMU_VIRTIO_SND_STREAMS="${QEMU_VIRTIO_SND_STREAMS:-1}"
-QEMU_PCSPK_MODE="${QEMU_PCSPK:-auto}"
+QEMU_INPUT_MODE="${QEMU_INPUT:-virtio}"
 MACHINE_SPEC="q35"
 AUDIO_BACKEND="none"
 WAV_AUDIO_PATH=""
 AUDIO_VOICE_ID="arr_audio0"
 AUDIO_ARGS=()
 VIRTIO_SOUND_ARGS=()
-PCSPK_ENABLED=0
 VIRTIO_SOUND_ENABLED=0
+INPUT_BACKEND="ps2"
+INPUT_ARGS=()
 
 if [[ "$QEMU_AUDIO_MODE" == "none" ]]; then
   AUDIO_BACKEND="none"
@@ -314,35 +315,30 @@ if [[ "$AUDIO_BACKEND" != "none" ]]; then
     VIRTIO_SOUND_ENABLED=1
     VIRTIO_SOUND_ARGS=(-device "virtio-sound-pci,audiodev=${AUDIO_VOICE_ID},streams=${QEMU_VIRTIO_SND_STREAMS}")
   fi
-
-  case "$QEMU_PCSPK_MODE" in
-    on | true | 1)
-      PCSPK_ENABLED=1
-      ;;
-    off | none | false | 0)
-      PCSPK_ENABLED=0
-      ;;
-    auto)
-      if [[ "$VIRTIO_SOUND_ENABLED" -eq 1 ]]; then
-        PCSPK_ENABLED=0
-      else
-        PCSPK_ENABLED=1
-      fi
-      ;;
-    *)
-      echo "Unknown QEMU_PCSPK mode: $QEMU_PCSPK_MODE (using auto)"
-      if [[ "$VIRTIO_SOUND_ENABLED" -eq 1 ]]; then
-        PCSPK_ENABLED=0
-      else
-        PCSPK_ENABLED=1
-      fi
-      ;;
-  esac
-
-  if [[ "$PCSPK_ENABLED" -eq 1 ]]; then
-    MACHINE_SPEC="q35,pcspk-audiodev=${AUDIO_VOICE_ID}"
-  fi
 fi
+
+case "$QEMU_INPUT_MODE" in
+  virtio | auto)
+    INPUT_BACKEND="virtio-input-pci"
+    MACHINE_SPEC="${MACHINE_SPEC},i8042=off"
+    INPUT_ARGS=(
+      -device virtio-keyboard-pci,disable-modern=on,disable-legacy=off
+      -device virtio-mouse-pci,disable-modern=on,disable-legacy=off
+    )
+    ;;
+  ps2 | legacy)
+    INPUT_BACKEND="ps2"
+    ;;
+  *)
+    echo "Unknown QEMU_INPUT mode: $QEMU_INPUT_MODE (using virtio)"
+    INPUT_BACKEND="virtio-input-pci"
+    MACHINE_SPEC="${MACHINE_SPEC},i8042=off"
+    INPUT_ARGS=(
+      -device virtio-keyboard-pci,disable-modern=on,disable-legacy=off
+      -device virtio-mouse-pci,disable-modern=on,disable-legacy=off
+    )
+    ;;
+esac
 
 UDP_FWD_PORT="${ARR_UDP_FWD_PORT:-}"
 UDP_FWD_GUEST_PORT="${ARR_UDP_FWD_GUEST_PORT:-7777}"
@@ -373,17 +369,11 @@ else
 fi
 echo "Using QEMU SMP cores: $QEMU_SMP_CORES"
 echo "Using QEMU audio backend: $AUDIO_BACKEND"
+echo "Using QEMU input backend: $INPUT_BACKEND"
 if [[ ${#VIRTIO_SOUND_ARGS[@]} -gt 0 ]]; then
   echo "Using QEMU virtio-sound: on (streams=$QEMU_VIRTIO_SND_STREAMS)"
 else
   echo "Using QEMU virtio-sound: off"
-fi
-if [[ "$AUDIO_BACKEND" != "none" ]]; then
-  if [[ "$PCSPK_ENABLED" -eq 1 ]]; then
-    echo "Using QEMU pc-speaker voice: on"
-  else
-    echo "Using QEMU pc-speaker voice: off"
-  fi
 fi
 if [[ -n "$WAV_AUDIO_PATH" ]]; then
   echo "Writing QEMU audio stream to: $WAV_AUDIO_PATH"
@@ -414,20 +404,19 @@ QEMU_BASE_ARGS+=(
   -device virtio-blk-pci,drive=arr_data,disable-modern=on,disable-legacy=off
   "${NETDEV_ARGS[@]}"
   -device virtio-net-pci,netdev=arr_net,disable-modern=on,disable-legacy=off
+  "${INPUT_ARGS[@]}"
 )
 if [[ -n "$CPU_SPEC" ]]; then
   QEMU_BASE_ARGS+=(-cpu "$CPU_SPEC")
 fi
 
-if [[ "$AUDIO_BACKEND" != "none" ]]; then
-  exec qemu-system-x86_64 \
-    "${QEMU_BASE_ARGS[@]}" \
-    "${AUDIO_ARGS[@]}" \
-    "${VIRTIO_SOUND_ARGS[@]}" \
-    -display "$DISPLAY_BACKEND"
-else
-  exec qemu-system-x86_64 \
-    "${QEMU_BASE_ARGS[@]}" \
-    "${VIRTIO_SOUND_ARGS[@]}" \
-    -display "$DISPLAY_BACKEND"
+QEMU_RUN_ARGS=("${QEMU_BASE_ARGS[@]}")
+if [[ "$AUDIO_BACKEND" != "none" ]] && [[ ${#AUDIO_ARGS[@]} -gt 0 ]]; then
+  QEMU_RUN_ARGS+=("${AUDIO_ARGS[@]}")
 fi
+if [[ ${#VIRTIO_SOUND_ARGS[@]} -gt 0 ]]; then
+  QEMU_RUN_ARGS+=("${VIRTIO_SOUND_ARGS[@]}")
+fi
+QEMU_RUN_ARGS+=(-display "$DISPLAY_BACKEND")
+
+exec qemu-system-x86_64 "${QEMU_RUN_ARGS[@]}"

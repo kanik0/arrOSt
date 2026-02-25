@@ -683,7 +683,6 @@ fn map_net_error(error: net::NetError) -> isize {
         net::NetError::NotReady => -107,
         net::NetError::NotFound => -19,
         net::NetError::QueueUnavailable => -19,
-        net::NetError::QueueTooLarge => -90,
         net::NetError::AddressTranslationFailed => -14,
         net::NetError::FrameTooLarge => -90,
         net::NetError::IoTimeout => -110,

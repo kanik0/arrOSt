@@ -7,7 +7,8 @@
 </p>
 
 ArrOSt is an educational 64-bit operating system written in Rust (`no_std`) and designed to run on QEMU with UEFI firmware.
-The current runtime target is `x86_64-unknown-none`.
+Supported runtime targets are `x86_64-unknown-none` and `aarch64-unknown-none`.
+`aarch64-unknown-none` boots on QEMU `virt` through an AAVMF/UEFI chainloader path, with firmware framebuffer handoff (`uefi-gop`, `ramfb` default), virtio-mmio transport, and serial-first diagnostics.
 
 The project focuses on practical kernel engineering with observable behavior, reproducible headless tests, and incremental subsystem bring-up.
 
@@ -25,15 +26,18 @@ The project focuses on practical kernel engineering with observable behavior, re
 
 ### Working today
 
-- UEFI boot on QEMU (`x86_64-unknown-none`) with serial-first diagnostics.
+- UEFI boot on QEMU with serial-first diagnostics on both `x86_64-unknown-none` and `aarch64-unknown-none`.
+- Cross-target build support for `x86_64-unknown-none` and `aarch64-unknown-none`.
+- `aarch64` boot on QEMU `virt` via AAVMF/UEFI chainloader with framebuffer UI (`uefi-gop` via `ramfb` by default), serial shell, cooperative scheduler, virtio block/network over virtio-mmio, DHCP, and diskfs.
 - Physical memory mapping, paging setup, kernel heap, and allocation smoke checks.
-- IDT/GDT/PIC/PIT setup with keyboard and mouse interrupt handling.
+- `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling.
+- `aarch64` interrupt path: EL1 vectors + GICv2 virtual timer IRQ with automatic runtime fallback to counter polling when unexpected IRQ sources are observed.
 - In-kernel shell with filesystem, UI, network, and Doom control commands.
 - Framebuffer compositor with shell and file-manager windows.
 - Virtio block storage backend with persistent disk image.
 - Filesystem layer with disk-backed and RAM fallback implementations.
 - Virtio network backend with ARP/IPv4, ICMP ping, UDP send/receive, and basic HTTP/UDP curl paths.
-- DoomGeneric integration (`doom play`) with viewport rendering, keyboard capture, and audio path (`virtio-sound` preferred, PC speaker fallback).
+- DoomGeneric integration (`doom play`) with viewport rendering, keyboard capture, and audio path (`virtio-sound` preferred, silent fallback when audio backend is unavailable).
 - Automated smoke tests for Doom normal path, long-run, strict virtio audio, and fallback mode.
 
 ### Not implemented yet
@@ -50,7 +54,7 @@ The project focuses on practical kernel engineering with observable behavior, re
 ### What works
 
 - `doom play` starts DoomGeneric when sources and WAD are available.
-- Frame output is rendered into the file-manager viewport.
+- Frame output is rendered in a dedicated Doom compositor window.
 - Runtime input supports shell injection (`doom key`/`doom keyup`) and capture mode.
 - Viewport filter can be switched at runtime (`doom view bilinear|nearest`, default `nearest`).
 - Minimal `/arr.cfg` persistence is wired through the Doom shim.
@@ -73,7 +77,8 @@ The project focuses on practical kernel engineering with observable behavior, re
   - `rustfmt`
   - `clippy`
 - `qemu-system-x86_64`
-- UEFI firmware files (OVMF/edk2)
+- `qemu-system-aarch64`
+- UEFI firmware files (OVMF/edk2 for `x86_64`, AAVMF/edk2 for `aarch64`)
 - C compiler toolchain (`cc`/clang) for Doom bridge objects
 
 ### Build image
@@ -84,9 +89,12 @@ cargo xtask build
 
 This produces:
 
-- kernel + user artifacts
+- kernel + user artifacts for `x86_64-unknown-none` and `aarch64-unknown-none`
 - UEFI boot image at `target/x86_64-unknown-none/debug/bootimage-arrost-kernel.bin`
 - storage image at `target/x86_64-unknown-none/debug/m6-disk.img`
+- aarch64 kernel ELF at `target/aarch64-unknown-none/debug/arrost-kernel`
+- aarch64 UEFI loader at `target/aarch64-unknown-uefi/debug/arrost-aarch64-uefi-loader.efi`
+- staged aarch64 ESP payload at `target/aarch64-unknown-none/debug/efi/` (`EFI/BOOT/BOOTAA64.EFI` + `arrost-kernel`)
 
 ## Run
 
@@ -96,6 +104,18 @@ This produces:
 cargo xtask run
 ```
 
+aarch64 path:
+
+```bash
+cargo xtask run --arch aarch64
+```
+
+or:
+
+```bash
+ARROST_ARCH=aarch64 cargo xtask run
+```
+
 Useful environment overrides:
 
 - `QEMU_DISPLAY=none|cocoa|gtk|sdl`
@@ -103,9 +123,18 @@ Useful environment overrides:
 - `QEMU_CPU=auto|host|qemu64|...`
 - `QEMU_SMP=auto|<cores>`
 - `QEMU_AUDIO=auto|none|coreaudio|wav`
+- `QEMU_FB=auto|ramfb|bochs|none`
 - `QEMU_AUDIO_WAV_PATH=/tmp/arrost.wav`
 - `QEMU_VIRTIO_SND=on|off`
-- `QEMU_PCSPK=auto|on|off`
+- `QEMU_INPUT=virtio|ps2` (`x86_64`; `aarch64` run path uses virtio-input)
+- `QEMU_VIRTIO_BUS=mmio|auto` (`pci` is accepted as alias but forced to `mmio` on `aarch64`)
+- `QEMU_GIC_VERSION=2|3|max` (`aarch64`)
+- `AAVMF_CODE=/path/to/AAVMF_CODE.fd`
+- `AAVMF_VARS=/path/to/AAVMF_VARS.fd`
+
+Note: on macOS, `scripts/qemu-aarch64.sh` resolves `QEMU_ACCEL=auto` to `hvf` when available, with `tcg` fallback.
+Note: `QEMU_FB=auto` prefers `ramfb` (firmware GOP handoff path) and falls back to `bochs-display` when needed.
+Note: on `aarch64`, kernel-side audio uses virtio-sound when a host audio backend is available.
 
 Suggested Doom performance profile (host-dependent):
 
@@ -137,6 +166,7 @@ user/doom/wad/doom1.wad
 cargo fmt --all
 cargo clippy -p xtask -- -D warnings
 cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 ```
 
 ### Unit tests
@@ -150,10 +180,13 @@ cargo test -p arrost-user-doom
 ### QEMU smoke tests
 
 ```bash
-cargo xtask smoke-doom
-cargo xtask smoke-doom-long
-cargo xtask smoke-doom-virtio
-cargo xtask smoke-doom-fallback
+cargo xtask smoke-doom --arch x86_64
+cargo xtask smoke-doom --arch aarch64
+cargo xtask smoke-doom-long --arch x86_64
+cargo xtask smoke-doom-long --arch aarch64
+cargo xtask smoke-doom-virtio --arch aarch64
+cargo xtask smoke-doom-fallback --arch x86_64
+cargo xtask smoke-doom-fallback --arch aarch64
 ```
 
 ## Documentation index

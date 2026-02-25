@@ -24,16 +24,21 @@ fn main() {
     let keys_present = include_dir.join("doomkeys.h").exists();
     let core_present = core_source.exists();
     let makefile_present = makefile_soso.exists();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
+    let clang_target = match target_arch.as_str() {
+        "x86_64" => "x86_64-unknown-none-elf",
+        "aarch64" => "aarch64-unknown-none",
+        _ => "x86_64-unknown-none-elf",
+    };
 
     let mut build = cc::Build::new();
     build
         .compiler("clang")
-        .flag("--target=x86_64-unknown-none-elf")
+        .flag(format!("--target={clang_target}"))
         .flag("-std=c11")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-stack-protector")
-        .flag("-mno-red-zone")
         .flag("-ffunction-sections")
         .flag("-fdata-sections")
         .flag("-Wall")
@@ -42,6 +47,9 @@ fn main() {
         .define("LINUX", None)
         .define("D_DEFAULT_SOURCE", None)
         .define("FEATURE_SOUND", None);
+    if target_arch == "x86_64" {
+        build.flag("-mno-red-zone");
+    }
 
     let c_dir = repo_root.join("user/doom/c");
     let runner = c_dir.join("doomgeneric_runner.c");

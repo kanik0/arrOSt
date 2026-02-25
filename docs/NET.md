@@ -4,7 +4,7 @@ ArrOSt provides a virtio-net based networking stack aimed at practical debugging
 
 ## Backend
 
-- Device backend: virtio-net (legacy PCI path)
+- Device backend: virtio-net (`virtio-pci` legacy-compatible queue path on `x86_64`, virtio-mmio legacy-compatible queue path on `aarch64`)
 - Environment: QEMU user-mode networking with optional host forwarding
 
 ## Protocol support (current)
@@ -35,6 +35,8 @@ ArrOSt provides a virtio-net based networking stack aimed at practical debugging
 ## Relevant files
 
 - `kernel/src/net/mod.rs`
+- `kernel/src/arch/aarch64/port.rs`
 - `kernel/src/proc/mod.rs`
 - `kernel/src/shell.rs`
 - `scripts/qemu.sh`
+- `scripts/qemu-aarch64.sh`

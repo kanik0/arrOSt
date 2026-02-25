@@ -141,6 +141,14 @@ pub fn event_overflow_count() -> u64 {
     EVENT_QUEUE_OVERFLOW_COUNT.load(Ordering::Relaxed)
 }
 
+pub fn inject_byte(byte: u8) {
+    push_byte(byte);
+}
+
+pub fn inject_key_event(event: KeyEvent) {
+    push_key_event(event);
+}
+
 fn push_byte(byte: u8) {
     let head = BYTE_QUEUE_HEAD.load(Ordering::Relaxed);
     let next_head = (head + 1) % BYTE_QUEUE_CAPACITY;

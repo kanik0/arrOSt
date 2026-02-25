@@ -14,8 +14,10 @@ const ICW1_INIT: u8 = 0x10;
 const ICW4_8086: u8 = 0x01;
 const EOI: u8 = 0x20;
 
-const MASTER_IRQ_MASK: u8 = 0b1111_1000; // enable IRQ0(timer), IRQ1(keyboard), IRQ2(cascade)
-const SLAVE_IRQ_MASK: u8 = 0b1110_1111; // enable IRQ12(PS/2 mouse), keep other slave IRQs masked
+const MASTER_IRQ_MASK_PS2: u8 = 0b1111_1000; // enable IRQ0(timer), IRQ1(keyboard), IRQ2(cascade)
+const SLAVE_IRQ_MASK_PS2: u8 = 0b1110_1111; // enable IRQ12(PS/2 mouse), keep other slave IRQs masked
+const MASTER_IRQ_MASK_TIMER_ONLY: u8 = 0b1111_1010; // enable IRQ0(timer), IRQ2(cascade)
+const SLAVE_IRQ_MASK_TIMER_ONLY: u8 = 0b1111_1111; // keep slave IRQs masked
 
 #[derive(Clone, Copy)]
 pub struct PicInitReport {
@@ -25,7 +27,13 @@ pub struct PicInitReport {
     pub slave_mask: u8,
 }
 
-pub fn init() -> PicInitReport {
+pub fn init(ps2_irqs: bool) -> PicInitReport {
+    let (master_mask, slave_mask) = if ps2_irqs {
+        (MASTER_IRQ_MASK_PS2, SLAVE_IRQ_MASK_PS2)
+    } else {
+        (MASTER_IRQ_MASK_TIMER_ONLY, SLAVE_IRQ_MASK_TIMER_ONLY)
+    };
+
     // SAFETY: PIC programming uses well-defined command/data ports on x86.
     unsafe {
         port::outb(PIC_1_COMMAND, ICW1_INIT | ICW1_ICW4);
@@ -48,15 +56,15 @@ pub fn init() -> PicInitReport {
         port::outb(PIC_2_DATA, ICW4_8086);
         port::io_wait();
 
-        port::outb(PIC_1_DATA, MASTER_IRQ_MASK);
-        port::outb(PIC_2_DATA, SLAVE_IRQ_MASK);
+        port::outb(PIC_1_DATA, master_mask);
+        port::outb(PIC_2_DATA, slave_mask);
     }
 
     PicInitReport {
         master_offset: MASTER_OFFSET,
         slave_offset: SLAVE_OFFSET,
-        master_mask: MASTER_IRQ_MASK,
-        slave_mask: SLAVE_IRQ_MASK,
+        master_mask,
+        slave_mask,
     }
 }
 

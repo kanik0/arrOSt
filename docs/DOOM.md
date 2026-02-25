@@ -63,14 +63,14 @@ If DoomGeneric is not ready, ArrOSt falls back to an explicit fallback runtime p
 
 - PCM audio path is active.
 - Preferred backend: `virtio-sound`.
-- Fallback backend: PC speaker.
+- Fallback backend: `off` (no PC-speaker path).
 - Virtio backend now uses a software jitter buffer with high-water trimming to reduce crackle/drop under bursty frame timing.
 - Virtio path applies linear resampling for cleaner playback when source/output rates differ.
 - Virtio stream setup now prefers native high-fidelity rates (44.1k/48k when available).
 - Doom mixer applies limiter/soft-clip to reduce hard clipping under heavy mix load.
 - Mixer gain/limiter tuning was tightened to reduce pumping and harsh clipping while keeping output level stable.
 - Runtime audio controls:
-  - `doom audio on|off|virtio|pcspk|status|test`
+  - `doom audio on|off|virtio|status|test`
 - Long-run strict smoke checks validate virtio audio stability.
 
 ### Config persistence
@@ -114,6 +114,12 @@ cargo xtask build
 cargo xtask run
 ```
 
+aarch64 path:
+
+```bash
+cargo xtask run --arch aarch64
+```
+
 Useful overrides:
 
 ```bash
@@ -128,25 +134,28 @@ QEMU_VIRTIO_SND=off cargo xtask run
 ### Short smoke
 
 ```bash
-cargo xtask smoke-doom
+cargo xtask smoke-doom --arch x86_64
+cargo xtask smoke-doom --arch aarch64
 ```
 
 ### Long-run smoke
 
 ```bash
-cargo xtask smoke-doom-long
+cargo xtask smoke-doom-long --arch x86_64
+cargo xtask smoke-doom-long --arch aarch64
 ```
 
 ### Strict virtio audio smoke
 
 ```bash
-cargo xtask smoke-doom-virtio
+cargo xtask smoke-doom-virtio --arch aarch64
 ```
 
 ### Fallback-path smoke
 
 ```bash
-cargo xtask smoke-doom-fallback
+cargo xtask smoke-doom-fallback --arch x86_64
+cargo xtask smoke-doom-fallback --arch aarch64
 ```
 
 ## Expected shell interactions

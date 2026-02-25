@@ -13,6 +13,13 @@ name = "arrost"
 version = "0.1.0"
 
 [[package]]
+name = "arrost-aarch64-uefi-loader"
+version = "0.1.0"
+dependencies = [
+ "r-efi",
+]
+
+[[package]]
 name = "arrost-kernel"
 version = "0.1.0"
 dependencies = [

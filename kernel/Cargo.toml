@@ -7,6 +7,8 @@ build = "build.rs"
 [dependencies]
 bootloader_api = "0.11.15"
 arrostd = { path = "../crates/arrostd" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 [build-dependencies]
