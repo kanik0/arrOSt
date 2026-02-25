@@ -19,7 +19,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview, rustfmt, clippy
-          targets: x86_64-unknown-none,aarch64-unknown-none
+          targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -33,6 +33,9 @@ jobs:
       - name: Build kernel aarch64
         run: cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 
+      - name: Build UEFI loader aarch64
+        run: cargo build -p arrost-aarch64-uefi-loader --target aarch64-unknown-uefi
+
       - name: Test xtask
         run: cargo test -p xtask
 
@@ -41,7 +44,7 @@ jobs:
 
   doom-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,14 +52,14 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf lsof clang
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-efi-aarch64 ovmf lsof clang
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview, rustfmt, clippy
-          targets: x86_64-unknown-none
+          targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
 
       - name: Vendor DoomGeneric Sources
         run: bash scripts/vendor_doomgeneric.sh
@@ -64,11 +67,20 @@ jobs:
       - name: Build Image
         run: cargo xtask build
 
-      - name: Smoke DOOM
-        run: timeout 180s cargo xtask smoke-doom
+      - name: Smoke DOOM x86_64
+        run: timeout 180s cargo xtask smoke-doom --arch x86_64
 
-      - name: Smoke DOOM Long
-        run: timeout 240s cargo xtask smoke-doom-long
+      - name: Smoke DOOM Long x86_64
+        run: timeout 240s cargo xtask smoke-doom-long --arch x86_64
 
-      - name: Smoke DOOM Fallback
-        run: timeout 180s cargo xtask smoke-doom-fallback
+      - name: Smoke DOOM Fallback x86_64
+        run: timeout 180s cargo xtask smoke-doom-fallback --arch x86_64
+
+      - name: Smoke DOOM aarch64
+        run: timeout 180s cargo xtask smoke-doom --arch aarch64
+
+      - name: Smoke DOOM Virtio aarch64
+        run: timeout 180s cargo xtask smoke-doom-virtio --arch aarch64
+
+      - name: Smoke DOOM Fallback aarch64
+        run: timeout 180s cargo xtask smoke-doom-fallback --arch aarch64
