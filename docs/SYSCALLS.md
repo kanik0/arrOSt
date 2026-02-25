@@ -77,6 +77,9 @@ Both are `#[repr(C)]` and designed for stable kernel/user data exchange.
 ## Status
 
 The ABI is active for the cooperative runtime path and test-oriented syscall dispatch. Full userspace process isolation and broader syscall coverage are planned but not yet implemented.
+On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DPL=3) wired to a register-based kernel entry path.
+When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an optional CPL3 `int 0x80` smoke sequence (`getpid/time_ms/exit`) before entering the main loop.
+That smoke sequence is dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contributes to shared syscall statistics.
 
 ## Userland shim
 

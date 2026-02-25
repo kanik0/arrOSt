@@ -90,6 +90,12 @@ The project focuses on practical kernel engineering with observable behavior, re
 cargo xtask build
 ```
 
+Show `xtask` command usage:
+
+```bash
+cargo xtask --help
+```
+
 This produces:
 
 - kernel + user artifacts for `x86_64-unknown-none` and `aarch64-unknown-none`
@@ -132,6 +138,7 @@ Useful environment overrides:
 - `QEMU_INPUT=virtio|ps2` (`x86_64`; `aarch64` run path uses virtio-input)
 - `QEMU_VIRTIO_BUS=mmio|auto` (`pci` is accepted as alias but forced to `mmio` on `aarch64`)
 - `QEMU_GIC_VERSION=2|3|max` (`aarch64`)
+- `ARROST_RING3_BOOT_SMOKE=true|false` (`x86_64`; optional boot-time CPL3 `int 0x80` smoke sequence: `getpid/time_ms/exit`)
 - `AAVMF_CODE=/path/to/AAVMF_CODE.fd`
 - `AAVMF_VARS=/path/to/AAVMF_VARS.fd`
 

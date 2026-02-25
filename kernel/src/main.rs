@@ -302,6 +302,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "Mouse: backend={} ready={} ack={:#04x}/{:#04x}\n",
         irq.mouse_backend, irq.mouse_ready, irq.mouse_ack_defaults, irq.mouse_ack_enable
     ));
+    serial::write_fmt(format_args!(
+        "Interrupts: user_prep user_cs={:#x} user_ds={:#x} rsp0={:#018x} syscall_vec={:#04x} dpl={}\n",
+        irq.user_code_selector,
+        irq.user_data_selector,
+        irq.privilege_stack_top,
+        irq.syscall_vector,
+        irq.syscall_gate_dpl
+    ));
     time::set_heartbeat(false);
     let audio_report = audio::init();
     serial::write_fmt(format_args!(
@@ -394,6 +402,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         proc_report.shell_pid,
         proc_report.scripted_input_bytes
     ));
+
+    let _ = arch::x86_64::ring3::run_boot_smoke(
+        run_loop,
+        irq.user_code_selector,
+        irq.user_data_selector,
+        irq.syscall_vector,
+    );
 
     run_loop()
 }

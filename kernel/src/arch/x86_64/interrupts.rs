@@ -1,13 +1,17 @@
 // kernel/src/arch/x86_64/interrupts.rs: IDT and interrupt handlers for M3.
-use crate::arch::x86_64::{gdt, pic, pit, port};
+use crate::arch::x86_64::{gdt, pic, pit, port, syscall};
 use crate::{input, keyboard, mouse, serial, time};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
+use x86_64::PrivilegeLevel;
+use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 static IDT_READY: AtomicBool = AtomicBool::new(false);
 static mut IDT: MaybeUninit<InterruptDescriptorTable> = MaybeUninit::uninit();
+const SYSCALL_VECTOR: u8 = 0x80;
+const SYSCALL_GATE_DPL: u8 = 3;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -28,6 +32,11 @@ pub struct InterruptInitReport {
     pub code_selector: u16,
     pub tss_selector: u16,
     pub double_fault_stack_top: u64,
+    pub user_code_selector: u16,
+    pub user_data_selector: u16,
+    pub privilege_stack_top: u64,
+    pub syscall_vector: u8,
+    pub syscall_gate_dpl: u8,
     pub pic_master_offset: u8,
     pub pic_slave_offset: u8,
     pub pic_master_mask: u8,
@@ -54,6 +63,10 @@ pub fn init() -> InterruptInitReport {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            // SAFETY: entry address points to a dedicated naked int80 handler with iretq return.
+            idt[SYSCALL_VECTOR]
+                .set_handler_addr(VirtAddr::new(syscall::int80_entry_addr()))
+                .set_privilege_level(PrivilegeLevel::Ring3);
             idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
             idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
             idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
@@ -87,6 +100,11 @@ pub fn init() -> InterruptInitReport {
         code_selector: gdt_report.code_selector,
         tss_selector: gdt_report.tss_selector,
         double_fault_stack_top: gdt_report.double_fault_stack_top,
+        user_code_selector: gdt_report.user_code_selector,
+        user_data_selector: gdt_report.user_data_selector,
+        privilege_stack_top: gdt_report.privilege_stack_top,
+        syscall_vector: SYSCALL_VECTOR,
+        syscall_gate_dpl: SYSCALL_GATE_DPL,
         pic_master_offset: pic_report.master_offset,
         pic_slave_offset: pic_report.slave_offset,
         pic_master_mask: pic_report.master_mask,

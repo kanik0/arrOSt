@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-    mapper::{MapToError, OffsetPageTable, Translate},
+    mapper::{FlagUpdateError, MapToError, OffsetPageTable, Translate, TranslateResult},
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -79,6 +79,15 @@ pub enum MemoryError {
     AllocationSmokeFailed,
 }
 
+#[derive(Debug)]
+pub enum UserPageError {
+    PagingNotInitialized,
+    InvalidRange,
+    NotMapped { virt_addr: u64 },
+    UnsupportedPageSize { virt_addr: u64 },
+    FlagUpdate(FlagUpdateError),
+}
+
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -93,6 +102,22 @@ impl fmt::Display for MemoryError {
                 write!(f, "guard page unexpectedly mapped: {guard}")
             }
             Self::AllocationSmokeFailed => write!(f, "heap allocation smoke test failed"),
+        }
+    }
+}
+
+impl fmt::Display for UserPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PagingNotInitialized => write!(f, "paging not initialized"),
+            Self::InvalidRange => write!(f, "invalid virtual range"),
+            Self::NotMapped { virt_addr } => {
+                write!(f, "virtual address not mapped: {virt_addr:#018x}")
+            }
+            Self::UnsupportedPageSize { virt_addr } => {
+                write!(f, "unsupported mapped page size at {virt_addr:#018x}")
+            }
+            Self::FlagUpdate(error) => write!(f, "failed to update page flags: {error:?}"),
         }
     }
 }
@@ -183,6 +208,105 @@ pub fn phys_to_virt(phys_addr: u64) -> Option<usize> {
     }
     let virt = physical_memory_offset.checked_add(phys_addr)?;
     usize::try_from(virt).ok()
+}
+
+pub fn make_user_accessible(virt_start: usize, len: usize) -> Result<usize, UserPageError> {
+    update_user_flags(virt_start, len, false)
+}
+
+pub fn make_user_code_accessible(virt_start: usize, len: usize) -> Result<usize, UserPageError> {
+    update_user_flags(virt_start, len, true)
+}
+
+fn update_user_flags(
+    virt_start: usize,
+    len: usize,
+    executable: bool,
+) -> Result<usize, UserPageError> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let physical_memory_offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire);
+    if physical_memory_offset == 0 {
+        return Err(UserPageError::PagingNotInitialized);
+    }
+
+    let start_u64 = virt_start as u64;
+    let end_u64 = start_u64
+        .checked_add((len.saturating_sub(1)) as u64)
+        .ok_or(UserPageError::InvalidRange)?;
+    let start = VirtAddr::new(start_u64);
+    let end = VirtAddr::new(end_u64);
+
+    let offset = VirtAddr::new(physical_memory_offset);
+    let level_4_phys = Cr3::read().0.start_address();
+    let level_4_virt = offset + level_4_phys.as_u64();
+    let level_4_ptr: *mut PageTable = level_4_virt.as_mut_ptr();
+    // SAFETY: physical memory offset is initialized during `mem::init` and points to active L4 mapping.
+    let level_4_table = unsafe { &mut *level_4_ptr };
+    // SAFETY: level-4 table and physical offset correspond to the active page table hierarchy.
+    let mut mapper = unsafe { OffsetPageTable::new(level_4_table, offset) };
+
+    let start_page = Page::<Size4KiB>::containing_address(start);
+    let end_page = Page::<Size4KiB>::containing_address(end);
+
+    let mut updated = 0usize;
+    for page in Page::range_inclusive(start_page, end_page) {
+        let virt_addr = page.start_address();
+        let parent_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // SAFETY: user-mode access requires USER flags on all parent levels in the page walk.
+        unsafe {
+            mapper
+                .set_flags_p4_entry(page, parent_flags)
+                .map_err(UserPageError::FlagUpdate)?
+                .flush_all();
+            mapper
+                .set_flags_p3_entry(page, parent_flags)
+                .map_err(UserPageError::FlagUpdate)?
+                .flush_all();
+            mapper
+                .set_flags_p2_entry(page, parent_flags)
+                .map_err(UserPageError::FlagUpdate)?
+                .flush_all();
+        }
+
+        let current_flags = match mapper.translate(virt_addr) {
+            TranslateResult::Mapped { frame, flags, .. } => {
+                if !matches!(
+                    frame,
+                    x86_64::structures::paging::mapper::MappedFrame::Size4KiB(_)
+                ) {
+                    return Err(UserPageError::UnsupportedPageSize {
+                        virt_addr: virt_addr.as_u64(),
+                    });
+                }
+                flags
+            }
+            TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => {
+                return Err(UserPageError::NotMapped {
+                    virt_addr: virt_addr.as_u64(),
+                });
+            }
+        };
+
+        let mut new_flags =
+            current_flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if executable {
+            new_flags.remove(PageTableFlags::NO_EXECUTE);
+        }
+        // SAFETY: caller requests controlled user exposure for the selected mapped range only.
+        let flush = unsafe {
+            mapper
+                .update_flags(page, new_flags)
+                .map_err(UserPageError::FlagUpdate)?
+        };
+        flush.flush();
+        updated = updated.saturating_add(1);
+    }
+
+    Ok(updated)
 }
 
 pub fn collect_stats(boot_info: &BootInfo) -> MemoryStats {

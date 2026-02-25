@@ -14,6 +14,9 @@ ArrOSt currently uses a cooperative in-kernel scheduler for deterministic bring-
 - Spawned user workers consume metadata from `user/init` and `user/doom` crates (caps + boot markers).
 - Worker sleep pacing is sourced from user crate contracts (`init=90` ticks, `doom=110` ticks).
 - Worker exit codes are sourced from user crate contracts (`init=7`, `doom=11`).
+- `x86_64` interrupt bring-up now exposes ring-3 groundwork (user selectors + `int 0x80` DPL3 gate + TSS `RSP0` stack), while scheduler execution remains cooperative kernel-side.
+- Optional `x86_64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) executes CPL3 syscalls (`getpid/time_ms/exit`) through `int 0x80` and resumes kernel runtime, without enabling full user task scheduling yet.
+- Ring-3 smoke syscall dispatch now reuses process-layer capability policy/counters through a dedicated temporary ring-3 context (`pid/caps/name`), instead of a standalone ad-hoc stub path.
 
 ## Responsibilities
 

@@ -5,20 +5,26 @@ ArrOSt currently has architecture-specific interrupt bring-up.
 ## `x86_64` runtime path
 
 The `x86_64` path configures CPU exceptions and legacy PIC IRQ handling for timer, keyboard, and mouse.
+It now also prepares user-mode transition primitives for future ring-3 execution, while runtime tasks remain cooperative in kernel space.
 
 ### Responsibilities
 
 - Load GDT/TSS and IDT entries.
+- Prepare ring-3 selectors and a dedicated TSS privilege stack (`RSP0`) for user->kernel transitions.
 - Initialize legacy PIC with explicit vector offsets.
 - Program PIT timer frequency.
 - Dispatch keyboard and mouse IRQ handlers.
+- Install a user-callable software interrupt gate (`int 0x80`, DPL=3) with register-based syscall entry.
 - Keep interrupt-driven time and input queues updated.
 - Provide PIT-based polling fallback ticks when interrupts are disabled.
+- Support an optional boot-time ring-3 smoke (`ARROST_RING3_BOOT_SMOKE=true`) that enters CPL3, executes `int 0x80` syscalls (`getpid/time_ms/exit`), and resumes kernel runtime.
+- Route ring-3 smoke syscall numbers/arguments to process-layer dispatch for shared capability enforcement and syscall accounting.
 
 ### Implemented handlers
 
 - Breakpoint exception handler
 - Double-fault handler (halt loop)
+- `int 0x80` syscall entry/dispatcher (x86_64, DPL=3 gate)
 - Timer IRQ handler
 - Keyboard IRQ handler
 - Mouse IRQ handler
@@ -39,6 +45,7 @@ The `x86_64` path configures CPU exceptions and legacy PIC IRQ handling for time
 Boot logs expose:
 
 - Selector values and double-fault IST stack address
+- User selector values, TSS `RSP0` top, and syscall-gate vector/DPL
 - PIC offsets and masks
 - PIT divisor/frequency
 - Mouse backend readiness and ACK bytes
@@ -67,6 +74,8 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 
 - `kernel/src/arch/x86_64/interrupts.rs`
 - `kernel/src/arch/x86_64/gdt.rs`
+- `kernel/src/arch/x86_64/ring3.rs`
+- `kernel/src/arch/x86_64/syscall.rs`
 - `kernel/src/arch/x86_64/pic.rs`
 - `kernel/src/arch/x86_64/pit.rs`
 - `kernel/src/arch/aarch64/interrupts.rs`

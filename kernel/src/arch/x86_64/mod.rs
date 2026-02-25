@@ -4,6 +4,8 @@ pub mod interrupts;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod ring3;
+pub mod syscall;
 
 pub fn poll_timer_ticks() -> u64 {
     if ::x86_64::instructions::interrupts::are_enabled() {

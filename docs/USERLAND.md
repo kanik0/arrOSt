@@ -45,6 +45,9 @@ ArrOSt includes userland-facing crates and ABI contracts, while full ring-3 proc
 - Spawned cooperative workers consume user crate contracts for capability mask assignment and serial boot markers.
 - Shell command `user apps` prints the cooperative app registry contracts (`id`, `name`, `caps`, `sleep`, `exit`).
 - User crates still provide metadata/contracts rather than isolated executable processes.
+- `x86_64` kernel setup now includes ring-3 transition groundwork (user selectors, TSS `RSP0`, `int 0x80` DPL3 entry), but no standalone user-mode task execution path is enabled yet.
+- Optional boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) executes CPL3 `int 0x80` syscalls (`getpid/time_ms/exit`) on `x86_64` for early user->kernel transition validation.
+- Those smoke syscalls are now mediated by process-layer context/capability checks (shared with cooperative syscall policy), but still do not represent full ring-3 task scheduling.
 
 ## Relevant files
 

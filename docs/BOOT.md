@@ -29,6 +29,7 @@ On macOS, `scripts/qemu-aarch64.sh` resolves `QEMU_ACCEL=auto` to `hvf` when ava
 The `aarch64` firmware path supports selecting framebuffer device via `QEMU_FB=auto|ramfb|bochs|none` (`auto` prefers `ramfb`).
 The `aarch64` runtime uses virtio-mmio transport; `QEMU_VIRTIO_BUS` is accepted for compatibility but coerced to `mmio`.
 Virtio-mmio mode selection remains available via `QEMU_VIRTIO_MMIO_MODE=modern|legacy|auto`.
+`x86_64` exposes an optional ring-3 boot smoke via `ARROST_RING3_BOOT_SMOKE=true`, which performs a CPL3 `int 0x80` syscall sequence (`getpid`, `time_ms`, `exit`) before entering the main runtime loop.
 
 ## Smoke commands
 

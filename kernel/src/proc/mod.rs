@@ -178,11 +178,31 @@ impl InputScript {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Ring3Context {
+    active: bool,
+    pid: u32,
+    name: &'static str,
+    syscall_caps: u32,
+}
+
+impl Ring3Context {
+    const fn inactive() -> Self {
+        Self {
+            active: false,
+            pid: 0,
+            name: "<none>",
+            syscall_caps: 0,
+        }
+    }
+}
+
 struct Scheduler {
     initialized: bool,
     next_pid: u32,
     cursor: usize,
     tasks: [Option<Task>; MAX_TASKS],
+    ring3_context: Ring3Context,
     stats: SyscallStats,
     input_script: InputScript,
 }
@@ -194,6 +214,7 @@ impl Scheduler {
             next_pid: 1,
             cursor: 0,
             tasks: [None; MAX_TASKS],
+            ring3_context: Ring3Context::inactive(),
             stats: SyscallStats::new(),
             input_script: InputScript::new(USER_SHELL_SCRIPT),
         }
@@ -716,16 +737,13 @@ impl Scheduler {
         let required_caps = syscall_required_caps(number);
         if required_caps != 0 && !caps::allows(task.syscall_caps, required_caps) {
             self.stats.errors = self.stats.errors.saturating_add(1);
-            serial::write_fmt(format_args!(
-                "syscall: pid={} name={} number={} ({}) denied need={:#x} have={:#x} -> {}\n",
+            log_syscall_cap_denied(
                 task.pid,
                 task.name,
                 number,
-                arrostd::syscall::name(number),
                 required_caps,
                 task.syscall_caps,
-                errno::name(errno::EPERM)
-            ));
+            );
             return errno::EPERM;
         }
 
@@ -793,14 +811,69 @@ impl Scheduler {
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
-                serial::write_fmt(format_args!(
-                    "syscall: pid={} name={} number={} ({}) -> {}\n",
-                    task.pid,
-                    task.name,
-                    number,
-                    arrostd::syscall::name(number),
-                    errno::name(errno::ENOSYS)
-                ));
+                log_syscall_unknown(task.pid, task.name, number, errno::ENOSYS);
+                errno::ENOSYS
+            }
+        }
+    }
+
+    fn arm_ring3_context(&mut self, pid: u32, name: &'static str, syscall_caps: u32) -> bool {
+        if self.ring3_context.active {
+            return false;
+        }
+        self.ring3_context = Ring3Context {
+            active: true,
+            pid,
+            name,
+            syscall_caps,
+        };
+        true
+    }
+
+    fn disarm_ring3_context(&mut self) {
+        self.ring3_context = Ring3Context::inactive();
+    }
+
+    fn dispatch_ring3_syscall(&mut self, number: u64, arg0: u64, _arg1: u64, _arg2: u64) -> isize {
+        if !self.ring3_context.active {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::ENODEV;
+        }
+
+        let ctx_pid = self.ring3_context.pid;
+        let ctx_name = self.ring3_context.name;
+        let required_caps = syscall_required_caps(number);
+        let ctx_caps = self.ring3_context.syscall_caps;
+        if required_caps != 0 && !caps::allows(ctx_caps, required_caps) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            log_syscall_cap_denied(ctx_pid, ctx_name, number, required_caps, ctx_caps);
+            return errno::EPERM;
+        }
+
+        match number {
+            SYS_EXIT => {
+                self.stats.exit = self.stats.exit.saturating_add(1);
+                0
+            }
+            SYS_GETPID => {
+                self.stats.getpid = self.stats.getpid.saturating_add(1);
+                ctx_pid as isize
+            }
+            SYS_TIME_MS => {
+                self.stats.time_ms = self.stats.time_ms.saturating_add(1);
+                time::uptime_millis().min(isize::MAX as u64) as isize
+            }
+            SYS_CAP_GET => {
+                self.stats.cap_get = self.stats.cap_get.saturating_add(1);
+                self.ring3_context.syscall_caps as isize
+            }
+            SYS_CAP_DROP => {
+                self.stats.cap_drop = self.stats.cap_drop.saturating_add(1);
+                self.syscall_cap_drop_ring3(arg0)
+            }
+            _ => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                log_syscall_unknown(ctx_pid, ctx_name, number, errno::ENOSYS);
                 errno::ENOSYS
             }
         }
@@ -854,24 +927,23 @@ impl Scheduler {
     }
 
     fn syscall_cap_drop(&mut self, task: &mut Task, drop_mask: u64) -> isize {
-        let Ok(drop_mask) = u32::try_from(drop_mask) else {
-            self.stats.errors = self.stats.errors.saturating_add(1);
-            return errno::EINVAL;
-        };
-        if drop_mask == 0 {
-            return task.syscall_caps as isize;
+        match apply_cap_drop_mask(&mut task.syscall_caps, drop_mask) {
+            Ok(mask) => mask as isize,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error
+            }
         }
-        if (drop_mask & !caps::ALL) != 0 {
-            self.stats.errors = self.stats.errors.saturating_add(1);
-            return errno::EINVAL;
-        }
-        if (drop_mask & caps::CORE) != 0 {
-            self.stats.errors = self.stats.errors.saturating_add(1);
-            return errno::EPERM;
-        }
+    }
 
-        task.syscall_caps &= !drop_mask;
-        task.syscall_caps as isize
+    fn syscall_cap_drop_ring3(&mut self, drop_mask: u64) -> isize {
+        match apply_cap_drop_mask(&mut self.ring3_context.syscall_caps, drop_mask) {
+            Ok(mask) => mask as isize,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error
+            }
+        }
     }
 
     fn syscall_spawn(&mut self, task: &Task, app_id: u64) -> isize {
@@ -1190,6 +1262,47 @@ fn map_net_error(error: net::NetError) -> isize {
     }
 }
 
+fn log_syscall_cap_denied(pid: u32, name: &str, number: u64, required_caps: u32, have_caps: u32) {
+    serial::write_fmt(format_args!(
+        "syscall: pid={} name={} number={} ({}) denied need={:#x} have={:#x} -> {}\n",
+        pid,
+        name,
+        number,
+        arrostd::syscall::name(number),
+        required_caps,
+        have_caps,
+        errno::name(errno::EPERM)
+    ));
+}
+
+fn log_syscall_unknown(pid: u32, name: &str, number: u64, error: isize) {
+    serial::write_fmt(format_args!(
+        "syscall: pid={} name={} number={} ({}) -> {}\n",
+        pid,
+        name,
+        number,
+        arrostd::syscall::name(number),
+        errno::name(error)
+    ));
+}
+
+fn apply_cap_drop_mask(caps_mask: &mut u32, drop_mask: u64) -> Result<u32, isize> {
+    let Ok(drop_mask) = u32::try_from(drop_mask) else {
+        return Err(errno::EINVAL);
+    };
+    if drop_mask == 0 {
+        return Ok(*caps_mask);
+    }
+    if (drop_mask & !caps::ALL) != 0 {
+        return Err(errno::EINVAL);
+    }
+    if (drop_mask & caps::CORE) != 0 {
+        return Err(errno::EPERM);
+    }
+    *caps_mask &= !drop_mask;
+    Ok(*caps_mask)
+}
+
 fn syscall_required_caps(number: u64) -> u32 {
     match number {
         SYS_WRITE | SYS_READ | SYS_EXIT | SYS_YIELD | SYS_SLEEP => caps::CORE,
@@ -1379,6 +1492,18 @@ pub fn wait_all_user() -> UserWaitAllReport {
         };
         scheduler.reap_all_task_exits(shell_pid)
     })
+}
+
+pub fn arm_ring3_context(pid: u32, name: &'static str, syscall_caps: u32) -> bool {
+    with_scheduler(|scheduler| scheduler.arm_ring3_context(pid, name, syscall_caps))
+}
+
+pub fn disarm_ring3_context() {
+    with_scheduler(|scheduler| scheduler.disarm_ring3_context());
+}
+
+pub fn dispatch_ring3_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
+    with_scheduler(|scheduler| scheduler.dispatch_ring3_syscall(number, arg0, arg1, arg2))
 }
 
 fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {

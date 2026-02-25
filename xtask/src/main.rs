@@ -33,6 +33,7 @@ const DOOM_WAD_HINT: &str = "user/doom/wad/doom1.wad";
 const DOOM_FORCE_FALLBACK_ENV: &str = "ARROST_DOOM_FORCE_FALLBACK";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -63,6 +64,20 @@ impl RuntimeArch {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TopLevelCommand {
+    Help,
+    Build,
+    AbiCheck,
+    Run,
+    SmokeDoom,
+    SmokeDoomLong,
+    SmokeDoomVirtio,
+    SmokeDoomFallback,
+    SmokeProcCaps,
+    SmokeProcSpawn,
+}
+
 struct UserArtifact {
     hint: PathBuf,
     size: u64,
@@ -90,22 +105,45 @@ struct DoomGenericArtifact {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("build") => build(),
-        Some("abi-check") => abi_check(parse_abi_check_arch_args(args)?),
-        Some("run") => run_qemu(parse_run_arch_arg(args)?),
-        Some("smoke-doom") => smoke_doom(parse_run_arch_arg(args)?),
-        Some("smoke-doom-long") => smoke_doom_long(parse_run_arch_arg(args)?),
-        Some("smoke-doom-virtio") => smoke_doom_virtio(parse_run_arch_arg(args)?),
-        Some("smoke-doom-fallback") => smoke_doom_fallback(parse_run_arch_arg(args)?),
-        Some("smoke-proc-caps") => smoke_proc_caps(parse_run_arch_arg(args)?),
-        Some("smoke-proc-spawn") => smoke_proc_spawn(parse_run_arch_arg(args)?),
-        _ => {
-            eprintln!(
-                "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]>"
-            );
+    let top_level = parse_top_level_command(args.next().as_deref());
+    match top_level {
+        Ok(TopLevelCommand::Help) => {
+            print_usage();
             Ok(())
         }
+        Ok(TopLevelCommand::Build) => build(),
+        Ok(TopLevelCommand::AbiCheck) => abi_check(parse_abi_check_arch_args(args)?),
+        Ok(TopLevelCommand::Run) => run_qemu(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeDoom) => smoke_doom(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeDoomLong) => smoke_doom_long(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeDoomVirtio) => smoke_doom_virtio(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeDoomFallback) => smoke_doom_fallback(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeProcCaps) => smoke_proc_caps(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeProcSpawn) => smoke_proc_spawn(parse_run_arch_arg(args)?),
+        Err(error) => {
+            print_usage();
+            Err(error)
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!("{XTASK_USAGE}");
+}
+
+fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
+    match value {
+        None | Some("help") | Some("-h") | Some("--help") => Ok(TopLevelCommand::Help),
+        Some("build") => Ok(TopLevelCommand::Build),
+        Some("abi-check") => Ok(TopLevelCommand::AbiCheck),
+        Some("run") => Ok(TopLevelCommand::Run),
+        Some("smoke-doom") => Ok(TopLevelCommand::SmokeDoom),
+        Some("smoke-doom-long") => Ok(TopLevelCommand::SmokeDoomLong),
+        Some("smoke-doom-virtio") => Ok(TopLevelCommand::SmokeDoomVirtio),
+        Some("smoke-doom-fallback") => Ok(TopLevelCommand::SmokeDoomFallback),
+        Some("smoke-proc-caps") => Ok(TopLevelCommand::SmokeProcCaps),
+        Some("smoke-proc-spawn") => Ok(TopLevelCommand::SmokeProcSpawn),
+        Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
 
@@ -903,12 +941,20 @@ fn parse_run_arch_arg(args: impl Iterator<Item = String>) -> Result<Option<Strin
                 let value = iter
                     .next()
                     .context("missing value for --arch (expected x86_64 or aarch64)")?;
+                if arch.is_some() {
+                    bail!("duplicate --arch argument (supported: --arch <x86_64|aarch64> once)");
+                }
                 arch = Some(value);
             }
             _ => {
                 if let Some(value) = arg.strip_prefix("--arch=") {
                     if value.is_empty() {
                         bail!("missing value for --arch= (expected x86_64 or aarch64)");
+                    }
+                    if arch.is_some() {
+                        bail!(
+                            "duplicate --arch argument (supported: --arch <x86_64|aarch64> once)"
+                        );
                     }
                     arch = Some(value.to_string());
                 } else {
@@ -2292,6 +2338,34 @@ mod tests {
     }
 
     #[test]
+    fn top_level_command_defaults_to_help_when_missing() {
+        let parsed = parse_top_level_command(None).expect("empty command should map to help");
+        assert!(parsed == TopLevelCommand::Help);
+    }
+
+    #[test]
+    fn top_level_command_supports_help_aliases() {
+        let short = parse_top_level_command(Some("-h")).expect("-h should map to help");
+        assert!(short == TopLevelCommand::Help);
+
+        let long = parse_top_level_command(Some("--help")).expect("--help should map to help");
+        assert!(long == TopLevelCommand::Help);
+
+        let explicit = parse_top_level_command(Some("help")).expect("help should map to help");
+        assert!(explicit == TopLevelCommand::Help);
+    }
+
+    #[test]
+    fn top_level_command_rejects_unknown_subcommand() {
+        let error = match parse_top_level_command(Some("unknown")) {
+            Ok(_) => panic!("unknown top-level command must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("unsupported xtask command"));
+    }
+
+    #[test]
     fn abi_check_arch_args_default_to_both_targets() {
         let parsed = parse_abi_check_arch_args(Vec::<String>::new().into_iter())
             .expect("default abi-check args should parse");
@@ -2333,5 +2407,59 @@ mod tests {
         };
         let message = format!("{error:#}");
         assert!(message.contains("missing value for --arch"));
+    }
+
+    #[test]
+    fn run_arch_arg_supports_flag_and_equals_syntax() {
+        let separate = parse_run_arch_arg(to_owned_args(&["--arch", "aarch64"]).into_iter())
+            .expect("--arch value should parse");
+        assert_eq!(separate, Some(String::from("aarch64")));
+
+        let equals = parse_run_arch_arg(to_owned_args(&["--arch=x86_64"]).into_iter())
+            .expect("--arch=<value> should parse");
+        assert_eq!(equals, Some(String::from("x86_64")));
+    }
+
+    #[test]
+    fn run_arch_arg_rejects_duplicate_arch_flag() {
+        let error = match parse_run_arch_arg(
+            to_owned_args(&["--arch", "x86_64", "--arch", "aarch64"]).into_iter(),
+        ) {
+            Ok(_) => panic!("duplicate --arch must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("duplicate --arch"));
+    }
+
+    #[test]
+    fn run_arch_arg_rejects_unknown_flag() {
+        let error = match parse_run_arch_arg(to_owned_args(&["--bad"]).into_iter()) {
+            Ok(_) => panic!("unknown flag must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("unsupported argument"));
+    }
+
+    #[test]
+    fn resolve_runtime_arch_accepts_aliases() {
+        let amd64 =
+            resolve_runtime_arch(Some(String::from("amd64"))).expect("amd64 alias should resolve");
+        assert!(amd64 == RuntimeArch::X86_64);
+
+        let arm64 =
+            resolve_runtime_arch(Some(String::from("arm64"))).expect("arm64 alias should resolve");
+        assert!(arm64 == RuntimeArch::Aarch64);
+    }
+
+    #[test]
+    fn resolve_runtime_arch_rejects_unknown_value() {
+        let error = match resolve_runtime_arch(Some(String::from("riscv64"))) {
+            Ok(_) => panic!("unknown arch must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("unsupported arch"));
     }
 }
