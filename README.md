@@ -30,7 +30,8 @@ The project focuses on practical kernel engineering with observable behavior, re
 - Cross-target build support for `x86_64-unknown-none` and `aarch64-unknown-none`.
 - `aarch64` boot on QEMU `virt` via AAVMF/UEFI chainloader with framebuffer UI (`uefi-gop` via `ramfb` by default), serial shell, cooperative scheduler, virtio block/network over virtio-mmio, DHCP, and diskfs.
 - Physical memory mapping, paging setup, kernel heap, and allocation smoke checks.
-- `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling.
+- `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling, plus ring-3 transition groundwork (`user` selectors, TSS `RSP0`, `int 0x80` DPL3 gate).
+- Optional `x86_64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) runs CPL3 `int 0x80` (`getpid/time_ms/exit`) and routes syscall policy/accounting through process-layer context (`pid/caps/name`).
 - `aarch64` interrupt path: EL1 vectors + GICv2 virtual timer IRQ with automatic runtime fallback to counter polling when unexpected IRQ sources are observed.
 - Cooperative scheduler syscall ABI includes `getpid`, `time_ms`, `cap_get`, `cap_drop`, `spawn`, `waitpid`, and per-task capability enforcement diagnostics.
 - Cooperative user task lifecycle supports `spawn/waitpid` for `init` and `doom` app IDs in shared-address-space runtime.
