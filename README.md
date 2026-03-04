@@ -28,14 +28,18 @@ The project focuses on practical kernel engineering with observable behavior, re
 
 - UEFI boot on QEMU with serial-first diagnostics on both `x86_64-unknown-none` and `aarch64-unknown-none`.
 - Cross-target build support for `x86_64-unknown-none` and `aarch64-unknown-none`.
-- `aarch64` boot on QEMU `virt` via AAVMF/UEFI chainloader with framebuffer UI (`uefi-gop` via `ramfb` by default), serial shell, cooperative scheduler, virtio block/network over virtio-mmio, DHCP, and diskfs.
+- `aarch64` boot on QEMU `virt` via AAVMF/UEFI chainloader with framebuffer UI (`uefi-gop` via `ramfb` by default), serial shell, ring3 preemptive scheduler (syscall-timeslice), virtio block/network over virtio-mmio, DHCP, and diskfs.
 - Physical memory mapping, paging setup, kernel heap, and allocation smoke checks.
 - `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling, plus ring-3 transition groundwork (`user` selectors, TSS `RSP0`, `int 0x80` DPL3 gate).
 - Optional `x86_64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) runs CPL3 `int 0x80` (`getpid/time_ms/exit`) and routes syscall policy/accounting through process-layer context (`pid/caps/name`).
 - `aarch64` interrupt path: EL1 vectors + GICv2 virtual timer IRQ with automatic runtime fallback to counter polling when unexpected IRQ sources are observed.
-- Cooperative scheduler syscall ABI includes `getpid`, `time_ms`, `cap_get`, `cap_drop`, `spawn`, `waitpid`, and per-task capability enforcement diagnostics.
-- Cooperative user task lifecycle supports `spawn/waitpid` for `init` and `doom` app IDs in shared-address-space runtime.
+- Optional `aarch64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) attempts EL0->EL1 `SVC` (`getpid/time_ms/exit`) through lower-EL sync vectors and routes syscall policy/accounting through process-layer context (`pid/caps/name`).
+- Optional `aarch64` fault smoke (`ARROST_RING3_BOOT_SMOKE=true` + `ARROST_RING3_BOOT_SMOKE_FAULT=true`) triggers a controlled EL0 sync fault (`BRK`) and validates kernel fallback/resume.
+- Syscall ABI includes `getpid`, `time_ms`, `cap_get`, `cap_drop`, `spawn`, `waitpid`, and per-task capability enforcement diagnostics.
+- Ring3 runtime now supports preemptive multiprocess scheduling (round-robin, syscall-timeslice) for embedded ELF apps (`init`, `doom`) through non-blocking `ring3 run` enqueue and `ring3 wait` reap.
+- Shell ring3 controls include `ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`.
 - Shell command `user apps` exposes cooperative userland app contracts (`id/name/caps/sleep/exit`) sourced from user crates.
+- Shell command `ring3 smoke` runs a cross-platform ring-3 policy smoke (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the shared process-layer syscall context checks.
 - In-kernel shell with filesystem, UI, network, and Doom control commands.
 - Framebuffer compositor with shell and file-manager windows.
 - Virtio block storage backend with persistent disk image.
@@ -46,8 +50,8 @@ The project focuses on practical kernel engineering with observable behavior, re
 
 ### Not implemented yet
 
-- Ring-3 process isolation and full user-mode execution model.
-- Preemptive multitasking and multi-address-space scheduler.
+- Strong ring-3 process isolation with dedicated user-only page-table ownership per process.
+- Hard preemption without syscall/trap boundary dependence.
 - Full POSIX-like syscall surface.
 - Production-grade TCP/IP stack and broader protocol support.
 - Filesystem hierarchy features beyond current flat file model.
@@ -68,7 +72,6 @@ The project focuses on practical kernel engineering with observable behavior, re
 ### What is still pending
 
 - Music/synthesis fidelity vs original Doom output (current synth is functional but not final-quality).
-- Native user-mode Doom process model (currently integrated through kernel bridge flow).
 - Broader gameplay/input polish beyond the current capture and command-based controls.
 
 ## Build
@@ -139,7 +142,8 @@ Useful environment overrides:
 - `QEMU_INPUT=virtio|ps2` (`x86_64`; `aarch64` run path uses virtio-input)
 - `QEMU_VIRTIO_BUS=mmio|auto` (`pci` is accepted as alias but forced to `mmio` on `aarch64`)
 - `QEMU_GIC_VERSION=2|3|max` (`aarch64`)
-- `ARROST_RING3_BOOT_SMOKE=true|false` (`x86_64`; optional boot-time CPL3 `int 0x80` smoke sequence: `getpid/time_ms/exit`)
+- `ARROST_RING3_BOOT_SMOKE=true|false` (`x86_64`: CPL3 `int 0x80`; `aarch64`: EL0 `SVC` lower-EL sync; optional boot-time `getpid/time_ms/exit` smoke sequence)
+- `ARROST_RING3_BOOT_SMOKE_FAULT=true|false` (`aarch64` only: optional controlled EL0 fault variant for boot smoke fallback/resume checks)
 - `AAVMF_CODE=/path/to/AAVMF_CODE.fd`
 - `AAVMF_VARS=/path/to/AAVMF_VARS.fd`
 
@@ -208,6 +212,11 @@ cargo xtask smoke-proc-caps --arch x86_64
 cargo xtask smoke-proc-caps --arch aarch64
 cargo xtask smoke-proc-spawn --arch x86_64
 cargo xtask smoke-proc-spawn --arch aarch64
+cargo xtask smoke-ring3 --arch x86_64
+cargo xtask smoke-ring3 --arch aarch64
+cargo xtask smoke-ring3-run --arch x86_64
+cargo xtask smoke-ring3-run --arch aarch64
+cargo xtask smoke-ring3-fault --arch aarch64
 ```
 
 ## Documentation index

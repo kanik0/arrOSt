@@ -1,5 +1,11 @@
 // kernel/src/proc/mod.rs: M4 cooperative scheduler and syscall dispatch (same address space).
+mod ring3_groundwork;
+mod user_elf_embed {
+    include!(concat!(env!("OUT_DIR"), "/user_elf_embed.rs"));
+}
+
 use crate::{net, serial, time};
+use alloc::{boxed::Box, vec::Vec};
 use arrost_user_doom as user_doom;
 use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
@@ -12,10 +18,17 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
+use ring3_groundwork::{
+    AddressSpaceToken, MAX_USER_RANGES, Ring3ProcessImage, Ring3ProcessState, Ring3TrapFrame,
+    UserMemoryRange,
+};
 
 const MAX_TASKS: usize = 4;
+const MAX_RING3_TASKS: usize = 8;
 const MAX_LINE_LEN: usize = 96;
 const MAX_WRITE_BYTES: usize = 256;
+const MAX_RING3_IO_BYTES: usize = 4096;
+const RING3_SYSCALL_TIMESLICE: u32 = 8;
 const USER_SHELL_SCRIPT: &[u8] = b"";
 const TASK_CAP_INIT: u32 = user_init::required_caps();
 const TASK_CAP_SHELL: u32 = caps::ALL;
@@ -47,6 +60,168 @@ pub enum UserWaitAny {
 pub struct UserWaitAllReport {
     pub reaped: u32,
     pub running: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ring3PolicySmokeReport {
+    pub pid: u32,
+    pub initial_caps: u32,
+    pub getpid_rc: isize,
+    pub time_before_drop_rc: isize,
+    pub socket_rc: isize,
+    pub sendto_bad_ptr_rc: isize,
+    pub recvfrom_bad_ptr_rc: isize,
+    pub cap_get_before_drop_rc: isize,
+    pub cap_drop_rc: isize,
+    pub cap_get_after_drop_rc: isize,
+    pub time_after_drop_rc: isize,
+    pub exit_rc: isize,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ring3GroundworkSmokeReport {
+    pub enabled: bool,
+    pub pid: u32,
+    pub entry_ip: u64,
+    pub entry_sp: u64,
+    pub kernel_stack_top: u64,
+    pub user_ranges: usize,
+    pub mapped_pages: usize,
+    pub getpid_rc: isize,
+    pub time_ms_rc: isize,
+    pub cap_get_rc: isize,
+    pub sendto_user_req_rc: isize,
+    pub recvfrom_user_req_rc: isize,
+    pub exit_rc: isize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Ring3SyscallAction {
+    ContinueUser,
+    ReturnKernel,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ring3SyscallDispatch {
+    pub result: isize,
+    pub action: Ring3SyscallAction,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ring3ProcessContext {
+    pub pid: u32,
+    pub name: &'static str,
+    pub syscall_caps: u32,
+    pub address_space: AddressSpaceToken,
+    pub trap_frame: Ring3TrapFrame,
+    pub kernel_stack_top: u64,
+    pub state: Ring3ProcessState,
+    pub user_ranges: [Option<UserMemoryRange>; MAX_USER_RANGES],
+    pub user_range_count: usize,
+    pub mapped_pages: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Ring3TaskState {
+    Ready,
+    Running,
+    Sleeping { until_tick: u64 },
+    Exited { code: i32 },
+    Faulted,
+}
+
+#[derive(Clone, Copy)]
+struct Ring3Task {
+    pid: u32,
+    parent_pid: u32,
+    app_id: u64,
+    name: &'static str,
+    syscall_caps: u32,
+    state: Ring3TaskState,
+    process: Ring3ProcessContext,
+    image_ptr: *mut Ring3ProcessImage,
+}
+
+#[derive(Clone, Copy)]
+struct Ring3RunPlan {
+    process: Ring3ProcessContext,
+}
+
+#[derive(Clone, Copy)]
+pub enum Ring3WaitAny {
+    Exited { pid: u32, code: i32 },
+    Running,
+    NoChildren,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ring3WaitAllReport {
+    pub reaped: u32,
+    pub running: u32,
+}
+
+impl Ring3ProcessContext {
+    pub const fn new(pid: u32, name: &'static str, syscall_caps: u32) -> Self {
+        Self {
+            pid,
+            name,
+            syscall_caps,
+            address_space: AddressSpaceToken::empty(),
+            trap_frame: Ring3TrapFrame::empty(),
+            kernel_stack_top: 0,
+            state: Ring3ProcessState::ready(),
+            user_ranges: ring3_groundwork::empty_user_ranges(),
+            user_range_count: 0,
+            mapped_pages: 0,
+        }
+    }
+
+    fn with_process_image(self, image: &Ring3ProcessImage) -> Self {
+        Self {
+            pid: self.pid,
+            name: self.name,
+            syscall_caps: self.syscall_caps,
+            address_space: image.address_space,
+            trap_frame: image.trap_frame,
+            kernel_stack_top: image.kernel_stack_top,
+            state: Ring3ProcessState::Ready,
+            user_ranges: image.user_ranges,
+            user_range_count: image.user_range_count,
+            mapped_pages: image.mapped_pages,
+        }
+    }
+}
+
+impl Ring3PolicySmokeReport {
+    pub fn passed(&self) -> bool {
+        let expected_caps_after_drop = self.initial_caps & !caps::TIME;
+        self.getpid_rc == self.pid as isize
+            && self.time_before_drop_rc >= 0
+            && self.socket_rc == UDP_SOCKET_FD as isize
+            && self.sendto_bad_ptr_rc == errno::EINVAL
+            && self.recvfrom_bad_ptr_rc == errno::EINVAL
+            && self.cap_get_before_drop_rc == self.initial_caps as isize
+            && self.cap_drop_rc == expected_caps_after_drop as isize
+            && self.cap_get_after_drop_rc == expected_caps_after_drop as isize
+            && self.time_after_drop_rc == errno::EPERM
+            && self.exit_rc == 0
+    }
+}
+
+impl Ring3GroundworkSmokeReport {
+    pub fn passed(&self) -> bool {
+        self.enabled
+            && self.entry_ip != 0
+            && self.entry_sp != 0
+            && self.kernel_stack_top != 0
+            && self.user_ranges > 0
+            && self.getpid_rc == self.pid as isize
+            && self.time_ms_rc >= 0
+            && self.cap_get_rc >= 0
+            && self.sendto_user_req_rc == errno::EINVAL
+            && self.recvfrom_user_req_rc == errno::EINVAL
+            && self.exit_rc == 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -181,18 +356,14 @@ impl InputScript {
 #[derive(Clone, Copy)]
 struct Ring3Context {
     active: bool,
-    pid: u32,
-    name: &'static str,
-    syscall_caps: u32,
+    process: Ring3ProcessContext,
 }
 
 impl Ring3Context {
     const fn inactive() -> Self {
         Self {
             active: false,
-            pid: 0,
-            name: "<none>",
-            syscall_caps: 0,
+            process: Ring3ProcessContext::new(0, "<none>", 0),
         }
     }
 }
@@ -202,7 +373,15 @@ struct Scheduler {
     next_pid: u32,
     cursor: usize,
     tasks: [Option<Task>; MAX_TASKS],
+    ring3_tasks: [Option<Ring3Task>; MAX_RING3_TASKS],
+    ring3_cursor: usize,
+    ring3_active_slot: Option<usize>,
+    ring3_active_sleep_until: u64,
+    ring3_active_exit_code: i32,
+    ring3_active_syscalls: u32,
     ring3_context: Ring3Context,
+    ring3_process_image: Option<Ring3ProcessImage>,
+    ring3_previous_address_space: Option<AddressSpaceToken>,
     stats: SyscallStats,
     input_script: InputScript,
 }
@@ -214,7 +393,15 @@ impl Scheduler {
             next_pid: 1,
             cursor: 0,
             tasks: [None; MAX_TASKS],
+            ring3_tasks: [None; MAX_RING3_TASKS],
+            ring3_cursor: 0,
+            ring3_active_slot: None,
+            ring3_active_sleep_until: 0,
+            ring3_active_exit_code: 0,
+            ring3_active_syscalls: 0,
             ring3_context: Ring3Context::inactive(),
+            ring3_process_image: None,
+            ring3_previous_address_space: None,
             stats: SyscallStats::new(),
             input_script: InputScript::new(USER_SHELL_SCRIPT),
         }
@@ -817,43 +1004,123 @@ impl Scheduler {
         }
     }
 
-    fn arm_ring3_context(&mut self, pid: u32, name: &'static str, syscall_caps: u32) -> bool {
+    fn arm_ring3_context(&mut self, process: Ring3ProcessContext) -> bool {
         if self.ring3_context.active {
             return false;
         }
+        self.ring3_active_slot = None;
+        self.ring3_active_sleep_until = 0;
+        self.ring3_active_exit_code = 0;
+        self.ring3_active_syscalls = 0;
+        self.ring3_process_image = None;
+        self.ring3_previous_address_space = None;
         self.ring3_context = Ring3Context {
             active: true,
-            pid,
-            name,
-            syscall_caps,
+            process,
         };
         true
     }
 
-    fn disarm_ring3_context(&mut self) {
-        self.ring3_context = Ring3Context::inactive();
-    }
-
-    fn dispatch_ring3_syscall(&mut self, number: u64, arg0: u64, _arg1: u64, _arg2: u64) -> isize {
-        if !self.ring3_context.active {
-            self.stats.errors = self.stats.errors.saturating_add(1);
-            return errno::ENODEV;
+    fn arm_ring3_context_from_elf(
+        &mut self,
+        process: Ring3ProcessContext,
+        elf_bytes: &[u8],
+    ) -> Result<(), isize> {
+        if self.ring3_context.active {
+            return Err(errno::EAGAIN);
         }
 
-        let ctx_pid = self.ring3_context.pid;
-        let ctx_name = self.ring3_context.name;
+        let image = ring3_groundwork::load_native_process_image(elf_bytes).map_err(|error| {
+            serial::write_fmt(format_args!("ring3 groundwork: ELF load failed: {error}\n"));
+            errno::EINVAL
+        })?;
+        let process = process.with_process_image(&image);
+        self.ring3_active_slot = None;
+        self.ring3_active_sleep_until = 0;
+        self.ring3_active_exit_code = 0;
+        self.ring3_active_syscalls = 0;
+        self.ring3_context = Ring3Context {
+            active: true,
+            process,
+        };
+        self.ring3_process_image = Some(image);
+        self.ring3_previous_address_space = None;
+        Ok(())
+    }
+
+    fn disarm_ring3_context(&mut self) {
+        self.ring3_active_slot = None;
+        self.ring3_active_sleep_until = 0;
+        self.ring3_active_exit_code = 0;
+        self.ring3_active_syscalls = 0;
+        self.ring3_context = Ring3Context::inactive();
+        self.ring3_process_image = None;
+        self.ring3_previous_address_space = None;
+    }
+
+    fn dispatch_ring3_syscall(&mut self, number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
+        self.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2)
+            .result
+    }
+
+    fn dispatch_ring3_syscall_with_action(
+        &mut self,
+        number: u64,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    ) -> Ring3SyscallDispatch {
+        if !self.ring3_context.active {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return Ring3SyscallDispatch {
+                result: errno::ENODEV,
+                action: Ring3SyscallAction::ContinueUser,
+            };
+        }
+
+        let ctx = self.ring3_context.process;
+        self.ring3_context.process.state = Ring3ProcessState::Running;
+        let ctx_pid = ctx.pid;
+        let ctx_name = ctx.name;
         let required_caps = syscall_required_caps(number);
-        let ctx_caps = self.ring3_context.syscall_caps;
+        let ctx_caps = ctx.syscall_caps;
         if required_caps != 0 && !caps::allows(ctx_caps, required_caps) {
             self.stats.errors = self.stats.errors.saturating_add(1);
             log_syscall_cap_denied(ctx_pid, ctx_name, number, required_caps, ctx_caps);
-            return errno::EPERM;
+            self.ring3_context.process.state = Ring3ProcessState::Ready;
+            return Ring3SyscallDispatch {
+                result: errno::EPERM,
+                action: Ring3SyscallAction::ContinueUser,
+            };
         }
 
-        match number {
+        let mut action = Ring3SyscallAction::ContinueUser;
+        let result = match number {
             SYS_EXIT => {
                 self.stats.exit = self.stats.exit.saturating_add(1);
+                self.ring3_context.process.state = Ring3ProcessState::Exited;
+                self.ring3_active_exit_code = arg0 as i32;
+                action = Ring3SyscallAction::ReturnKernel;
                 0
+            }
+            SYS_YIELD => {
+                self.stats.yield_now = self.stats.yield_now.saturating_add(1);
+                self.ring3_context.process.state = Ring3ProcessState::Ready;
+                if self.ring3_active_slot.is_some() {
+                    action = Ring3SyscallAction::ReturnKernel;
+                }
+                0
+            }
+            SYS_SLEEP => {
+                self.stats.sleep = self.stats.sleep.saturating_add(1);
+                if self.ring3_active_slot.is_some() {
+                    self.ring3_active_sleep_until = time::ticks().saturating_add(arg0.max(1));
+                    self.ring3_context.process.state = Ring3ProcessState::Sleeping;
+                    action = Ring3SyscallAction::ReturnKernel;
+                    0
+                } else {
+                    self.syscall_sleep_ring3(arg0)
+                }
             }
             SYS_GETPID => {
                 self.stats.getpid = self.stats.getpid.saturating_add(1);
@@ -865,18 +1132,581 @@ impl Scheduler {
             }
             SYS_CAP_GET => {
                 self.stats.cap_get = self.stats.cap_get.saturating_add(1);
-                self.ring3_context.syscall_caps as isize
+                self.ring3_context.process.syscall_caps as isize
             }
             SYS_CAP_DROP => {
                 self.stats.cap_drop = self.stats.cap_drop.saturating_add(1);
                 self.syscall_cap_drop_ring3(arg0)
+            }
+            SYS_SOCKET => {
+                self.stats.socket = self.stats.socket.saturating_add(1);
+                self.syscall_socket(arg0, arg1, arg2)
+            }
+            SYS_SENDTO => {
+                self.stats.sendto = self.stats.sendto.saturating_add(1);
+                self.syscall_sendto_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_RECVFROM => {
+                self.stats.recvfrom = self.stats.recvfrom.saturating_add(1);
+                self.syscall_recvfrom_ring3(ctx, arg0, arg1, arg2)
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 log_syscall_unknown(ctx_pid, ctx_name, number, errno::ENOSYS);
                 errno::ENOSYS
             }
+        };
+
+        if matches!(self.ring3_context.process.state, Ring3ProcessState::Running) {
+            self.ring3_context.process.state = Ring3ProcessState::Ready;
         }
+        if self.ring3_active_slot.is_some() && action == Ring3SyscallAction::ContinueUser {
+            self.ring3_active_syscalls = self.ring3_active_syscalls.saturating_add(1);
+            if self.ring3_active_syscalls >= RING3_SYSCALL_TIMESLICE {
+                self.ring3_active_syscalls = 0;
+                self.ring3_context.process.state = Ring3ProcessState::Ready;
+                action = Ring3SyscallAction::ReturnKernel;
+            }
+        }
+
+        Ring3SyscallDispatch { result, action }
+    }
+
+    fn run_ring3_groundwork_smoke(&mut self) -> Result<Ring3GroundworkSmokeReport, isize> {
+        if !ring3_groundwork::elf_groundwork_enabled() {
+            return Ok(Ring3GroundworkSmokeReport {
+                enabled: false,
+                pid: 0,
+                entry_ip: 0,
+                entry_sp: 0,
+                kernel_stack_top: 0,
+                user_ranges: 0,
+                mapped_pages: 0,
+                getpid_rc: errno::ENODEV,
+                time_ms_rc: errno::ENODEV,
+                cap_get_rc: errno::ENODEV,
+                sendto_user_req_rc: errno::ENODEV,
+                recvfrom_user_req_rc: errno::ENODEV,
+                exit_rc: errno::ENODEV,
+            });
+        }
+
+        let elf = ring3_groundwork::build_native_smoke_elf();
+        let context = Ring3ProcessContext::new(
+            9300,
+            "ring3-elf-smoke",
+            caps::CORE | caps::NET | caps::PROC | caps::TIME,
+        );
+        self.arm_ring3_context_from_elf(context, &elf)?;
+        let current = self.ring3_context.process;
+
+        let Some(send_req_ptr) = self.first_writable_ring3_pointer(64, size_of::<UdpSendReq>())
+        else {
+            self.disarm_ring3_context();
+            return Err(errno::ENODEV);
+        };
+        let send_req = UdpSendReq::new([127, 0, 0, 1], 7777, 5555, 0, 8);
+        if let Err(error) = self.ring3_copy_to_user(send_req_ptr, &send_req) {
+            self.disarm_ring3_context();
+            return Err(error);
+        }
+
+        let Some(recv_req_ptr) = self.first_writable_ring3_pointer(192, size_of::<UdpRecvReq>())
+        else {
+            self.disarm_ring3_context();
+            return Err(errno::ENODEV);
+        };
+        let recv_req = UdpRecvReq::new(0, 64);
+        if let Err(error) = self.ring3_copy_to_user(recv_req_ptr, &recv_req) {
+            self.disarm_ring3_context();
+            return Err(error);
+        }
+
+        let getpid_rc = self.dispatch_ring3_syscall(SYS_GETPID, 0, 0, 0);
+        let time_ms_rc = self.dispatch_ring3_syscall(SYS_TIME_MS, 0, 0, 0);
+        let cap_get_rc = self.dispatch_ring3_syscall(SYS_CAP_GET, 0, 0, 0);
+        let sendto_user_req_rc = self.dispatch_ring3_syscall(
+            SYS_SENDTO,
+            UDP_SOCKET_FD,
+            send_req_ptr,
+            size_of::<UdpSendReq>() as u64,
+        );
+        let recvfrom_user_req_rc = self.dispatch_ring3_syscall(
+            SYS_RECVFROM,
+            UDP_SOCKET_FD,
+            recv_req_ptr,
+            size_of::<UdpRecvReq>() as u64,
+        );
+        let exit_rc = self.dispatch_ring3_syscall(SYS_EXIT, 0, 0, 0);
+        self.disarm_ring3_context();
+
+        Ok(Ring3GroundworkSmokeReport {
+            enabled: true,
+            pid: current.pid,
+            entry_ip: current.trap_frame.ip,
+            entry_sp: current.trap_frame.sp,
+            kernel_stack_top: current.kernel_stack_top,
+            user_ranges: current.user_range_count,
+            mapped_pages: current.mapped_pages,
+            getpid_rc,
+            time_ms_rc,
+            cap_get_rc,
+            sendto_user_req_rc,
+            recvfrom_user_req_rc,
+            exit_rc,
+        })
+    }
+
+    fn enqueue_ring3_user_app(&mut self, parent_pid: u32, app_id: u64) -> Result<u32, isize> {
+        if !ring3_groundwork::elf_groundwork_enabled() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            serial::write_line(
+                "ring3 run: disabled (set ARROST_RING3_ELF_GROUNDWORK=true at build time)",
+            );
+            return Err(errno::EPERM);
+        }
+        let Some(contract) = user_app_contract(app_id) else {
+            return Err(errno::EINVAL);
+        };
+        let elf = user_app_elf_bytes(app_id);
+        if elf.is_empty() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            serial::write_fmt(format_args!(
+                "ring3 run: missing ELF artifact for app={} ({})\n",
+                app_id, contract.app_name
+            ));
+            return Err(errno::ENODEV);
+        }
+
+        let pid = self.next_pid;
+        let context = Ring3ProcessContext::new(pid, contract.worker_name, contract.syscall_caps);
+        let image = ring3_groundwork::load_native_process_image(elf).map_err(|error| {
+            serial::write_fmt(format_args!("ring3 run: ELF load failed: {error}\n"));
+            errno::EINVAL
+        })?;
+        let process = context.with_process_image(&image);
+        let image_ptr = Box::into_raw(Box::new(image));
+        let Some(slot) = self.alloc_ring3_task_slot() else {
+            // SAFETY: pointer comes from Box::into_raw above and was not shared.
+            unsafe {
+                drop(Box::from_raw(image_ptr));
+            }
+            return Err(errno::ENODEV);
+        };
+        self.ring3_tasks[slot] = Some(Ring3Task {
+            pid,
+            parent_pid,
+            app_id,
+            name: contract.worker_name,
+            syscall_caps: contract.syscall_caps,
+            state: Ring3TaskState::Ready,
+            process,
+            image_ptr,
+        });
+        self.next_pid = self.next_pid.saturating_add(1);
+        Ok(pid)
+    }
+
+    fn alloc_ring3_task_slot(&self) -> Option<usize> {
+        for index in 0..MAX_RING3_TASKS {
+            if self.ring3_tasks[index].is_none() {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn wake_sleeping_ring3_tasks(&mut self, now_ticks: u64) {
+        for slot in &mut self.ring3_tasks {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if let Ring3TaskState::Sleeping { until_tick } = task.state
+                && now_ticks >= until_tick
+            {
+                task.state = Ring3TaskState::Ready;
+            }
+        }
+    }
+
+    fn prepare_ring3_run_plan(&mut self, now_ticks: u64) -> Option<Ring3RunPlan> {
+        if self.ring3_context.active {
+            return None;
+        }
+        self.wake_sleeping_ring3_tasks(now_ticks);
+
+        for _ in 0..MAX_RING3_TASKS {
+            let index = self.ring3_cursor % MAX_RING3_TASKS;
+            self.ring3_cursor = (self.ring3_cursor + 1) % MAX_RING3_TASKS;
+            let process = {
+                let Some(task) = self.ring3_tasks[index].as_mut() else {
+                    continue;
+                };
+                if !matches!(task.state, Ring3TaskState::Ready) {
+                    continue;
+                }
+                task.state = Ring3TaskState::Running;
+                task.process
+            };
+
+            self.ring3_context = Ring3Context {
+                active: true,
+                process,
+            };
+            self.ring3_active_slot = Some(index);
+            self.ring3_active_sleep_until = 0;
+            self.ring3_active_exit_code = 0;
+            self.ring3_active_syscalls = 0;
+            if self.activate_ring3_address_space().is_err() {
+                if let Some(task) = self.ring3_tasks[index].as_mut() {
+                    task.state = Ring3TaskState::Faulted;
+                }
+                self.disarm_ring3_context();
+                continue;
+            }
+            return Some(Ring3RunPlan {
+                process: self.ring3_context.process,
+            });
+        }
+
+        None
+    }
+
+    fn activate_ring3_address_space(&mut self) -> Result<(), isize> {
+        let process_space = self.ring3_context.process.address_space;
+        if process_space.root_table == 0 {
+            return Ok(());
+        }
+        match ring3_groundwork::switch_to_address_space(process_space) {
+            Ok(previous) => {
+                self.ring3_previous_address_space = Some(previous);
+                Ok(())
+            }
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                serial::write_fmt(format_args!(
+                    "ring3 run: address-space switch failed: {error}\n"
+                ));
+                Err(errno::ENODEV)
+            }
+        }
+    }
+
+    fn on_ring3_trap_resume(&mut self, ip: u64, sp: u64, ret0: u64) {
+        self.ring3_context.process.trap_frame = Ring3TrapFrame::new_with_ret(ip, sp, ret0);
+        self.complete_ring3_resume();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn mark_active_ring3_fault(&mut self) {
+        if self.ring3_context.active {
+            self.ring3_context.process.state = Ring3ProcessState::Faulted;
+        }
+    }
+
+    fn on_ring3_kernel_resume(&mut self) {
+        self.complete_ring3_resume();
+    }
+
+    fn complete_ring3_resume(&mut self) {
+        self.restore_ring3_address_space_if_needed();
+        if let Some(index) = self.ring3_active_slot {
+            if let Some(task) = self.ring3_tasks[index].as_mut() {
+                let process = self.ring3_context.process;
+                task.process = process;
+                task.syscall_caps = process.syscall_caps;
+                task.state = match process.state {
+                    Ring3ProcessState::Ready | Ring3ProcessState::Running => Ring3TaskState::Ready,
+                    Ring3ProcessState::Sleeping => Ring3TaskState::Sleeping {
+                        until_tick: self.ring3_active_sleep_until,
+                    },
+                    Ring3ProcessState::Exited => Ring3TaskState::Exited {
+                        code: self.ring3_active_exit_code,
+                    },
+                    Ring3ProcessState::Faulted => Ring3TaskState::Faulted,
+                };
+            }
+            self.ring3_active_slot = None;
+            self.ring3_active_sleep_until = 0;
+            self.ring3_active_exit_code = 0;
+            self.ring3_active_syscalls = 0;
+            self.ring3_context = Ring3Context::inactive();
+            return;
+        }
+
+        self.disarm_ring3_context();
+    }
+
+    fn mark_active_ring3_launch_failed(&mut self) {
+        self.stats.errors = self.stats.errors.saturating_add(1);
+        if let Some(index) = self.ring3_active_slot
+            && let Some(task) = self.ring3_tasks[index].as_mut()
+        {
+            task.state = Ring3TaskState::Faulted;
+        }
+        self.complete_ring3_resume();
+    }
+
+    fn restore_ring3_address_space_if_needed(&mut self) {
+        let Some(previous) = self.ring3_previous_address_space.take() else {
+            return;
+        };
+        if let Err(error) = ring3_groundwork::switch_to_address_space(previous) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            serial::write_fmt(format_args!(
+                "ring3 run: address-space restore failed: {error}\n"
+            ));
+        }
+    }
+
+    fn first_writable_ring3_pointer(&self, offset: u64, len: usize) -> Option<u64> {
+        let process = self.ring3_context.process;
+        let limit = process.user_range_count.min(MAX_USER_RANGES);
+        for range in process.user_ranges.iter().take(limit).flatten() {
+            if !range.writable {
+                continue;
+            }
+            let ptr = range.start.checked_add(offset)?;
+            if ring3_groundwork::validate_user_access(
+                &process.user_ranges,
+                process.user_range_count,
+                ptr,
+                len,
+                true,
+            )
+            .is_ok()
+            {
+                return Some(ptr);
+            }
+        }
+        None
+    }
+
+    fn ring3_copy_to_user<T: Copy>(&mut self, dst_ptr: u64, value: &T) -> Result<(), isize> {
+        let process = self.ring3_context.process;
+        ring3_groundwork::copy_to_user(
+            &process.user_ranges,
+            process.user_range_count,
+            dst_ptr,
+            value,
+        )
+        .map_err(|error| self.map_ring3_copy_error(error))
+    }
+
+    fn map_ring3_copy_error(&mut self, error: ring3_groundwork::UserCopyError) -> isize {
+        self.stats.errors = self.stats.errors.saturating_add(1);
+        self.ring3_context.process.state = Ring3ProcessState::Faulted;
+        serial::write_fmt(format_args!("ring3 copy error: {error}\n"));
+        errno::EFAULT
+    }
+
+    fn log_ring3_tasks(&self) {
+        let count = self.ring3_tasks.iter().flatten().count();
+        serial::write_fmt(format_args!("ring3(proc): tasks={}\n", count));
+        for task in self.ring3_tasks.iter().flatten() {
+            match task.state {
+                Ring3TaskState::Ready => {
+                    serial::write_fmt(format_args!(
+                        "ring3(proc): pid={} parent={} app={} name={} caps={:#x} state=ready\n",
+                        task.pid,
+                        task.parent_pid,
+                        app::name(task.app_id),
+                        task.name,
+                        task.syscall_caps
+                    ));
+                }
+                Ring3TaskState::Running => {
+                    serial::write_fmt(format_args!(
+                        "ring3(proc): pid={} parent={} app={} name={} caps={:#x} state=running\n",
+                        task.pid,
+                        task.parent_pid,
+                        app::name(task.app_id),
+                        task.name,
+                        task.syscall_caps
+                    ));
+                }
+                Ring3TaskState::Sleeping { until_tick } => {
+                    serial::write_fmt(format_args!(
+                        "ring3(proc): pid={} parent={} app={} name={} caps={:#x} state=sleep until_tick={}\n",
+                        task.pid,
+                        task.parent_pid,
+                        app::name(task.app_id),
+                        task.name,
+                        task.syscall_caps,
+                        until_tick
+                    ));
+                }
+                Ring3TaskState::Exited { code } => {
+                    serial::write_fmt(format_args!(
+                        "ring3(proc): pid={} parent={} app={} name={} caps={:#x} state=exited code={}\n",
+                        task.pid,
+                        task.parent_pid,
+                        app::name(task.app_id),
+                        task.name,
+                        task.syscall_caps,
+                        code
+                    ));
+                }
+                Ring3TaskState::Faulted => {
+                    serial::write_fmt(format_args!(
+                        "ring3(proc): pid={} parent={} app={} name={} caps={:#x} state=faulted\n",
+                        task.pid,
+                        task.parent_pid,
+                        app::name(task.app_id),
+                        task.name,
+                        task.syscall_caps
+                    ));
+                }
+            }
+        }
+    }
+
+    fn wait_ring3_pid(&mut self, requester_pid: u32, wait_pid: u32) -> isize {
+        if wait_pid == 0 || wait_pid == requester_pid {
+            return errno::EINVAL;
+        }
+        for index in 0..MAX_RING3_TASKS {
+            let Some(task) = self.ring3_tasks[index] else {
+                continue;
+            };
+            if task.pid != wait_pid || task.parent_pid != requester_pid {
+                continue;
+            }
+            return match task.state {
+                Ring3TaskState::Exited { code } => {
+                    self.release_ring3_task(index);
+                    code as isize
+                }
+                Ring3TaskState::Faulted => {
+                    self.release_ring3_task(index);
+                    errno::EFAULT
+                }
+                _ => errno::EAGAIN,
+            };
+        }
+        errno::EINVAL
+    }
+
+    fn wait_any_ring3(&mut self, requester_pid: u32) -> Ring3WaitAny {
+        let mut has_children = false;
+        for index in 0..MAX_RING3_TASKS {
+            let Some(task) = self.ring3_tasks[index] else {
+                continue;
+            };
+            if task.parent_pid != requester_pid {
+                continue;
+            }
+            has_children = true;
+            match task.state {
+                Ring3TaskState::Exited { code } => {
+                    let pid = task.pid;
+                    self.release_ring3_task(index);
+                    return Ring3WaitAny::Exited { pid, code };
+                }
+                Ring3TaskState::Faulted => {
+                    let pid = task.pid;
+                    self.release_ring3_task(index);
+                    return Ring3WaitAny::Exited {
+                        pid,
+                        code: errno::EFAULT as i32,
+                    };
+                }
+                _ => {}
+            }
+        }
+        if has_children {
+            Ring3WaitAny::Running
+        } else {
+            Ring3WaitAny::NoChildren
+        }
+    }
+
+    fn wait_all_ring3(&mut self, requester_pid: u32) -> Ring3WaitAllReport {
+        let mut report = Ring3WaitAllReport {
+            reaped: 0,
+            running: 0,
+        };
+        for index in 0..MAX_RING3_TASKS {
+            let Some(task) = self.ring3_tasks[index] else {
+                continue;
+            };
+            if task.parent_pid != requester_pid {
+                continue;
+            }
+            match task.state {
+                Ring3TaskState::Exited { .. } | Ring3TaskState::Faulted => {
+                    self.release_ring3_task(index);
+                    report.reaped = report.reaped.saturating_add(1);
+                }
+                _ => {
+                    report.running = report.running.saturating_add(1);
+                }
+            }
+        }
+        report
+    }
+
+    fn release_ring3_task(&mut self, index: usize) {
+        let Some(task) = self.ring3_tasks[index].take() else {
+            return;
+        };
+        if !task.image_ptr.is_null() {
+            // SAFETY: image_ptr was allocated with Box::into_raw at spawn and is released once.
+            unsafe {
+                drop(Box::from_raw(task.image_ptr));
+            }
+        }
+    }
+
+    fn run_ring3_policy_smoke(&mut self) -> Result<Ring3PolicySmokeReport, isize> {
+        const RING3_POLICY_SMOKE_CONTEXT: Ring3ProcessContext = Ring3ProcessContext::new(
+            9100,
+            "ring3-policy-smoke",
+            caps::CORE | caps::NET | caps::PROC | caps::TIME,
+        );
+
+        if !self.arm_ring3_context(RING3_POLICY_SMOKE_CONTEXT) {
+            return Err(errno::EAGAIN);
+        }
+
+        let getpid_rc = self.dispatch_ring3_syscall(SYS_GETPID, 0, 0, 0);
+        let time_before_drop_rc = self.dispatch_ring3_syscall(SYS_TIME_MS, 0, 0, 0);
+        let socket_rc = self.dispatch_ring3_syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        let sendto_bad = UdpSendReq::new([127, 0, 0, 1], 7777, 5555, 0, 4);
+        let sendto_bad_ptr_rc = self.dispatch_ring3_syscall(
+            SYS_SENDTO,
+            UDP_SOCKET_FD,
+            (&sendto_bad as *const UdpSendReq) as u64,
+            size_of::<UdpSendReq>() as u64,
+        );
+        let recvfrom_bad = UdpRecvReq::new(0, 32);
+        let recvfrom_bad_ptr_rc = self.dispatch_ring3_syscall(
+            SYS_RECVFROM,
+            UDP_SOCKET_FD,
+            (&recvfrom_bad as *const UdpRecvReq) as u64,
+            size_of::<UdpRecvReq>() as u64,
+        );
+        let cap_get_before_drop_rc = self.dispatch_ring3_syscall(SYS_CAP_GET, 0, 0, 0);
+        let cap_drop_rc = self.dispatch_ring3_syscall(SYS_CAP_DROP, caps::TIME as u64, 0, 0);
+        let cap_get_after_drop_rc = self.dispatch_ring3_syscall(SYS_CAP_GET, 0, 0, 0);
+        let time_after_drop_rc = self.dispatch_ring3_syscall(SYS_TIME_MS, 0, 0, 0);
+        let exit_rc = self.dispatch_ring3_syscall(SYS_EXIT, 0, 0, 0);
+        self.disarm_ring3_context();
+
+        Ok(Ring3PolicySmokeReport {
+            pid: RING3_POLICY_SMOKE_CONTEXT.pid,
+            initial_caps: RING3_POLICY_SMOKE_CONTEXT.syscall_caps,
+            getpid_rc,
+            time_before_drop_rc,
+            socket_rc,
+            sendto_bad_ptr_rc,
+            recvfrom_bad_ptr_rc,
+            cap_get_before_drop_rc,
+            cap_drop_rc,
+            cap_get_after_drop_rc,
+            time_after_drop_rc,
+            exit_rc,
+        })
     }
 
     fn syscall_write(&mut self, _task: &Task, ptr: u64, len: u64) -> isize {
@@ -937,13 +1767,35 @@ impl Scheduler {
     }
 
     fn syscall_cap_drop_ring3(&mut self, drop_mask: u64) -> isize {
-        match apply_cap_drop_mask(&mut self.ring3_context.syscall_caps, drop_mask) {
+        match apply_cap_drop_mask(&mut self.ring3_context.process.syscall_caps, drop_mask) {
             Ok(mask) => mask as isize,
             Err(error) => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 error
             }
         }
+    }
+
+    fn syscall_sleep_ring3(&mut self, delta: u64) -> isize {
+        let until_tick = time::ticks().saturating_add(delta.max(1));
+        let mut idle_spins = 0u64;
+        while time::ticks() < until_tick {
+            let polled = crate::arch::poll_timer_ticks();
+            if polled == 0 {
+                spin_loop();
+                idle_spins = idle_spins.saturating_add(1);
+                if idle_spins > 1_000_000 {
+                    break;
+                }
+                continue;
+            }
+
+            idle_spins = 0;
+            for _ in 0..polled {
+                let _ = time::on_timer_tick();
+            }
+        }
+        0
     }
 
     fn syscall_spawn(&mut self, task: &Task, app_id: u64) -> isize {
@@ -1118,6 +1970,151 @@ impl Scheduler {
                 // SAFETY: request pointer is valid and writable in shared address space.
                 unsafe {
                     (req_ptr as *mut UdpRecvReq).write(request);
+                }
+                meta.len as isize
+            }
+            Ok(None) => 0,
+            Err(err) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_net_error(err)
+            }
+        }
+    }
+
+    fn syscall_sendto_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        req_ptr: u64,
+        req_len: u64,
+    ) -> isize {
+        if process.user_range_count == 0 {
+            return self.syscall_sendto(fd, req_ptr, req_len);
+        }
+        if fd != UDP_SOCKET_FD {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        }
+        if req_ptr == 0 || req_len != size_of::<UdpSendReq>() as u64 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        let request = match ring3_groundwork::copy_from_user::<UdpSendReq>(
+            &process.user_ranges,
+            process.user_range_count,
+            req_ptr,
+        ) {
+            Ok(value) => value,
+            Err(error) => return self.map_ring3_copy_error(error),
+        };
+
+        let Some(payload_len) = usize::try_from(request.payload_len).ok() else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if request.payload_ptr == 0 || payload_len == 0 || payload_len > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        let mut payload = Vec::<u8>::new();
+        if payload.try_reserve_exact(payload_len).is_err() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        payload.resize(payload_len, 0);
+        if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            request.payload_ptr,
+            payload.as_mut_slice(),
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        match net::udp_send(
+            request.dst_ip,
+            request.dst_port,
+            request.src_port,
+            payload.as_slice(),
+        ) {
+            Ok(sent) => sent as isize,
+            Err(err) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_net_error(err)
+            }
+        }
+    }
+
+    fn syscall_recvfrom_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        req_ptr: u64,
+        req_len: u64,
+    ) -> isize {
+        if process.user_range_count == 0 {
+            return self.syscall_recvfrom(fd, req_ptr, req_len);
+        }
+        if fd != UDP_SOCKET_FD {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        }
+        if req_ptr == 0 || req_len != size_of::<UdpRecvReq>() as u64 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        let mut request = match ring3_groundwork::copy_from_user::<UdpRecvReq>(
+            &process.user_ranges,
+            process.user_range_count,
+            req_ptr,
+        ) {
+            Ok(value) => value,
+            Err(error) => return self.map_ring3_copy_error(error),
+        };
+        let Some(payload_cap) = usize::try_from(request.payload_cap).ok() else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if request.payload_ptr == 0 || payload_cap == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        if payload_cap > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EMSGSIZE;
+        }
+
+        let mut output = Vec::<u8>::new();
+        if output.try_reserve_exact(payload_cap).is_err() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        output.resize(payload_cap, 0);
+
+        match net::udp_recv(output.as_mut_slice()) {
+            Ok(Some(meta)) => {
+                let used = meta.len.min(output.len());
+                if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+                    &process.user_ranges,
+                    process.user_range_count,
+                    request.payload_ptr,
+                    &output[..used],
+                ) {
+                    return self.map_ring3_copy_error(error);
+                }
+                request.src_ip = meta.src_ip;
+                request.src_port = meta.src_port;
+                request.dst_port = meta.dst_port;
+                if let Err(error) = ring3_groundwork::copy_to_user::<UdpRecvReq>(
+                    &process.user_ranges,
+                    process.user_range_count,
+                    req_ptr,
+                    &request,
+                ) {
+                    return self.map_ring3_copy_error(error);
                 }
                 meta.len as isize
             }
@@ -1347,6 +2344,14 @@ fn user_app_contract(app_id: u64) -> Option<UserAppContract> {
     }
 }
 
+fn user_app_elf_bytes(app_id: u64) -> &'static [u8] {
+    match app_id {
+        app::INIT => user_elf_embed::ARROST_USER_INIT_ELF_BYTES,
+        app::DOOM => user_elf_embed::ARROST_USER_DOOM_ELF_BYTES,
+        _ => &[],
+    }
+}
+
 fn user_app_contract_for_kind(kind: TaskKind) -> Option<UserAppContract> {
     match kind {
         TaskKind::InitWorker => Some(init_user_app_contract()),
@@ -1494,16 +2499,131 @@ pub fn wait_all_user() -> UserWaitAllReport {
     })
 }
 
-pub fn arm_ring3_context(pid: u32, name: &'static str, syscall_caps: u32) -> bool {
-    with_scheduler(|scheduler| scheduler.arm_ring3_context(pid, name, syscall_caps))
+pub fn arm_ring3_context(process: Ring3ProcessContext) -> bool {
+    with_scheduler(|scheduler| scheduler.arm_ring3_context(process))
 }
 
-pub fn disarm_ring3_context() {
-    with_scheduler(|scheduler| scheduler.disarm_ring3_context());
+pub fn dispatch_ring3_syscall_with_action(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> Ring3SyscallDispatch {
+    with_scheduler(|scheduler| {
+        scheduler.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2)
+    })
 }
 
-pub fn dispatch_ring3_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
-    with_scheduler(|scheduler| scheduler.dispatch_ring3_syscall(number, arg0, arg1, arg2))
+pub fn run_ring3_policy_smoke() -> Result<Ring3PolicySmokeReport, isize> {
+    with_scheduler(|scheduler| scheduler.run_ring3_policy_smoke())
+}
+
+pub fn run_ring3_groundwork_smoke() -> Result<Ring3GroundworkSmokeReport, isize> {
+    with_scheduler(|scheduler| scheduler.run_ring3_groundwork_smoke())
+}
+
+pub fn run_ring3_user_app(app_id: u64) -> isize {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return errno::ENODEV;
+        };
+        match scheduler.enqueue_ring3_user_app(shell_pid, app_id) {
+            Ok(pid) => pid as isize,
+            Err(error) => error,
+        }
+    })
+}
+
+pub fn run_ring3_once(now_ticks: u64) {
+    let Some(plan) = with_scheduler(|scheduler| scheduler.prepare_ring3_run_plan(now_ticks)) else {
+        return;
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some((user_code_selector, user_data_selector, syscall_vector)) =
+            crate::arch::x86_64::interrupts::ring3_gate_info()
+        else {
+            with_scheduler(|scheduler| scheduler.mark_active_ring3_launch_failed());
+            return;
+        };
+
+        if let Err(error) = crate::arch::x86_64::ring3::run_loaded_context(
+            crate::resume_main_loop,
+            plan.process,
+            user_code_selector,
+            user_data_selector,
+            syscall_vector,
+        ) {
+            serial::write_fmt(format_args!(
+                "ring3 scheduler: x86_64 launch failed: {error}\n"
+            ));
+            with_scheduler(|scheduler| scheduler.mark_active_ring3_launch_failed());
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Err(error) =
+            crate::arch::aarch64::syscall::run_loaded_context(crate::resume_main_loop, plan.process)
+        {
+            serial::write_fmt(format_args!(
+                "ring3 scheduler: aarch64 launch failed: {error}\n"
+            ));
+            with_scheduler(|scheduler| scheduler.mark_active_ring3_launch_failed());
+        }
+    }
+}
+
+pub fn on_ring3_kernel_resume() {
+    with_scheduler(|scheduler| scheduler.on_ring3_kernel_resume());
+}
+
+pub fn on_ring3_kernel_resume_with_trap(ip: u64, sp: u64, ret0: u64) {
+    with_scheduler(|scheduler| scheduler.on_ring3_trap_resume(ip, sp, ret0));
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn mark_active_ring3_fault() {
+    with_scheduler(|scheduler| scheduler.mark_active_ring3_fault());
+}
+
+pub fn ring3_elf_groundwork_enabled() -> bool {
+    ring3_groundwork::elf_groundwork_enabled()
+}
+
+pub fn log_ring3_process_table() {
+    with_scheduler(|scheduler| scheduler.log_ring3_tasks());
+}
+
+pub fn wait_ring3_pid(pid: u32) -> isize {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return errno::ENODEV;
+        };
+        scheduler.wait_ring3_pid(shell_pid, pid)
+    })
+}
+
+pub fn wait_any_ring3_user() -> Ring3WaitAny {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return Ring3WaitAny::NoChildren;
+        };
+        scheduler.wait_any_ring3(shell_pid)
+    })
+}
+
+pub fn wait_all_ring3_user() -> Ring3WaitAllReport {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return Ring3WaitAllReport {
+                reaped: 0,
+                running: 0,
+            };
+        };
+        scheduler.wait_all_ring3(shell_pid)
+    })
 }
 
 fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {

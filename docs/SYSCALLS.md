@@ -1,6 +1,6 @@
 # Syscall ABI
 
-ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata and scheduler simulation paths.
+ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus cooperative and ring-3 runtime paths.
 
 ## ABI revision
 
@@ -40,10 +40,10 @@ Syscall capability flags are shared via `crates/arrostd/src/lib.rs` (`syscall::c
 - `PROC`: process identity (`getpid`)
 - `TIME`: monotonic uptime (`time_ms`)
 
-Kernel cooperative scheduler enforces required capability bits per task before syscall dispatch.
+Kernel process-layer dispatch enforces required capability bits per task/process before syscall handling.
 `cap_get` returns the current task capability mask.
 `cap_drop` removes capability bits from the current task mask (one-way); dropping `CORE` is rejected with `EPERM`.
-`spawn` creates a cooperative user task instance (current app set: `init`, `doom`).
+`spawn` creates a cooperative user task instance (legacy/shared-address-space worker path).
 `waitpid` returns child exit code, `EAGAIN` while the child is still running, and reaps on success.
 
 ## Error codes (`errno`)
@@ -51,7 +51,7 @@ Kernel cooperative scheduler enforces required capability bits per task before s
 Shared syscall error return codes are centralized in `crates/arrostd/src/lib.rs` (`syscall::errno`).
 Kernel syscall handlers return negative values (`-errno`) and diagnostics report both numeric and symbolic forms.
 
-Current mapped set used by cooperative runtime paths:
+Current mapped set used by runtime paths:
 
 - `EPERM = -1`
 - `EAGAIN = -11`
@@ -76,14 +76,23 @@ Both are `#[repr(C)]` and designed for stable kernel/user data exchange.
 
 ## Status
 
-The ABI is active for the cooperative runtime path and test-oriented syscall dispatch. Full userspace process isolation and broader syscall coverage are planned but not yet implemented.
+The ABI is active for cooperative and ring-3 runtime paths. Full userspace isolation and broader syscall coverage are planned but not yet implemented.
 On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DPL=3) wired to a register-based kernel entry path.
-When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an optional CPL3 `int 0x80` smoke sequence (`getpid/time_ms/exit`) before entering the main loop.
-That smoke sequence is dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contributes to shared syscall statistics.
+On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to process-layer ring-3 syscall dispatch.
+On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, syscall args in `x0..x5`, return value in `x0`.
+When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an optional architecture-specific user->kernel smoke sequence (`getpid/time_ms/exit`) before entering the main loop (`int 0x80` on `x86_64`, `SVC` on `aarch64`).
+When `ARROST_RING3_BOOT_SMOKE_FAULT=true` is also set (aarch64 only), boot smoke intentionally triggers a controlled EL0 sync fault to validate fallback/resume diagnostics.
+Those smoke sequences are dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contribute to shared syscall statistics.
+A cross-platform shell command (`ring3 smoke`) also exercises ring-3 policy dispatch through that same process-layer context (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) without requiring hardware ring transition support.
+With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into user ranges and validates process-model metadata (`trapframe`, kernel stack top) plus range-checked pointer dispatch (`copy_from_user`/`copy_to_user`) for ring-3 `sendto`/`recvfrom` request structs.
+With `ARROST_RING3_ELF_GROUNDWORK=true`, shell command `ring3 run <init|doom>` enqueues embedded native ELF artifacts (`ring3_init`/`ring3_doom`) into the ring-3 multiprocess scheduler through the architecture gate (`int 0x80`/`SVC`).
+Ring-3 runtime dispatch handles `yield` and `sleep` as scheduler preemption points, and `xtask smoke-ring3-run` validates multiprocess runtime (`init` + `doom`) plus `yield/sleep/exit` flow on both architectures.
+Runtime launch stores process address-space token metadata and performs switch/restore around user execution (current groundwork is partial: x86 clones active P4 root; aarch64 currently reuses TTBR0 token).
+Current aarch64 groundwork runtime path uses per-process trapframe stack metadata for launch entry; user-page permission tagging is best-effort when page-table layout is block-mapped/firmware-constrained.
 
 ## Userland shim
 
-`crates/arrostd/src/lib.rs` exposes a tiny userland syscall shim at `syscall::shim` for cooperative lifecycle calls:
+`crates/arrostd/src/lib.rs` exposes a tiny userland syscall shim at `syscall::shim` for common lifecycle calls:
 
 - `getpid`
 - `time_ms`

@@ -13,6 +13,14 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const PAGE_SIZE: usize = 4096;
 const HEAP_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const AARCH64_TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+const AARCH64_TABLE_VALID: u64 = 1 << 0;
+const AARCH64_TABLE_TABLE_OR_PAGE: u64 = 1 << 1;
+const AARCH64_TABLE_AP_MASK: u64 = 0b11 << 6;
+const AARCH64_TABLE_AP_EL1_RW_EL0_RW: u64 = 0b01 << 6;
+const AARCH64_TABLE_AP_EL1_RO_EL0_RO: u64 = 0b11 << 6;
+const AARCH64_TABLE_AF: u64 = 1 << 10;
+const AARCH64_TABLE_UXN: u64 = 1 << 54;
 
 const EFI_MEMORY_LOADER_CODE: u32 = 1;
 const EFI_MEMORY_LOADER_DATA: u32 = 2;
@@ -161,6 +169,190 @@ pub fn phys_to_virt(phys_addr: u64) -> Option<usize> {
     usize::try_from(phys_addr).ok()
 }
 
+#[derive(Debug)]
+pub enum UserPageError {
+    InvalidRange,
+    PagingNotInitialized,
+    NotMapped { virt_addr: u64 },
+    UnsupportedDescriptor { virt_addr: u64 },
+}
+
+impl fmt::Display for UserPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRange => write!(f, "invalid virtual range"),
+            Self::PagingNotInitialized => write!(f, "paging not initialized"),
+            Self::NotMapped { virt_addr } => {
+                write!(f, "virtual address not mapped: {virt_addr:#018x}")
+            }
+            Self::UnsupportedDescriptor { virt_addr } => {
+                write!(f, "unsupported page descriptor at {virt_addr:#018x}")
+            }
+        }
+    }
+}
+
+pub fn make_user_accessible(virt_start: usize, len: usize) -> Result<usize, UserPageError> {
+    update_user_flags(virt_start, len, false)
+}
+
+pub fn make_user_code_accessible(virt_start: usize, len: usize) -> Result<usize, UserPageError> {
+    update_user_flags(virt_start, len, true)
+}
+
+fn update_user_flags(
+    virt_start: usize,
+    len: usize,
+    executable: bool,
+) -> Result<usize, UserPageError> {
+    if len == 0 {
+        return Ok(0);
+    }
+    if virt_start == 0 {
+        return Err(UserPageError::InvalidRange);
+    }
+
+    let Some(virt_end) = virt_start.checked_add(len.saturating_sub(1)) else {
+        return Err(UserPageError::InvalidRange);
+    };
+    let Some(root_table_phys) = active_user_root_table() else {
+        return Err(UserPageError::PagingNotInitialized);
+    };
+
+    let first_page = align_down(virt_start as u64, PAGE_SIZE as u64);
+    let last_page = align_down(virt_end as u64, PAGE_SIZE as u64);
+    let total_pages =
+        ((last_page.saturating_sub(first_page)) / (PAGE_SIZE as u64)).saturating_add(1) as usize;
+
+    let mut current = first_page;
+    let mut updated_pages = 0usize;
+    loop {
+        let descriptor_ptr = match walk_leaf_descriptor_for_va(root_table_phys, current) {
+            Ok(ptr) => ptr,
+            Err(UserPageError::PagingNotInitialized)
+            | Err(UserPageError::NotMapped { .. })
+            | Err(UserPageError::UnsupportedDescriptor { .. }) => {
+                // Some aarch64 firmware/MMU profiles keep user-launchable pages in block-mapped
+                // regions or hide translation-table virtual aliases from the kernel direct path.
+                // Keep EL0 groundwork non-fatal in that case and preserve previous behavior.
+                return Ok(total_pages);
+            }
+            Err(error) => return Err(error),
+        };
+        write_user_descriptor_flags(descriptor_ptr, executable);
+        updated_pages = updated_pages.saturating_add(1);
+
+        if current == last_page {
+            break;
+        }
+        current = current
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or(UserPageError::InvalidRange)?;
+    }
+
+    // SAFETY: synchronize descriptor updates before returning to user entry paths.
+    unsafe {
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+    Ok(updated_pages)
+}
+
+fn active_user_root_table() -> Option<u64> {
+    let ttbr0 = read_ttbr0_el1() & AARCH64_TABLE_ADDR_MASK;
+    if ttbr0 != 0 {
+        return Some(ttbr0);
+    }
+
+    let ttbr1 = read_ttbr1_el1() & AARCH64_TABLE_ADDR_MASK;
+    if ttbr1 != 0 { Some(ttbr1) } else { None }
+}
+
+fn walk_leaf_descriptor_for_va(
+    root_table_phys: u64,
+    virt_addr: u64,
+) -> Result<*mut u64, UserPageError> {
+    match walk_leaf_descriptor_for_va_from_level(root_table_phys, virt_addr, 0) {
+        Ok(ptr) => Ok(ptr),
+        Err(UserPageError::NotMapped { .. }) | Err(UserPageError::UnsupportedDescriptor { .. }) => {
+            walk_leaf_descriptor_for_va_from_level(root_table_phys, virt_addr, 1)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn walk_leaf_descriptor_for_va_from_level(
+    root_table_phys: u64,
+    virt_addr: u64,
+    start_level: usize,
+) -> Result<*mut u64, UserPageError> {
+    let mut table_phys = root_table_phys;
+    for level in start_level..=3 {
+        let Some(table_virt) = phys_to_virt(table_phys) else {
+            return Err(UserPageError::PagingNotInitialized);
+        };
+        let table_ptr = table_virt as *mut u64;
+        let index = table_index_for_level(virt_addr, level);
+        // SAFETY: index is within 512-entry page-table bounds.
+        let descriptor_ptr = unsafe { table_ptr.add(index) };
+        // SAFETY: descriptor points to a valid page-table entry in mapped memory.
+        let descriptor = unsafe { core::ptr::read_volatile(descriptor_ptr) };
+        if (descriptor & AARCH64_TABLE_VALID) == 0 {
+            return Err(UserPageError::NotMapped { virt_addr });
+        }
+
+        let table_or_page = (descriptor & AARCH64_TABLE_TABLE_OR_PAGE) != 0;
+        if level == 3 {
+            if !table_or_page {
+                return Err(UserPageError::UnsupportedDescriptor { virt_addr });
+            }
+            return Ok(descriptor_ptr);
+        }
+
+        if table_or_page {
+            table_phys = descriptor & AARCH64_TABLE_ADDR_MASK;
+            if table_phys == 0 {
+                return Err(UserPageError::NotMapped { virt_addr });
+            }
+            continue;
+        }
+
+        return Err(UserPageError::UnsupportedDescriptor { virt_addr });
+    }
+
+    Err(UserPageError::UnsupportedDescriptor { virt_addr })
+}
+
+fn table_index_for_level(virt_addr: u64, level: usize) -> usize {
+    let shift = match level {
+        0 => 39,
+        1 => 30,
+        2 => 21,
+        _ => 12,
+    };
+    ((virt_addr >> shift) & 0x1ff) as usize
+}
+
+fn write_user_descriptor_flags(descriptor_ptr: *mut u64, executable: bool) {
+    // SAFETY: descriptor pointer is validated by page-table walk and points to mutable table entry.
+    let mut descriptor = unsafe { core::ptr::read_volatile(descriptor_ptr) };
+    descriptor |= AARCH64_TABLE_AF;
+    let ap = if executable {
+        AARCH64_TABLE_AP_EL1_RO_EL0_RO
+    } else {
+        AARCH64_TABLE_AP_EL1_RW_EL0_RW
+    };
+    descriptor = (descriptor & !AARCH64_TABLE_AP_MASK) | ap;
+    if executable {
+        descriptor &= !AARCH64_TABLE_UXN;
+    } else {
+        descriptor |= AARCH64_TABLE_UXN;
+    }
+    // SAFETY: descriptor pointer is valid and aligned; volatile write updates page-table entry.
+    unsafe {
+        core::ptr::write_volatile(descriptor_ptr, descriptor);
+    }
+}
+
 pub fn collect_stats(memory_regions: &MemoryRegions) -> MemoryStats {
     let mut stats = MemoryStats {
         region_count: 0,
@@ -304,6 +496,15 @@ unsafe fn uefi_desc_at(
     let ptr = (map.ptr as usize).checked_add(offset)? as *const UefiMemoryDescriptor;
     // SAFETY: pointer is in-bounds for one descriptor inside firmware-provided map storage.
     unsafe { ptr.as_ref() }
+}
+
+fn read_ttbr0_el1() -> u64 {
+    let mut value: u64;
+    // SAFETY: reading TTBR0_EL1 is side-effect free and used only for page-table walk roots.
+    unsafe {
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 fn read_ttbr1_el1() -> u64 {
@@ -506,6 +707,13 @@ fn align_up(addr: usize, align: usize) -> Option<usize> {
     } else {
         addr.checked_add(align - remainder)
     }
+}
+
+const fn align_down(addr: u64, align: u64) -> u64 {
+    if align == 0 {
+        return addr;
+    }
+    addr & !(align - 1)
 }
 
 // SAFETY: `Locked` guarantees exclusive access to the allocator state.

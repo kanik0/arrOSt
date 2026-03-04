@@ -579,8 +579,23 @@ fn with_bridge_mut<R>(f: impl FnOnce(&mut BridgeState) -> R) -> R {
     unsafe { f(&mut *BRIDGE_STATE.0.get()) }
 }
 
+#[cfg(arrost_doomgeneric_bridge)]
 unsafe extern "C" {
     fn arr_doomgeneric_create();
     fn arr_doomgeneric_tick();
     fn arr_doomgeneric_frame_counter() -> u32;
+}
+
+#[cfg(not(arrost_doomgeneric_bridge))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arr_doomgeneric_create() {}
+
+#[cfg(not(arrost_doomgeneric_bridge))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arr_doomgeneric_tick() {}
+
+#[cfg(not(arrost_doomgeneric_bridge))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arr_doomgeneric_frame_counter() -> u32 {
+    0
 }

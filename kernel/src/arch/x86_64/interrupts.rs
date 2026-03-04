@@ -2,13 +2,16 @@
 use crate::arch::x86_64::{gdt, pic, pit, port, syscall};
 use crate::{input, keyboard, mouse, serial, time};
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 static IDT_READY: AtomicBool = AtomicBool::new(false);
+static USER_CODE_SELECTOR: AtomicU16 = AtomicU16::new(0);
+static USER_DATA_SELECTOR: AtomicU16 = AtomicU16::new(0);
+static SYSCALL_VECTOR_ID: AtomicU8 = AtomicU8::new(0);
 static mut IDT: MaybeUninit<InterruptDescriptorTable> = MaybeUninit::uninit();
 const SYSCALL_VECTOR: u8 = 0x80;
 const SYSCALL_GATE_DPL: u8 = 3;
@@ -95,6 +98,9 @@ pub fn init() -> InterruptInitReport {
     };
     let pit_divisor = pit::init(time::PIT_HZ);
     interrupts::enable();
+    USER_CODE_SELECTOR.store(gdt_report.user_code_selector, Ordering::Release);
+    USER_DATA_SELECTOR.store(gdt_report.user_data_selector, Ordering::Release);
+    SYSCALL_VECTOR_ID.store(SYSCALL_VECTOR, Ordering::Release);
 
     InterruptInitReport {
         code_selector: gdt_report.code_selector,
@@ -120,6 +126,16 @@ pub fn init() -> InterruptInitReport {
         mouse_ack_defaults: mouse_report.ack_defaults,
         mouse_ack_enable: mouse_report.ack_enable,
     }
+}
+
+pub fn ring3_gate_info() -> Option<(u16, u16, u8)> {
+    let user_cs = USER_CODE_SELECTOR.load(Ordering::Acquire);
+    let user_ds = USER_DATA_SELECTOR.load(Ordering::Acquire);
+    let vector = SYSCALL_VECTOR_ID.load(Ordering::Acquire);
+    if user_cs == 0 || user_ds == 0 || vector == 0 {
+        return None;
+    }
+    Some((user_cs, user_ds, vector))
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {

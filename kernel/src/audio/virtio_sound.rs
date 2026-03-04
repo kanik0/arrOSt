@@ -1787,16 +1787,18 @@ fn map_cap_region(location: &PciLocation, cap: CapRegion) -> Option<*mut u8> {
     if cap.length == 0 {
         return None;
     }
-    let mut bar_base = pci_bar_phys(location, cap.bar)?;
+    let bar_base = pci_bar_phys(location, cap.bar)?;
     #[cfg(target_arch = "aarch64")]
-    {
-        if bar_base == 0 {
+    let bar_base = {
+        let mut resolved = bar_base;
+        if resolved == 0 {
             if !assign_pci_bar_fallback(location, cap.bar) {
                 return None;
             }
-            bar_base = pci_bar_phys(location, cap.bar)?;
+            resolved = pci_bar_phys(location, cap.bar)?;
         }
-    }
+        resolved
+    };
     let phys = bar_base.checked_add(u64::from(cap.offset))?;
     let virt = mem::phys_to_virt(phys)?;
     Some(virt as *mut u8)

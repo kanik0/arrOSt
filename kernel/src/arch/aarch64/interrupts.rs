@@ -1,6 +1,7 @@
-// kernel/src/arch/aarch64/interrupts.rs: aarch64 GIC/timer IRQ initialization.
-use crate::arch::aarch64;
-use crate::time;
+// kernel/src/arch/aarch64/interrupts.rs: aarch64 EL1 vectors + GIC/timer + SVC groundwork.
+use crate::arch::aarch64::{self, syscall};
+use crate::{serial, time};
+use arrostd::syscall::errno;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, without_provenance_mut, write_volatile};
 
@@ -36,21 +37,25 @@ __arrost_aarch64_vectors:
         .space 124
     .endm
 
+    // Current EL with SP0
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_irq_common
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_sync_unhandled
 
+    // Current EL with SPx
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_irq_common
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_sync_unhandled
 
-    arrost_vector __arrost_sync_unhandled
+    // Lower EL using AArch64
+    arrost_vector __arrost_sync_lower_aarch64
     arrost_vector __arrost_irq_common
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_sync_unhandled
 
+    // Lower EL using AArch32
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_irq_common
     arrost_vector __arrost_sync_unhandled
@@ -58,6 +63,36 @@ __arrost_aarch64_vectors:
 
 __arrost_sync_unhandled:
     b __arrost_sync_unhandled
+
+__arrost_sync_lower_aarch64:
+    sub sp, sp, #160
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x30, [sp, #144]
+
+    mov x0, sp
+    bl __arrost_aarch64_sync_dispatch
+    str x0, [sp, #0]
+
+    ldp x18, x30, [sp, #144]
+    ldp x16, x17, [sp, #128]
+    ldp x14, x15, [sp, #112]
+    ldp x12, x13, [sp, #96]
+    ldp x10, x11, [sp, #80]
+    ldp x8, x9, [sp, #64]
+    ldp x6, x7, [sp, #48]
+    ldp x4, x5, [sp, #32]
+    ldp x2, x3, [sp, #16]
+    ldp x0, x1, [sp, #0]
+    add sp, sp, #160
+    eret
 
 __arrost_irq_common:
     sub sp, sp, #64
@@ -144,6 +179,46 @@ __arrost_irq_common:
 
 unsafe extern "C" {
     static __arrost_aarch64_vectors: u8;
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame) -> u64 {
+    let Some(frame) = (unsafe { frame_ptr.as_mut() }) else {
+        return errno::ENOSYS as u64;
+    };
+
+    let esr = read_esr_el1();
+    let elr = read_elr_el1();
+    let spsr = read_spsr_el1();
+    let sp_el0 = read_sp_el0();
+    let from_el0 = syscall::is_from_el0(spsr);
+
+    if syscall::is_svc64(esr) {
+        let svc_imm = (esr & 0xffff) as u16;
+        let call = syscall::SvcCall::from_sync_frame(frame);
+        if let Some(result) = syscall::dispatch_svc(call, svc_imm, elr, sp_el0, from_el0) {
+            return result as u64;
+        }
+        syscall::log_svc_fallback_once(call.number, svc_imm, elr, sp_el0, from_el0);
+        return errno::ENOSYS as u64;
+    }
+
+    if from_el0 && syscall::handle_lower_sync_fault_if_smoke(esr, elr, spsr, sp_el0) {
+        // This branch is unreachable because active smoke faults resume directly to kernel path.
+        return errno::ENOSYS as u64;
+    }
+
+    let ec = syscall::exception_class(esr);
+    serial::write_fmt(format_args!(
+        "Interrupts(a64): unhandled sync ec={:#04x} ({}) esr={:#018x} elr={:#018x} spsr={:#018x} sp_el0={:#018x}\n",
+        ec,
+        syscall::ec_name(ec),
+        esr,
+        elr,
+        spsr,
+        sp_el0
+    ));
+    crate::arch::halt_forever();
 }
 
 #[derive(Clone, Copy)]
@@ -283,6 +358,42 @@ unsafe fn timer_start_periodic(counts_per_tick: u64) {
         asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nostack, preserves_flags));
         asm!("isb", options(nomem, nostack, preserves_flags));
     }
+}
+
+fn read_esr_el1() -> u64 {
+    let mut value: u64;
+    // SAFETY: reading ESR_EL1 is side-effect free.
+    unsafe {
+        asm!("mrs {value}, esr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn read_elr_el1() -> u64 {
+    let mut value: u64;
+    // SAFETY: reading ELR_EL1 is side-effect free.
+    unsafe {
+        asm!("mrs {value}, elr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn read_spsr_el1() -> u64 {
+    let mut value: u64;
+    // SAFETY: reading SPSR_EL1 is side-effect free.
+    unsafe {
+        asm!("mrs {value}, spsr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn read_sp_el0() -> u64 {
+    let mut value: u64;
+    // SAFETY: reading SP_EL0 is side-effect free.
+    unsafe {
+        asm!("mrs {value}, sp_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 #[inline]

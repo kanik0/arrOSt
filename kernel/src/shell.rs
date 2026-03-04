@@ -156,7 +156,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, spawn, wait, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -523,7 +523,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | spawn <init|doom> | wait <pid|any|all> | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
             );
         }
         "version" => {
@@ -550,6 +550,82 @@ fn run_command(shell: &mut ShellState) {
             ));
         }
         "user apps" => proc::log_user_app_registry(),
+        "ring3" => log_ring3_status(),
+        "ring3 smoke" => run_ring3_smoke(),
+        "ring3 groundwork" => run_ring3_groundwork_smoke(),
+        "ring3 ps" => proc::log_ring3_process_table(),
+        "ring3 wait any" => match proc::wait_any_ring3_user() {
+            proc::Ring3WaitAny::Exited { pid, code } => {
+                serial::write_fmt(format_args!("ring3(wait): any pid={} exit={}\n", pid, code));
+            }
+            proc::Ring3WaitAny::Running => {
+                serial::write_line("ring3(wait): any running");
+            }
+            proc::Ring3WaitAny::NoChildren => {
+                serial::write_line("ring3(wait): any no-children");
+            }
+        },
+        "ring3 wait all" => {
+            let report = proc::wait_all_ring3_user();
+            serial::write_fmt(format_args!(
+                "ring3(wait): all reaped={} running={}\n",
+                report.reaped, report.running
+            ));
+        }
+        _ if input.starts_with("ring3 wait ") => {
+            let Some(pid_text) = input.strip_prefix("ring3 wait ") else {
+                serial::write_line("usage: ring3 wait <pid|any|all>");
+                return;
+            };
+            let Some(pid) = pid_text.trim().parse::<u32>().ok() else {
+                serial::write_line("usage: ring3 wait <pid|any|all>");
+                return;
+            };
+            if pid == 0 {
+                serial::write_line("usage: ring3 wait <pid|any|all>");
+                return;
+            }
+            let waited = proc::wait_ring3_pid(pid);
+            if waited == errno::EAGAIN {
+                serial::write_fmt(format_args!("ring3(wait): pid={} running\n", pid));
+            } else if waited >= 0 {
+                serial::write_fmt(format_args!("ring3(wait): pid={} exit={}\n", pid, waited));
+            } else {
+                serial::write_fmt(format_args!(
+                    "ring3(wait): failed pid={} rc={} ({})\n",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                ));
+            }
+        }
+        _ if input.starts_with("ring3 run ") => {
+            let target = input.trim_start_matches("ring3 run ").trim();
+            let app_id = match target {
+                "init" => Some(app::INIT),
+                "doom" => Some(app::DOOM),
+                _ => None,
+            };
+            let Some(app_id) = app_id else {
+                serial::write_line("usage: ring3 run <init|doom>");
+                return;
+            };
+            let run_rc = proc::run_ring3_user_app(app_id);
+            if run_rc > 0 {
+                serial::write_fmt(format_args!(
+                    "ring3(run): queued app={} pid={}\n",
+                    app::name(app_id),
+                    run_rc
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "ring3(run): failed app={} rc={} ({})\n",
+                    app::name(app_id),
+                    run_rc,
+                    errno::name(run_rc)
+                ));
+            }
+        }
         "spawn" => {
             serial::write_line("usage: spawn <init|doom>");
         }
@@ -760,6 +836,108 @@ fn log_doom_audio_status() {
         status.pcm_stream_id,
         status.pcm_last_ctrl_status
     ));
+}
+
+fn log_ring3_status() {
+    let groundwork_flag = if proc::ring3_elf_groundwork_enabled() {
+        "on"
+    } else {
+        "off"
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        serial::write_line(
+            "ring3: mode=preemptive policy_smoke=available hw_transition=x86_64-int80 scheduler=round-robin/syscall-timeslice",
+        );
+        serial::write_fmt(format_args!(
+            "ring3: groundwork_elf_flag={} (ARROST_RING3_ELF_GROUNDWORK)\n",
+            groundwork_flag
+        ));
+        serial::write_line(
+            "ring3: runtime commands=`ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`",
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        serial::write_line(
+            "ring3: mode=preemptive policy_smoke=available hw_transition=aarch64-svc scheduler=round-robin/syscall-timeslice",
+        );
+        serial::write_fmt(format_args!(
+            "ring3: groundwork_elf_flag={} (ARROST_RING3_ELF_GROUNDWORK)\n",
+            groundwork_flag
+        ));
+        serial::write_line(
+            "ring3: runtime commands=`ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`",
+        );
+    }
+}
+
+fn run_ring3_smoke() {
+    match proc::run_ring3_policy_smoke() {
+        Ok(report) => {
+            let pass = report.passed();
+            serial::write_fmt(format_args!(
+                "ring3(smoke): pid={} caps={:#x} getpid={} time_before={} socket={} sendto_bad_ptr={} recvfrom_bad_ptr={} cap_get_before={} cap_drop={} cap_get_after={} time_after_drop={} exit={} result={}\n",
+                report.pid,
+                report.initial_caps,
+                report.getpid_rc,
+                report.time_before_drop_rc,
+                report.socket_rc,
+                report.sendto_bad_ptr_rc,
+                report.recvfrom_bad_ptr_rc,
+                report.cap_get_before_drop_rc,
+                report.cap_drop_rc,
+                report.cap_get_after_drop_rc,
+                report.time_after_drop_rc,
+                report.exit_rc,
+                if pass { "ok" } else { "fail" },
+            ));
+        }
+        Err(error) => {
+            serial::write_fmt(format_args!(
+                "ring3(smoke): failed rc={} ({})\n",
+                error,
+                errno::name(error)
+            ));
+        }
+    }
+}
+
+fn run_ring3_groundwork_smoke() {
+    match proc::run_ring3_groundwork_smoke() {
+        Ok(report) => {
+            if !report.enabled {
+                serial::write_line(
+                    "ring3(groundwork): disabled (set ARROST_RING3_ELF_GROUNDWORK=true at build time)",
+                );
+                return;
+            }
+
+            serial::write_fmt(format_args!(
+                "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} exit={} result={}\n",
+                report.pid,
+                report.entry_ip,
+                report.entry_sp,
+                report.kernel_stack_top,
+                report.user_ranges,
+                report.mapped_pages,
+                report.getpid_rc,
+                report.time_ms_rc,
+                report.cap_get_rc,
+                report.sendto_user_req_rc,
+                report.recvfrom_user_req_rc,
+                report.exit_rc,
+                if report.passed() { "ok" } else { "fail" },
+            ));
+        }
+        Err(error) => {
+            serial::write_fmt(format_args!(
+                "ring3(groundwork): failed rc={} ({})\n",
+                error,
+                errno::name(error)
+            ));
+        }
+    }
 }
 
 fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {

@@ -1718,7 +1718,7 @@ impl GfxState {
         let src_h = self.doom_view.height as u64;
         let body_w_u64 = body_w as u64;
         let body_h_u64 = body_h as u64;
-        let (mut draw_w, mut draw_h) =
+        let (draw_w, draw_h) =
             if body_w_u64.saturating_mul(src_h) <= body_h_u64.saturating_mul(src_w) {
                 let width = body_w.max(1);
                 let height = ((body_w_u64.saturating_mul(src_h) / src_w) as usize).max(1);
@@ -1729,12 +1729,12 @@ impl GfxState {
                 (width, height)
             };
         #[cfg(target_arch = "aarch64")]
-        {
+        let (draw_w, draw_h) = (
             // Keep viewport at native Doom resolution on aarch64 to avoid
             // expensive upscaling in software emulation (TCG).
-            draw_w = draw_w.min(self.doom_view.width.max(1));
-            draw_h = draw_h.min(self.doom_view.height.max(1));
-        }
+            draw_w.min(self.doom_view.width.max(1)),
+            draw_h.min(self.doom_view.height.max(1)),
+        );
         if draw_w == 0 || draw_h == 0 {
             return None;
         }
@@ -1764,6 +1764,7 @@ impl GfxState {
         Some(clipped)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn blit_doom_native_rgb(
         &mut self,
         draw_x: usize,

@@ -21,6 +21,9 @@ static char *g_argv[] = {
     arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, 0,
 };
 
+/* Anchor symbol keeps archive TOC non-empty across host toolchain variants. */
+int arrost_doomgeneric_bridge_anchor = 1;
+
 void arr_doomgeneric_create(void) {
     if (g_created) {
         return;

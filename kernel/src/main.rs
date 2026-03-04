@@ -746,6 +746,11 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         irq_unhandled_last
     ));
 
+    serial::write_line(
+        "Interrupts: user_prep svc_gate=aarch64-lower-el-sync ec=0x15 (boot-only smoke optional via ARROST_RING3_BOOT_SMOKE; fault variant via ARROST_RING3_BOOT_SMOKE_FAULT)",
+    );
+    let _ = arch::aarch64::syscall::run_boot_smoke(run_loop);
+
     run_loop()
 }
 
@@ -1049,6 +1054,7 @@ fn run_loop() -> ! {
         doom::poll(ticks);
         audio::poll(ticks);
         proc::run_once(ticks);
+        proc::run_ring3_once(ticks);
         if time::heartbeat_enabled()
             && let Some(seconds) = time::poll_elapsed_second()
         {
@@ -1060,6 +1066,10 @@ fn run_loop() -> ! {
         }
         arch::idle();
     }
+}
+
+pub fn resume_main_loop() -> ! {
+    run_loop()
 }
 
 fn halt_loop() -> ! {

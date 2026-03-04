@@ -1,6 +1,9 @@
 # Userland Interface
 
-ArrOSt includes userland-facing crates and ABI contracts, while full ring-3 process execution is still under active development.
+ArrOSt userland currently exposes a shared ABI plus two runtime models:
+
+- cooperative kernel-simulated workers (`spawn`/`waitpid`)
+- ring-3 native ELF processes (`ring3 run`) scheduled by the ring-3 runtime
 
 ## Shared crate
 
@@ -11,43 +14,57 @@ ArrOSt includes userland-facing crates and ABI contracts, while full ring-3 proc
 - syscall number constants
 - syscall capability masks (`core/net/proc/time`)
 - capability-management syscall numbers (`cap_get`, `cap_drop`)
-- cooperative lifecycle syscall numbers (`spawn`, `waitpid`)
+- lifecycle syscall numbers (`spawn`, `waitpid`)
 - tiny userland syscall shim (`syscall::shim`) for `getpid/time_ms/cap_get/cap_drop/spawn/waitpid`
-- UDP request structures for kernel/user interoperability
+- UDP request structs used for kernel/user interoperability
 
 ## User crates
 
 ### `user/init`
 
-- Exposes metadata and stable strings for init app identity.
-- Contains syscall/capability contract declarations and unit tests.
-- Exposes required cooperative syscall caps (`core|proc|time`) and boot marker text.
-- Exposes cooperative worker sleep ticks contract (`90`).
-- Exposes cooperative worker exit code contract (`7`).
+- Exposes app metadata and stable init identity strings.
+- Declares syscall/capability contracts and unit tests.
+- Exposes contract values used by cooperative and ring-3 runtime paths:
+  - required syscall caps: `core|proc|time`
+  - sleep ticks: `90`
+  - exit code: `7`
 
 ### `user/doom`
 
 - Exposes Doom app metadata and backend capability contract.
-- Defines required backend caps: video, input, timer, audio.
-- Exposes required cooperative syscall caps (`core|proc`) and boot marker text.
-- Exposes cooperative worker sleep ticks contract (`110`).
-- Exposes cooperative worker exit code contract (`11`).
+- Declares backend caps for video/input/timer/audio integration.
+- Exposes contract values used by cooperative and ring-3 runtime paths:
+  - required syscall caps: `core|proc`
+  - sleep ticks: `110`
+  - exit code: `11`
 
-## Cooperative app registry
+## App registry
 
-- `spawn` app id `1` -> `init`
-- `spawn` app id `2` -> `doom`
+- app id `1` -> `init`
+- app id `2` -> `doom`
 
-## Current runtime model
+The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 
-- Kernel simulates cooperative task behavior in shared address space.
-- Runtime supports cooperative user task lifecycle via `spawn`/`waitpid` (no ring-3 isolation yet).
-- Spawned cooperative workers consume user crate contracts for capability mask assignment and serial boot markers.
-- Shell command `user apps` prints the cooperative app registry contracts (`id`, `name`, `caps`, `sleep`, `exit`).
-- User crates still provide metadata/contracts rather than isolated executable processes.
-- `x86_64` kernel setup now includes ring-3 transition groundwork (user selectors, TSS `RSP0`, `int 0x80` DPL3 entry), but no standalone user-mode task execution path is enabled yet.
-- Optional boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) executes CPL3 `int 0x80` syscalls (`getpid/time_ms/exit`) on `x86_64` for early user->kernel transition validation.
-- Those smoke syscalls are now mediated by process-layer context/capability checks (shared with cooperative syscall policy), but still do not represent full ring-3 task scheduling.
+## Runtime model
+
+- Cooperative path remains available for legacy worker flow (`spawn`, `waitpid`) in shared kernel address space.
+- With `ARROST_RING3_ELF_GROUNDWORK=true`, `ring3 run <init|doom>` enqueues embedded native ELFs (`ring3_init`, `ring3_doom`) into the ring-3 process table.
+- Ring-3 scheduler is round-robin with multiprocess state tracking (`ready`, `running`, `sleep`, `exited`, `faulted`) and explicit reap.
+- Ring-3 shell controls:
+  - `ring3 ps`
+  - `ring3 wait <pid|any|all>`
+- Ring-3 preemption points are enforced at syscall/trap boundaries (`yield`, `sleep`, `exit`, plus syscall-timeslice return to kernel).
+- `x86_64` uses CPL3 `int 0x80`; `aarch64` uses EL0 `SVC`; both route through shared process-layer capability policy and accounting.
+- `xtask smoke-ring3-run` validates cross-platform multiprocess runtime (`init` + `doom`) with `yield/sleep/exit` flow.
+- Optional boot smoke remains available:
+  - `ARROST_RING3_BOOT_SMOKE=true`
+  - `ARROST_RING3_BOOT_SMOKE_FAULT=true` (`aarch64` fault variant)
+
+## Current limits
+
+- Process isolation groundwork is partial (shared kernel mappings, architecture-specific address-space limitations).
+- Preemption is not yet hard timer-driven at arbitrary instruction boundaries.
+- Syscall surface remains intentionally small.
 
 ## Relevant files
 
@@ -55,3 +72,5 @@ ArrOSt includes userland-facing crates and ABI contracts, while full ring-3 proc
 - `user/init/src/lib.rs`
 - `user/doom/src/lib.rs`
 - `kernel/src/proc/mod.rs`
+- `kernel/src/arch/x86_64/ring3.rs`
+- `kernel/src/arch/aarch64/syscall.rs`

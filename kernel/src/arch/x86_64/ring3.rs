@@ -37,11 +37,16 @@ static RING3_SMOKE_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 static RING3_SMOKE_HITS: AtomicU64 = AtomicU64::new(0);
 static RING3_SMOKE_RETURN_RSP: AtomicU64 = AtomicU64::new(0);
 static RING3_SMOKE_CONTINUE_FN: AtomicU64 = AtomicU64::new(0);
+static RING3_SMOKE_TRAP_VALID: AtomicU8 = AtomicU8::new(0);
+static RING3_SMOKE_TRAP_RIP: AtomicU64 = AtomicU64::new(0);
+static RING3_SMOKE_TRAP_RSP: AtomicU64 = AtomicU64::new(0);
+static RING3_SMOKE_TRAP_RET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct SmokeFrameSpec {
     user_ip: u64,
     user_sp: u64,
+    user_rax: u64,
     user_cs: u16,
     user_ss: u16,
 }
@@ -56,43 +61,85 @@ pub fn run_boot_smoke(
         return false;
     }
 
-    if RING3_SMOKE_STATE
-        .compare_exchange(STATE_IDLE, STATE_ARMED, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        serial::write_line("ring3 smoke: already active/completed, skipping");
-        return false;
-    }
-
     let Some(frame) = prepare_smoke_frame(user_code_selector, user_data_selector) else {
         RING3_SMOKE_STATE.store(STATE_FAILED, Ordering::Release);
         return false;
     };
 
-    if !proc::arm_ring3_context(
+    let process = proc::Ring3ProcessContext::new(
         RING3_SMOKE_PID,
         RING3_SMOKE_TASK_NAME,
         RING3_SMOKE_CAPS_DEFAULT,
+    );
+    if let Err(error) = arm_and_enter(
+        continue_fn,
+        process,
+        frame,
+        syscall_vector,
+        "ring3 smoke",
+        true,
     ) {
-        serial::write_line("ring3 smoke: failed to arm proc ring3 context");
+        serial::write_fmt(format_args!("ring3 smoke: {error}\n"));
         RING3_SMOKE_STATE.store(STATE_FAILED, Ordering::Release);
         return false;
+    }
+    false
+}
+
+pub fn run_loaded_context(
+    continue_fn: fn() -> !,
+    process: proc::Ring3ProcessContext,
+    user_code_selector: u16,
+    user_data_selector: u16,
+    syscall_vector: u8,
+) -> Result<(), &'static str> {
+    let frame = SmokeFrameSpec {
+        user_ip: process.trap_frame.ip,
+        user_sp: process.trap_frame.sp,
+        user_rax: process.trap_frame.ret0,
+        user_cs: user_code_selector,
+        user_ss: user_data_selector,
+    };
+    arm_and_enter(
+        continue_fn,
+        process,
+        frame,
+        syscall_vector,
+        "ring3 run",
+        false,
+    )
+}
+
+fn arm_and_enter(
+    continue_fn: fn() -> !,
+    process: proc::Ring3ProcessContext,
+    frame: SmokeFrameSpec,
+    syscall_vector: u8,
+    label: &str,
+    arm_process_context: bool,
+) -> Result<(), &'static str> {
+    let previous = RING3_SMOKE_STATE.swap(STATE_ARMED, Ordering::AcqRel);
+    if previous == STATE_ARMED {
+        return Err("gate already active");
+    }
+    if arm_process_context && !proc::arm_ring3_context(process) {
+        RING3_SMOKE_STATE.store(previous, Ordering::Release);
+        return Err("failed to arm proc ring3 context");
     }
 
     RING3_SMOKE_HITS.store(0, Ordering::Release);
     let kernel_rsp = read_rsp();
     RING3_SMOKE_RETURN_RSP.store(kernel_rsp, Ordering::Release);
     RING3_SMOKE_CONTINUE_FN.store(continue_fn as usize as u64, Ordering::Release);
-
     serial::write_fmt(format_args!(
-        "ring3 smoke: entering user mode ip={:#018x} sp={:#018x} cs={:#x} ss={:#x} vec={:#04x} pid={} caps={:#x}\n",
+        "{label}: entering user mode ip={:#018x} sp={:#018x} cs={:#x} ss={:#x} vec={:#04x} pid={} caps={:#x}\n",
         frame.user_ip,
         frame.user_sp,
         frame.user_cs,
         frame.user_ss,
         syscall_vector,
-        RING3_SMOKE_PID,
-        RING3_SMOKE_CAPS_DEFAULT
+        process.pid,
+        process.syscall_caps
     ));
 
     let entry = InterruptStackFrameValue::new(
@@ -105,6 +152,11 @@ pub fn run_boot_smoke(
 
     // SAFETY: this optional smoke runs only after GDT/TSS+IDT setup; selectors/stack/IP are explicit.
     unsafe {
+        core::arch::asm!(
+            "mov rax, {user_rax}",
+            user_rax = in(reg) frame.user_rax,
+            options(nostack, preserves_flags)
+        );
         entry.iretq();
     }
 }
@@ -126,19 +178,37 @@ pub fn dispatch_int80(
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
 
-    let result = proc::dispatch_ring3_syscall(number, arg0, _arg1, _arg2);
-    if number == SYS_EXIT && result == 0 {
-        let exit_code = arg0 as i32;
-        serial::write_fmt(format_args!(
-            "ring3 smoke: int80 hit={} rip={:#018x} rsp={:#018x} nr={} ({}) exit_code={} -> kernel resume\n",
-            hit,
-            user_rip,
-            user_rsp,
-            number,
-            arrostd::syscall::name(number),
-            exit_code
-        ));
-        RING3_SMOKE_STATE.store(STATE_COMPLETED, Ordering::Release);
+    let dispatch = proc::dispatch_ring3_syscall_with_action(number, arg0, _arg1, _arg2);
+    let result = dispatch.result;
+    let return_to_kernel = dispatch.action == proc::Ring3SyscallAction::ReturnKernel;
+    if return_to_kernel {
+        if number == SYS_EXIT {
+            RING3_SMOKE_STATE.store(STATE_COMPLETED, Ordering::Release);
+            serial::write_fmt(format_args!(
+                "ring3 smoke: int80 hit={} rip={:#018x} rsp={:#018x} nr={} ({}) exit_code={} -> kernel resume\n",
+                hit,
+                user_rip,
+                user_rsp,
+                number,
+                arrostd::syscall::name(number),
+                arg0 as i32
+            ));
+        } else {
+            serial::write_fmt(format_args!(
+                "ring3 smoke: int80 hit={} rip={:#018x} rsp={:#018x} nr={} ({}) a0={:#x} rc={} -> kernel resume\n",
+                hit,
+                user_rip,
+                user_rsp,
+                number,
+                arrostd::syscall::name(number),
+                arg0,
+                result
+            ));
+        }
+        RING3_SMOKE_TRAP_RIP.store(user_rip, Ordering::Release);
+        RING3_SMOKE_TRAP_RSP.store(user_rsp, Ordering::Release);
+        RING3_SMOKE_TRAP_RET.store(result as u64, Ordering::Release);
+        RING3_SMOKE_TRAP_VALID.store(1, Ordering::Release);
         resume_boot_smoke_to_kernel();
     }
     let result_name = if result < 0 {
@@ -196,6 +266,7 @@ fn prepare_smoke_frame(user_code_selector: u16, user_data_selector: u16) -> Opti
     Some(SmokeFrameSpec {
         user_ip: code_region.as_ptr() as u64,
         user_sp: stack_top as u64,
+        user_rax: 0,
         user_cs: user_code_selector,
         user_ss: user_data_selector,
     })
@@ -215,7 +286,19 @@ fn read_rsp() -> u64 {
 }
 
 fn resume_boot_smoke_to_kernel() -> ! {
-    proc::disarm_ring3_context();
+    RING3_SMOKE_STATE.store(STATE_IDLE, Ordering::Release);
+    if RING3_SMOKE_TRAP_VALID
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        proc::on_ring3_kernel_resume_with_trap(
+            RING3_SMOKE_TRAP_RIP.load(Ordering::Acquire),
+            RING3_SMOKE_TRAP_RSP.load(Ordering::Acquire),
+            RING3_SMOKE_TRAP_RET.load(Ordering::Acquire),
+        );
+    } else {
+        proc::on_ring3_kernel_resume();
+    }
 
     let resume_rsp = RING3_SMOKE_RETURN_RSP.load(Ordering::Acquire);
     let continue_fn = RING3_SMOKE_CONTINUE_FN.load(Ordering::Acquire);

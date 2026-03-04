@@ -6,27 +6,7 @@ use core::cell::UnsafeCell;
 mod virtio_sound;
 
 #[cfg(target_arch = "x86_64")]
-const PIT_INPUT_HZ: u32 = 1_193_182;
-#[cfg(target_arch = "x86_64")]
-const PIT_COMMAND: u16 = 0x43;
-#[cfg(target_arch = "x86_64")]
-const PIT_CHANNEL_2: u16 = 0x42;
-#[cfg(target_arch = "x86_64")]
 const SPEAKER_PORT: u16 = 0x61;
-#[cfg(target_arch = "x86_64")]
-const PIT_MODE_CHANNEL2_SQUARE: u8 = 0xB6;
-const PCM_MAX_HOLD_TICKS: u64 = 24;
-const PCM_MIN_HOLD_TICKS: u64 = 3;
-const PCM_TONE_RETUNE_MIN_TICKS: u64 = 2;
-const PCM_MIN_ENERGY: u64 = 240;
-const PCM_MIN_EST_HZ: u16 = 90;
-const PCM_MAX_EST_HZ: u16 = 2400;
-const PCM_DYNAMIC_THRESHOLD_DIV: u64 = 10;
-const PCM_DYNAMIC_THRESHOLD_MIN: i16 = 40;
-const PCM_DYNAMIC_THRESHOLD_MAX: i16 = 1400;
-const PCM_ENERGY_FALLBACK_HZ_MIN: u16 = 160;
-const PCM_ENERGY_FALLBACK_HZ_MAX: u16 = 920;
-const PCM_ENERGY_FALLBACK_REF: u64 = 14_000;
 
 struct AudioCell(UnsafeCell<AudioState>);
 
@@ -88,8 +68,6 @@ struct AudioState {
     mode: AudioMode,
     active: bool,
     tone_hz: u16,
-    next_tone_update_tick: u64,
-    stop_tick: u64,
     pcm_mix_events: u64,
     pcm_samples: u64,
     pcm_tone_switches: u64,
@@ -105,8 +83,6 @@ impl AudioState {
             mode: AudioMode::Off,
             active: false,
             tone_hz: 0,
-            next_tone_update_tick: 0,
-            stop_tick: 0,
             pcm_mix_events: 0,
             pcm_samples: 0,
             pcm_tone_switches: 0,
@@ -259,20 +235,17 @@ pub fn set_mode(mode: AudioMode) -> AudioMode {
                 }
                 state.active = false;
                 state.tone_hz = 0;
-                state.next_tone_update_tick = 0;
             }
             AudioMode::PcSpeaker => {
                 virtio_sound::set_enabled(false);
                 state.active = false;
                 state.tone_hz = 0;
-                state.next_tone_update_tick = 0;
                 disable_speaker();
             }
             AudioMode::Virtio => {
                 disable_speaker();
                 state.active = false;
                 state.tone_hz = 0;
-                state.next_tone_update_tick = 0;
                 virtio_sound::set_enabled(true);
             }
         }
@@ -304,7 +277,7 @@ pub fn submit_pcm_i16(samples: &[i16], sample_rate: u32, channels: u8) -> usize 
     })
 }
 
-pub fn poll(now_ticks: u64) {
+pub fn poll(_now_ticks: u64) {
     with_state_mut(|state| {
         virtio_sound::poll();
         if state.mode == AudioMode::Virtio {
@@ -316,148 +289,8 @@ pub fn poll(now_ticks: u64) {
             disable_speaker();
             state.active = false;
             state.tone_hz = 0;
-            state.next_tone_update_tick = 0;
-            return;
-        }
-        if state.active && now_ticks >= state.stop_tick {
-            disable_speaker();
-            state.active = false;
-            state.tone_hz = 0;
         }
     });
-}
-
-fn estimate_tone_from_pcm(samples: &[i16], sample_rate: u32, channels: u8) -> Option<u16> {
-    let stride = channels.clamp(1, 2) as usize;
-    let frame_count = samples.len() / stride;
-    if frame_count < 8 || sample_rate < 2_000 {
-        return None;
-    }
-
-    let first_sample = if stride == 1 {
-        samples[0]
-    } else {
-        let left = i32::from(samples[0]);
-        let right = i32::from(samples[1]);
-        ((left + right) / 2) as i16
-    };
-    let mut abs_sum = 0u64;
-    let mut zero_crossings = 0u32;
-    let mut prev_sign = sample_sign(first_sample, PCM_DYNAMIC_THRESHOLD_MIN);
-
-    for frame in 0..frame_count {
-        let idx = frame * stride;
-        let value = if stride == 1 {
-            samples[idx]
-        } else {
-            let left = i32::from(samples[idx]);
-            let right = i32::from(samples[idx + 1]);
-            ((left + right) / 2) as i16
-        };
-        abs_sum = abs_sum.saturating_add(u64::from(value.unsigned_abs()));
-    }
-
-    let avg_energy = abs_sum / (frame_count as u64);
-    if avg_energy < PCM_MIN_ENERGY {
-        return None;
-    }
-    let dynamic_threshold = ((avg_energy / PCM_DYNAMIC_THRESHOLD_DIV) as i16)
-        .clamp(PCM_DYNAMIC_THRESHOLD_MIN, PCM_DYNAMIC_THRESHOLD_MAX);
-
-    for frame in 1..frame_count {
-        let idx = frame * stride;
-        let sample = if stride == 1 {
-            samples[idx]
-        } else {
-            let left = i32::from(samples[idx]);
-            let right = i32::from(samples[idx + 1]);
-            ((left + right) / 2) as i16
-        };
-        let sign = sample_sign(sample, dynamic_threshold);
-        if sign != 0 && prev_sign != 0 && sign != prev_sign {
-            zero_crossings = zero_crossings.saturating_add(1);
-        }
-        if sign != 0 {
-            prev_sign = sign;
-        }
-    }
-
-    if zero_crossings < 2 {
-        let span = u32::from(PCM_ENERGY_FALLBACK_HZ_MAX - PCM_ENERGY_FALLBACK_HZ_MIN);
-        let scaled = avg_energy.min(PCM_ENERGY_FALLBACK_REF) as u32;
-        let mapped = u32::from(PCM_ENERGY_FALLBACK_HZ_MIN)
-            .saturating_add(span.saturating_mul(scaled) / (PCM_ENERGY_FALLBACK_REF as u32));
-        return Some(mapped as u16);
-    }
-
-    let estimate_hz = ((u64::from(zero_crossings) * u64::from(sample_rate))
-        / (2 * (frame_count as u64)))
-        .clamp(u64::from(PCM_MIN_EST_HZ), u64::from(PCM_MAX_EST_HZ)) as u16;
-    Some(estimate_hz)
-}
-
-fn sample_sign(sample: i16, threshold: i16) -> i8 {
-    if sample >= threshold {
-        1
-    } else if sample <= -threshold {
-        -1
-    } else {
-        0
-    }
-}
-
-fn apply_tone(state: &mut AudioState, tone_hz: u16, hold_ticks: u64) {
-    let now_ticks = crate::time::ticks();
-    if tone_hz != state.tone_hz && now_ticks >= state.next_tone_update_tick {
-        program_channel2(tone_hz);
-        state.tone_hz = tone_hz;
-        state.next_tone_update_tick = now_ticks.saturating_add(PCM_TONE_RETUNE_MIN_TICKS);
-    }
-    enable_speaker();
-    state.active = true;
-
-    let hold_ticks = hold_ticks.clamp(1, PCM_MAX_HOLD_TICKS);
-    let target_tick = now_ticks.saturating_add(hold_ticks);
-    if target_tick > state.stop_tick {
-        state.stop_tick = target_tick;
-    }
-}
-
-fn program_channel2(hz: u16) {
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = hz;
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    let requested_hz = u32::from(hz.max(1));
-    #[cfg(target_arch = "x86_64")]
-    let divisor = (PIT_INPUT_HZ / requested_hz).clamp(1, u32::from(u16::MAX)) as u16;
-
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: programming PIT channel 2 uses fixed legacy x86 ports.
-    unsafe {
-        port::outb(PIT_COMMAND, PIT_MODE_CHANNEL2_SQUARE);
-        port::outb(PIT_CHANNEL_2, (divisor & 0x00ff) as u8);
-        port::outb(PIT_CHANNEL_2, ((divisor >> 8) & 0x00ff) as u8);
-    }
-}
-
-fn enable_speaker() {
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: port 0x61 controls the legacy PC speaker gate/data bits.
-    unsafe {
-        let value = port::inb(SPEAKER_PORT);
-        if (value & 0x03) != 0x03 {
-            port::outb(SPEAKER_PORT, value | 0x03);
-        }
-    }
 }
 
 fn disable_speaker() {

@@ -17,6 +17,8 @@ const KERNEL_PACKAGE: &str = "arrost-kernel";
 const AARCH64_UEFI_LOADER_PACKAGE: &str = "arrost-aarch64-uefi-loader";
 const USER_INIT_PACKAGE: &str = "arrost-user-init";
 const USER_DOOM_PACKAGE: &str = "arrost-user-doom";
+const USER_INIT_RING3_BIN: &str = "ring3_init";
+const USER_DOOM_RING3_BIN: &str = "ring3_doom";
 const BUILD_STD: &str = "-Zbuild-std=core,compiler_builtins,alloc";
 const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
 const M6_DISK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
@@ -31,9 +33,16 @@ const DOOM_GENERIC_INCLUDE_DIR: &str = "user/doom/third_party/doomgeneric/doomge
 const DOOM_GENERIC_PORT_SOURCE: &str = "user/doom/c/doomgeneric_arrost.c";
 const DOOM_WAD_HINT: &str = "user/doom/wad/doom1.wad";
 const DOOM_FORCE_FALLBACK_ENV: &str = "ARROST_DOOM_FORCE_FALLBACK";
+const RING3_BOOT_SMOKE_ENV: &str = "ARROST_RING3_BOOT_SMOKE";
+const RING3_BOOT_SMOKE_FAULT_ENV: &str = "ARROST_RING3_BOOT_SMOKE_FAULT";
+const RING3_ELF_GROUNDWORK_ENV: &str = "ARROST_RING3_ELF_GROUNDWORK";
+const USER_INIT_ELF_HINT_ENV: &str = "ARROST_USER_INIT_ELF_HINT";
+const USER_INIT_ELF_PRESENT_ENV: &str = "ARROST_USER_INIT_ELF_PRESENT";
+const USER_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_DOOM_ELF_HINT";
+const USER_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -76,6 +85,9 @@ enum TopLevelCommand {
     SmokeDoomFallback,
     SmokeProcCaps,
     SmokeProcSpawn,
+    SmokeRing3,
+    SmokeRing3Run,
+    SmokeRing3Fault,
 }
 
 struct UserArtifact {
@@ -120,6 +132,9 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeDoomFallback) => smoke_doom_fallback(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcCaps) => smoke_proc_caps(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcSpawn) => smoke_proc_spawn(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeRing3Fault) => smoke_ring3_fault(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -143,6 +158,9 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-doom-fallback") => Ok(TopLevelCommand::SmokeDoomFallback),
         Some("smoke-proc-caps") => Ok(TopLevelCommand::SmokeProcCaps),
         Some("smoke-proc-spawn") => Ok(TopLevelCommand::SmokeProcSpawn),
+        Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
+        Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
+        Some("smoke-ring3-fault") => Ok(TopLevelCommand::SmokeRing3Fault),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -241,11 +259,18 @@ fn parse_abi_check_arch_args(args: impl Iterator<Item = String>) -> Result<Vec<R
 }
 
 fn build() -> Result<()> {
-    build_impl(env_truthy(DOOM_FORCE_FALLBACK_ENV))
+    build_impl(env_truthy(DOOM_FORCE_FALLBACK_ENV), false, false, None)
 }
 
-fn build_impl(force_fallback: bool) -> Result<()> {
+fn build_impl(
+    force_fallback: bool,
+    ring3_boot_smoke: bool,
+    ring3_boot_smoke_fault: bool,
+    ring3_elf_groundwork_override: Option<bool>,
+) -> Result<()> {
     let build_count = next_build_count()?;
+    let ring3_elf_groundwork =
+        ring3_elf_groundwork_override.unwrap_or_else(|| env_truthy(RING3_ELF_GROUNDWORK_ENV));
     let version = format!("{VERSION_MAJOR}.{VERSION_MINOR}.{build_count}");
     let build_count_env = build_count.to_string();
     let major_env = VERSION_MAJOR.to_string();
@@ -261,6 +286,22 @@ fn build_impl(force_fallback: bool) -> Result<()> {
     )?;
     let user_doom = build_userland_package(
         USER_DOOM_PACKAGE,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_init_elf = build_userland_binary(
+        USER_INIT_PACKAGE,
+        USER_INIT_RING3_BIN,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_doom_elf = build_userland_binary(
+        USER_DOOM_PACKAGE,
+        USER_DOOM_RING3_BIN,
         KERNEL_TARGET,
         &build_count_env,
         &major_env,
@@ -307,6 +348,30 @@ fn build_impl(force_fallback: bool) -> Result<()> {
         )
         .env("ARROST_DOOM_ARTIFACT_SIZE", user_doom.size.to_string())
         .env(
+            USER_INIT_ELF_HINT_ENV,
+            user_init_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_INIT_ELF_PRESENT_ENV,
+            if user_init_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_DOOM_ELF_HINT_ENV,
+            user_doom_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_DOOM_ELF_PRESENT_ENV,
+            if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
             "ARROST_DOOM_C_BACKEND_OBJECT",
             doom_c_backend.object.display().to_string(),
         )
@@ -382,6 +447,26 @@ fn build_impl(force_fallback: bool) -> Result<()> {
                 "false"
             },
         )
+        .env(
+            RING3_BOOT_SMOKE_ENV,
+            if ring3_boot_smoke { "true" } else { "false" },
+        )
+        .env(
+            RING3_BOOT_SMOKE_FAULT_ENV,
+            if ring3_boot_smoke_fault {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            RING3_ELF_GROUNDWORK_ENV,
+            if ring3_elf_groundwork {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .args([
             "build",
             "-p",
@@ -415,7 +500,15 @@ fn build_impl(force_fallback: bool) -> Result<()> {
         .create_uefi_image(&disk_image)
         .context("failed to create UEFI disk image")?;
 
-    build_secondary_target(&build_count_env, &major_env, &minor_env, force_fallback)?;
+    build_secondary_target(
+        &build_count_env,
+        &major_env,
+        &minor_env,
+        force_fallback,
+        ring3_boot_smoke,
+        ring3_boot_smoke_fault,
+        ring3_elf_groundwork,
+    )?;
 
     Ok(())
 }
@@ -425,6 +518,9 @@ fn build_secondary_target(
     major_env: &str,
     minor_env: &str,
     force_fallback: bool,
+    ring3_boot_smoke: bool,
+    ring3_boot_smoke_fault: bool,
+    ring3_elf_groundwork: bool,
 ) -> Result<()> {
     println!("ArrOSt target build: {KERNEL_TARGET_AARCH64}");
 
@@ -437,6 +533,22 @@ fn build_secondary_target(
     )?;
     let user_doom = build_userland_package(
         USER_DOOM_PACKAGE,
+        KERNEL_TARGET_AARCH64,
+        build_count_env,
+        major_env,
+        minor_env,
+    )?;
+    let user_init_elf = build_userland_binary(
+        USER_INIT_PACKAGE,
+        USER_INIT_RING3_BIN,
+        KERNEL_TARGET_AARCH64,
+        build_count_env,
+        major_env,
+        minor_env,
+    )?;
+    let user_doom_elf = build_userland_binary(
+        USER_DOOM_PACKAGE,
+        USER_DOOM_RING3_BIN,
         KERNEL_TARGET_AARCH64,
         build_count_env,
         major_env,
@@ -482,6 +594,30 @@ fn build_secondary_target(
         )
         .env("ARROST_DOOM_ARTIFACT_SIZE", user_doom.size.to_string())
         .env(
+            USER_INIT_ELF_HINT_ENV,
+            user_init_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_INIT_ELF_PRESENT_ENV,
+            if user_init_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_DOOM_ELF_HINT_ENV,
+            user_doom_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_DOOM_ELF_PRESENT_ENV,
+            if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
             "ARROST_DOOM_C_BACKEND_OBJECT",
             doom_c_backend.object.display().to_string(),
         )
@@ -552,6 +688,26 @@ fn build_secondary_target(
         .env(
             "ARROST_DOOM_WAD_PRESENT",
             if doom_generic.wad_present {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            RING3_BOOT_SMOKE_ENV,
+            if ring3_boot_smoke { "true" } else { "false" },
+        )
+        .env(
+            RING3_BOOT_SMOKE_FAULT_ENV,
+            if ring3_boot_smoke_fault {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            RING3_ELF_GROUNDWORK_ENV,
+            if ring3_elf_groundwork {
                 "true"
             } else {
                 "false"
@@ -698,6 +854,40 @@ fn build_userland_package(
     } else {
         lib_hint
     };
+    let size = std::fs::metadata(&hint).map(|meta| meta.len()).unwrap_or(0);
+    Ok(UserArtifact { hint, size })
+}
+
+fn build_userland_binary(
+    package: &str,
+    binary: &str,
+    target: &str,
+    build_count_env: &str,
+    major_env: &str,
+    minor_env: &str,
+) -> Result<UserArtifact> {
+    let status = Command::new("cargo")
+        .env("ARROST_BUILD_COUNT", build_count_env)
+        .env("ARROST_VERSION_MAJOR", major_env)
+        .env("ARROST_VERSION_MINOR", minor_env)
+        .args([
+            "build",
+            "-p",
+            package,
+            "--bin",
+            binary,
+            "--target",
+            target,
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .with_context(|| format!("cargo build for {package} bin {binary} ({target}) failed"))?;
+    if !status.success() {
+        bail!("user binary build failed for {package} bin {binary} ({target})");
+    }
+
+    let hint = PathBuf::from(format!("target/{target}/debug/{binary}"));
     let size = std::fs::metadata(&hint).map(|meta| meta.len()).unwrap_or(0);
     Ok(UserArtifact { hint, size })
 }
@@ -1044,9 +1234,9 @@ fn smoke_doom_virtio(arch_override: Option<String>) -> Result<()> {
 
 fn smoke_doom_fallback(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
-    build_impl(true)?;
+    build_impl(true, false, false, None)?;
     let smoke_result = smoke_doom_impl(arch, false, true, false);
-    let restore_result = build_impl(false);
+    let restore_result = build_impl(false, false, false, None);
     match smoke_result {
         Ok(()) => {
             restore_result?;
@@ -1450,6 +1640,442 @@ fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
         println!("{smoke_name}: {line}");
     }
     if let Some(line) = last_matching_line(&log_snapshot, "user(wait): pid=") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+fn smoke_ring3(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_ring3_impl(arch)
+}
+
+fn smoke_ring3_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-ring3";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let expected_transition = match arch {
+        RuntimeArch::X86_64 => "hw_transition=x86_64-int80",
+        RuntimeArch::Aarch64 => "hw_transition=aarch64-svc",
+    };
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        send_serial_command(stdin, "ring3\n")?;
+        wait_for_log(
+            &log,
+            "ring3: mode=preemptive policy_smoke=available",
+            Duration::from_secs(8),
+            "ring3 status",
+        )?;
+        wait_for_log(
+            &log,
+            expected_transition,
+            Duration::from_secs(8),
+            "ring3 transition status",
+        )?;
+
+        send_serial_command(stdin, "ring3 smoke\n")?;
+        wait_for_log(
+            &log,
+            "ring3(smoke):",
+            Duration::from_secs(8),
+            "ring3 smoke output",
+        )?;
+        wait_for_log(
+            &log,
+            "socket=1",
+            Duration::from_secs(8),
+            "ring3 socket ABI args smoke",
+        )?;
+        wait_for_log(
+            &log,
+            "sendto_bad_ptr=-22",
+            Duration::from_secs(8),
+            "ring3 sendto pointer validation",
+        )?;
+        wait_for_log(
+            &log,
+            "recvfrom_bad_ptr=-22",
+            Duration::from_secs(8),
+            "ring3 recvfrom pointer validation",
+        )?;
+        wait_for_log(
+            &log,
+            "time_after_drop=-1",
+            Duration::from_secs(8),
+            "ring3 time capability denial",
+        )?;
+        wait_for_log(
+            &log,
+            "result=ok",
+            Duration::from_secs(8),
+            "ring3 smoke pass result",
+        )?;
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "ring3: mode=preemptive") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "ring3(smoke):") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+fn smoke_ring3_run(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
+    let restore_ring3_elf_groundwork = env_truthy(RING3_ELF_GROUNDWORK_ENV);
+
+    build_impl(restore_force_fallback, false, false, Some(true))?;
+    let smoke_result = smoke_ring3_run_impl(arch);
+    let restore_result = build_impl(
+        restore_force_fallback,
+        false,
+        false,
+        Some(restore_ring3_elf_groundwork),
+    );
+    match smoke_result {
+        Ok(()) => {
+            restore_result?;
+            Ok(())
+        }
+        Err(smoke_err) => {
+            if let Err(restore_err) = restore_result {
+                return Err(smoke_err.context(format!(
+                    "ring3 run smoke failed and restoring prior ELF groundwork state failed: {restore_err:#}"
+                )));
+            }
+            Err(smoke_err)
+        }
+    }
+}
+
+fn smoke_ring3_run_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-ring3-run";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let launch_pattern = match arch {
+        RuntimeArch::X86_64 => "ring3 run: entering user mode",
+        RuntimeArch::Aarch64 => "ring3 run(a64): entering user mode",
+    };
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        send_serial_command(stdin, "ring3 run init\n")?;
+        wait_for_log(
+            &log,
+            "ring3(run): queued app=init pid=",
+            Duration::from_secs(8),
+            "ring3 init queue acknowledgement",
+        )?;
+        send_serial_command(stdin, "ring3 run doom\n")?;
+        wait_for_log(
+            &log,
+            "ring3(run): queued app=doom pid=",
+            Duration::from_secs(8),
+            "ring3 doom queue acknowledgement",
+        )?;
+        wait_for_log(
+            &log,
+            launch_pattern,
+            Duration::from_secs(12),
+            "ring3 run launch entry",
+        )?;
+        wait_for_log(
+            &log,
+            "nr=4 (yield)",
+            Duration::from_secs(12),
+            "ring3 init yield syscall",
+        )?;
+        wait_for_log(
+            &log,
+            "nr=5 (sleep)",
+            Duration::from_secs(12),
+            "ring3 init sleep syscall",
+        )?;
+        wait_for_log(
+            &log,
+            "nr=3 (exit) exit_code=7 -> kernel resume",
+            Duration::from_secs(20),
+            "ring3 init exit resume",
+        )?;
+        wait_for_log(
+            &log,
+            "nr=3 (exit) exit_code=11 -> kernel resume",
+            Duration::from_secs(30),
+            "ring3 doom exit resume",
+        )?;
+
+        let snapshot = snapshot_log(&log);
+        if snapshot.contains("ring3(run): failed app=init") {
+            bail!("ring3 run init reported failure in shell output");
+        }
+        if snapshot.contains("ring3(run): failed app=doom") {
+            bail!("ring3 run doom reported failure in shell output");
+        }
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, launch_pattern) {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "nr=5 (sleep)") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "nr=3 (exit) exit_code=7") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "nr=3 (exit) exit_code=11") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+fn smoke_ring3_fault(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    if arch != RuntimeArch::Aarch64 {
+        bail!("smoke-ring3-fault supports only --arch aarch64");
+    }
+
+    build_impl(false, true, true, None)?;
+    let smoke_result = smoke_ring3_fault_impl(arch);
+    let restore_result = build_impl(false, false, false, None);
+    match smoke_result {
+        Ok(()) => {
+            restore_result?;
+            Ok(())
+        }
+        Err(smoke_err) => {
+            if let Err(restore_err) = restore_result {
+                return Err(smoke_err.context(format!(
+                    "ring3 fault smoke failed and restoring normal build failed: {restore_err:#}"
+                )));
+            }
+            Err(smoke_err)
+        }
+    }
+}
+
+fn smoke_ring3_fault_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-ring3-fault";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none")
+        .env("QEMU_FB", "auto")
+        .env("QEMU_VIRTIO_BUS", "mmio")
+        .env("QEMU_INPUT", "virtio")
+        .env(
+            "QEMU_AUDIO_WAV_PATH",
+            format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+        );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(
+            &log,
+            "ring3 smoke(a64): entering user mode",
+            Duration::from_secs(30),
+            "ring3 fault smoke boot entry",
+        )?;
+        wait_for_log(
+            &log,
+            "mode=fault",
+            Duration::from_secs(8),
+            "ring3 fault mode marker",
+        )?;
+        wait_for_log(
+            &log,
+            "ring3 smoke(a64): lower-el sync fault",
+            Duration::from_secs(20),
+            "ring3 lower-el fault log",
+        )?;
+        wait_for_log(
+            &log,
+            "expected_fault=true",
+            Duration::from_secs(8),
+            "ring3 expected fault flag",
+        )?;
+        wait_for_log(
+            &log,
+            "result=expected_fault_hit",
+            Duration::from_secs(8),
+            "ring3 expected fault result",
+        )?;
+        wait_for_log(
+            &log,
+            "arrost> ",
+            Duration::from_secs(30),
+            "shell prompt after fault fallback resume",
+        )?;
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "ring3 smoke(a64): lower-el sync fault") {
         println!("{smoke_name}: {line}");
     }
     Ok(())
@@ -2363,6 +2989,27 @@ mod tests {
         };
         let message = format!("{error:#}");
         assert!(message.contains("unsupported xtask command"));
+    }
+
+    #[test]
+    fn top_level_command_supports_ring3_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-ring3"))
+            .expect("smoke-ring3 should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeRing3);
+    }
+
+    #[test]
+    fn top_level_command_supports_ring3_run_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-ring3-run"))
+            .expect("smoke-ring3-run should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeRing3Run);
+    }
+
+    #[test]
+    fn top_level_command_supports_ring3_fault_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-ring3-fault"))
+            .expect("smoke-ring3-fault should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeRing3Fault);
     }
 
     #[test]

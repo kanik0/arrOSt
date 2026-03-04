@@ -30,6 +30,8 @@ The `aarch64` firmware path supports selecting framebuffer device via `QEMU_FB=a
 The `aarch64` runtime uses virtio-mmio transport; `QEMU_VIRTIO_BUS` is accepted for compatibility but coerced to `mmio`.
 Virtio-mmio mode selection remains available via `QEMU_VIRTIO_MMIO_MODE=modern|legacy|auto`.
 `x86_64` exposes an optional ring-3 boot smoke via `ARROST_RING3_BOOT_SMOKE=true`, which performs a CPL3 `int 0x80` syscall sequence (`getpid`, `time_ms`, `exit`) before entering the main runtime loop.
+`aarch64` exposes the same optional flag for EL0->EL1 `SVC` smoke (`getpid`, `time_ms`, `exit`) through lower-EL sync vectors, then resumes normal runtime flow.
+`aarch64` additionally supports a controlled fault variant (`ARROST_RING3_BOOT_SMOKE=true` + `ARROST_RING3_BOOT_SMOKE_FAULT=true`) that executes EL0 `BRK` after the first syscall and verifies fault-aware fallback/resume into kernel runtime.
 
 ## Smoke commands
 
@@ -42,6 +44,11 @@ Virtio-mmio mode selection remains available via `QEMU_VIRTIO_MMIO_MODE=modern|l
 - `cargo xtask smoke-doom-virtio --arch aarch64`
 - `cargo xtask smoke-doom-fallback --arch x86_64`
 - `cargo xtask smoke-doom-fallback --arch aarch64`
+- `cargo xtask smoke-ring3 --arch x86_64`
+- `cargo xtask smoke-ring3 --arch aarch64`
+- `cargo xtask smoke-ring3-run --arch x86_64`
+- `cargo xtask smoke-ring3-run --arch aarch64`
+- `cargo xtask smoke-ring3-fault --arch aarch64`
 
 ## Early boot sequence
 

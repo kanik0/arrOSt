@@ -345,15 +345,15 @@ mod virtio {
                 );
             }
 
-            if let Some(io_base) = port::virtio_input_mouse_io_base() {
-                if init_device_queue(
+            if let Some(io_base) = port::virtio_input_mouse_io_base()
+                && init_device_queue(
                     io_base,
                     &MOUSE_QUEUE_MEMORY,
                     &MOUSE_EVENT_MEMORY,
                     &mut self.mouse.device,
-                ) {
-                    mouse::set_virtual_backend_ready();
-                }
+                )
+            {
+                mouse::set_virtual_backend_ready();
             }
 
             self.report()
@@ -797,11 +797,6 @@ mod virtio {
     unsafe fn queue_used_ptr(queue_memory: &QueueMemoryCell) -> *mut VirtqUsed {
         // SAFETY: pointer arithmetic stays within the queue allocation.
         unsafe { queue_memory_base(queue_memory).add(USED_OFFSET) as *mut VirtqUsed }
-    }
-
-    fn virtio_read_u8(io_base: u16, offset: u16) -> u8 {
-        // SAFETY: `io_base + offset` is a validated virtio legacy I/O range.
-        unsafe { port::inb(io_base + offset) }
     }
 
     fn virtio_write_u8(io_base: u16, offset: u16, value: u8) {
