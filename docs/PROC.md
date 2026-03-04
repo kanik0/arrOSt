@@ -50,6 +50,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `aarch64` runtime launch now uses per-process trapframe stack metadata from the loaded process image; user-page permission tagging remains best-effort when firmware/MMU tables expose only block mappings.
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).
 - Capability masks are policy checks in shared address space, not hardware isolation.
+- GUI terminal emulator sessions (PID/TTY shown in desktop terminals) are compositor-local processes and are not represented in `proc`/`ring3 ps` tables yet.
 
 ## Relevant files
 

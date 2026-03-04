@@ -1,23 +1,33 @@
 // kernel/src/gfx/mod.rs: M8 framebuffer desktop with minimal compositor/event queue.
 use crate::doom;
+use crate::fs;
 use crate::mouse;
+use crate::net;
+use crate::proc;
 use crate::serial;
+use crate::shell;
+use crate::storage;
 use crate::time;
+use alloc::string::String;
 use alloc::vec::Vec;
+use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
+use arrostd::syscall::{app, errno};
 use bootloader_api::{
     BootInfo,
     info::{FrameBufferInfo, PixelFormat},
 };
 use core::cell::UnsafeCell;
 use core::cmp::min;
+use core::fmt::Write;
+use core::str;
 
-const WINDOW_COUNT: usize = 3;
-const SHELL_WINDOW_INDEX: usize = 0;
-const FILE_MANAGER_WINDOW_INDEX: usize = 1;
-const DOOM_WINDOW_INDEX: usize = 2;
+const WINDOW_COUNT: usize = 8;
+const FILE_MANAGER_WINDOW_INDEX: usize = 0;
+const DOOM_WINDOW_INDEX: usize = 1;
+const TERMINAL_WINDOW_START: usize = 2;
+const TERMINAL_WINDOW_COUNT: usize = WINDOW_COUNT - TERMINAL_WINDOW_START;
 const WINDOW_MAX_COLS: usize = 96;
 const WINDOW_MAX_ROWS: usize = 32;
-const INPUT_EVENT_CAPACITY: usize = 128;
 const DAMAGE_CAPACITY: usize = 24;
 const CHAR_W: usize = 6;
 const CHAR_H: usize = 8;
@@ -35,6 +45,33 @@ const MAX_BACKBUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DOOM_VIEW_MAX_W: usize = 320;
 const DOOM_VIEW_MAX_H: usize = 200;
 const DOOM_VIEW_MAX_PIXELS: usize = DOOM_VIEW_MAX_W * DOOM_VIEW_MAX_H;
+const TASKBAR_HEIGHT: usize = 28;
+const APPS_BUTTON_X: usize = 8;
+const APPS_BUTTON_Y: usize = 4;
+const APPS_BUTTON_W: usize = 44;
+const APPS_BUTTON_H: usize = 20;
+const APPS_MENU_W: usize = 148;
+const APPS_MENU_ITEM_H: usize = 22;
+const APPS_MENU_ITEMS: usize = 2;
+const CLOSE_BUTTON_W: usize = 14;
+const CLOSE_BUTTON_H: usize = 14;
+const TERMINAL_LINE_MAX: usize = 96;
+const TERMINAL_BASE_PID: u32 = 700;
+const TERMINAL_BASE_TTY: u32 = 1;
+const FILE_MANAGER_LIST_LINES: usize = 5;
+const FILE_MANAGER_PREVIEW_BYTES: usize = 180;
+const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
+    Some(value) => value,
+    None => "0",
+};
+const VERSION_MINOR: &str = match option_env!("ARROST_VERSION_MINOR") {
+    Some(value) => value,
+    None => "1",
+};
+const VERSION_BUILD: &str = match option_env!("ARROST_BUILD_COUNT") {
+    Some(value) => value,
+    None => "0",
+};
 
 #[derive(Clone, Copy)]
 pub struct GfxInitReport {
@@ -193,6 +230,54 @@ impl Rect {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMenuItem {
+    Doom,
+    Terminal,
+}
+
+impl AppMenuItem {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Doom => "doom",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+const APP_MENU_ORDER: [AppMenuItem; APPS_MENU_ITEMS] = [AppMenuItem::Doom, AppMenuItem::Terminal];
+const DEFAULT_WINDOW_ORDER: [usize; WINDOW_COUNT] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiAction {
+    None,
+    LaunchDoom,
+    StopDoom,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalProcess {
+    pid: u32,
+    tty: u32,
+    line: [u8; TERMINAL_LINE_MAX],
+    line_len: usize,
+}
+
+impl TerminalProcess {
+    const fn new(pid: u32, tty: u32) -> Self {
+        Self {
+            pid,
+            tty,
+            line: [0; TERMINAL_LINE_MAX],
+            line_len: 0,
+        }
+    }
+
+    fn clear_line(&mut self) {
+        self.line_len = 0;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct UiWindow {
     x: usize,
@@ -214,7 +299,7 @@ struct UiWindow {
 #[derive(Clone, Copy)]
 enum TextChange {
     None,
-    Cell { row: usize, col: usize },
+    Cell,
     FullText,
 }
 
@@ -319,10 +404,7 @@ impl UiWindow {
                     self.cursor_col -= 1;
                     self.lines[self.cursor_row][self.cursor_col] = 0;
                     self.line_len[self.cursor_row] = self.cursor_col;
-                    return TextChange::Cell {
-                        row: self.cursor_row,
-                        col: self.cursor_col,
-                    };
+                    return TextChange::Cell;
                 }
 
                 if self.cursor_row > 0 {
@@ -344,16 +426,15 @@ impl UiWindow {
                     scrolled = true;
                 }
 
-                let row = self.cursor_row;
-                let col = self.cursor_col;
-                self.lines[row][col] = byte;
+                self.lines[self.cursor_row][self.cursor_col] = byte;
                 self.cursor_col += 1;
-                self.line_len[row] = self.line_len[row].max(self.cursor_col);
+                self.line_len[self.cursor_row] =
+                    self.line_len[self.cursor_row].max(self.cursor_col);
 
                 if scrolled {
                     TextChange::FullText
                 } else {
-                    TextChange::Cell { row, col }
+                    TextChange::Cell
                 }
             }
             _ => TextChange::None,
@@ -384,42 +465,6 @@ impl UiWindow {
 
     const fn visible_rows(&self) -> usize {
         self.rows
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ByteQueue<const CAPACITY: usize> {
-    bytes: [u8; CAPACITY],
-    head: usize,
-    tail: usize,
-}
-
-impl<const CAPACITY: usize> ByteQueue<CAPACITY> {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; CAPACITY],
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) -> bool {
-        let next_head = (self.head + 1) % CAPACITY;
-        if next_head == self.tail {
-            return false;
-        }
-        self.bytes[self.head] = byte;
-        self.head = next_head;
-        true
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.tail == self.head {
-            return None;
-        }
-        let byte = self.bytes[self.tail];
-        self.tail = (self.tail + 1) % CAPACITY;
-        Some(byte)
     }
 }
 
@@ -590,8 +635,10 @@ struct GfxState {
     backbuffer: Option<Vec<u8>>,
     info: FrameBufferInfo,
     windows: [UiWindow; WINDOW_COUNT],
+    window_order: [usize; WINDOW_COUNT],
+    terminal_processes: [Option<TerminalProcess>; TERMINAL_WINDOW_COUNT],
     focused_window: usize,
-    input_queue: ByteQueue<INPUT_EVENT_CAPACITY>,
+    apps_menu_open: bool,
     events: u64,
     dropped: u64,
     stdout_events: u64,
@@ -621,6 +668,9 @@ struct GfxState {
     present_full: u64,
     doom_window_open: bool,
     doom_view: DoomViewLayer,
+    next_terminal_pid: u32,
+    next_terminal_tty: u32,
+    pending_ui_action: UiAction,
 }
 
 impl GfxState {
@@ -631,10 +681,12 @@ impl GfxState {
         info: FrameBufferInfo,
     ) -> Self {
         let backbuffer = None;
-        let primary_w = min(640, info.width.saturating_sub(80)).max(280);
-        let primary_h = min(290, info.height.saturating_sub(120)).max(180);
-        let secondary_w = min(420, info.width.saturating_sub(110)).max(220);
-        let secondary_h = min(210, info.height.saturating_sub(150)).max(140);
+        let manager_w = min(420, info.width.saturating_sub(110)).max(220);
+        let manager_h = min(210, info.height.saturating_sub(150)).max(140);
+        let terminal_w = min(660, info.width.saturating_sub(120)).max(320);
+        let terminal_h = min(340, info.height.saturating_sub(140)).max(180);
+        let terminal_x = info.width.saturating_sub(terminal_w) / 2;
+        let terminal_y = (info.height.saturating_sub(terminal_h) / 2).max(TASKBAR_HEIGHT + 8);
         #[cfg(target_arch = "aarch64")]
         let doom_w = min(360, info.width.saturating_sub(140)).max(280);
         #[cfg(not(target_arch = "aarch64"))]
@@ -644,18 +696,59 @@ impl GfxState {
         #[cfg(not(target_arch = "aarch64"))]
         let doom_h = min(420, info.height.saturating_sub(100)).max(260);
         let doom_x = info.width.saturating_sub(doom_w) / 2;
-        let doom_y = info.height.saturating_sub(doom_h) / 2;
+        let doom_y = (info.height.saturating_sub(doom_h) / 2).max(TASKBAR_HEIGHT + 8);
 
         let windows = [
-            UiWindow::new(32, 56, primary_w, primary_h, "ARR0ST SHELL MIRROR"),
             UiWindow::new(
-                info.width.saturating_sub(secondary_w).saturating_sub(36),
-                info.height.saturating_sub(secondary_h).saturating_sub(42),
-                secondary_w,
-                secondary_h,
+                info.width.saturating_sub(manager_w).saturating_sub(36),
+                info.height.saturating_sub(manager_h).saturating_sub(42),
+                manager_w,
+                manager_h,
                 "ARR0ST FILE MANAGER",
             ),
             UiWindow::new(doom_x, doom_y, doom_w, doom_h, "ARR0ST DOOM"),
+            UiWindow::new(
+                terminal_x,
+                terminal_y,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
+            UiWindow::new(
+                terminal_x + 18,
+                terminal_y + 16,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
+            UiWindow::new(
+                terminal_x + 36,
+                terminal_y + 32,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
+            UiWindow::new(
+                terminal_x + 54,
+                terminal_y + 48,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
+            UiWindow::new(
+                terminal_x + 72,
+                terminal_y + 64,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
+            UiWindow::new(
+                terminal_x + 90,
+                terminal_y + 80,
+                terminal_w,
+                terminal_h,
+                "ARR0ST TERMINAL",
+            ),
         ];
 
         Self {
@@ -665,8 +758,10 @@ impl GfxState {
             backbuffer,
             info,
             windows,
+            window_order: DEFAULT_WINDOW_ORDER,
+            terminal_processes: [None; TERMINAL_WINDOW_COUNT],
             focused_window: 0,
-            input_queue: ByteQueue::new(),
+            apps_menu_open: false,
             events: 0,
             dropped: 0,
             stdout_events: 0,
@@ -696,25 +791,18 @@ impl GfxState {
             present_full: 0,
             doom_window_open: false,
             doom_view: DoomViewLayer::new(),
+            next_terminal_pid: TERMINAL_BASE_PID,
+            next_terminal_tty: TERMINAL_BASE_TTY,
+            pending_ui_action: UiAction::None,
         }
     }
 
     fn seed_content(&mut self) {
-        self.windows[SHELL_WINDOW_INDEX].append_text("M9 desktop online.\n");
-        self.windows[SHELL_WINDOW_INDEX].append_text("Shell stdout is mirrored here.\n");
-        self.windows[SHELL_WINDOW_INDEX].append_text("Press TAB to switch focus.\n");
-        self.windows[SHELL_WINDOW_INDEX].append_text("Mouse left: focus + drag title bar.\n");
-        self.windows[SHELL_WINDOW_INDEX]
-            .append_text("Mouse right: drag window corner to resize.\n");
-        self.windows[SHELL_WINDOW_INDEX]
-            .append_text("Double click title bar to minimize/restore.\n");
-        self.windows[SHELL_WINDOW_INDEX]
-            .append_text("Commands: ui | ui redraw | ui next | ui minimize | fm | doom play/key\n");
-
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm list\n");
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm open <file>\n");
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm copy <src> <dst>\n");
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm delete <file>\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("\nUse taskbar Apps to launch.\n");
     }
 
     fn try_enable_backbuffer(&mut self) -> bool {
@@ -743,40 +831,14 @@ impl GfxState {
         true
     }
 
-    fn push_event(&mut self, byte: u8) {
-        if !self.input_queue.push(byte) {
-            self.dropped = self.dropped.saturating_add(1);
-        }
-    }
-
-    fn append_mirror_byte_damage(&mut self, byte: u8) -> Option<Rect> {
-        match self.windows[SHELL_WINDOW_INDEX].append_byte_with_change(byte) {
-            TextChange::None => None,
-            TextChange::Cell { row, col } => {
-                Some(self.window_text_cell_rect(SHELL_WINDOW_INDEX, row, col))
-            }
-            TextChange::FullText => Some(self.window_text_area_rect(SHELL_WINDOW_INDEX)),
-        }
+    fn on_input_byte(&mut self, byte: u8) -> bool {
+        self.events = self.events.saturating_add(1);
+        self.handle_key(byte)
     }
 
     fn process_events(&mut self) {
-        while let Some(byte) = self.input_queue.pop() {
-            self.events = self.events.saturating_add(1);
-            self.handle_key(byte);
-        }
-
-        let mut stdout_damage: Option<Rect> = None;
-        while let Some(byte) = serial::pop_mirror_byte() {
+        while serial::pop_mirror_byte().is_some() {
             self.stdout_events = self.stdout_events.saturating_add(1);
-            if let Some(rect) = self.append_mirror_byte_damage(byte) {
-                stdout_damage = Some(match stdout_damage {
-                    Some(existing) => existing.union(rect),
-                    None => rect,
-                });
-            }
-        }
-        if let Some(rect) = stdout_damage {
-            self.invalidate_rect(rect);
         }
 
         while let Some(event) = mouse::pop_event() {
@@ -789,19 +851,1029 @@ impl GfxState {
         }
     }
 
-    fn handle_key(&mut self, byte: u8) {
+    fn handle_key(&mut self, byte: u8) -> bool {
         if byte == b'\t' {
             self.focus_next_internal();
+            if self.damage_len > 0 {
+                self.flush_damage();
+            }
+            return true;
         }
+
+        let Some(index) = self.focused_terminal_window() else {
+            return false;
+        };
+        self.handle_terminal_input(index, byte);
+        if self.damage_len > 0 {
+            self.flush_damage();
+        }
+        true
     }
 
     fn window_visible(&self, index: usize) -> bool {
         if index >= WINDOW_COUNT {
             return false;
         }
+        if index == FILE_MANAGER_WINDOW_INDEX {
+            return true;
+        }
         if index == DOOM_WINDOW_INDEX {
             return self.doom_window_open;
         }
+        self.terminal_process_for_window(index).is_some()
+    }
+
+    fn window_closable(&self, index: usize) -> bool {
+        if index == DOOM_WINDOW_INDEX {
+            return self.doom_window_open;
+        }
+        self.terminal_process_for_window(index).is_some()
+    }
+
+    fn doom_capture_target(&self) -> bool {
+        self.doom_window_open && self.focused_window == DOOM_WINDOW_INDEX
+    }
+
+    fn apps_button_rect(&self) -> Rect {
+        Rect::new(APPS_BUTTON_X, APPS_BUTTON_Y, APPS_BUTTON_W, APPS_BUTTON_H)
+    }
+
+    fn apps_menu_rect(&self) -> Rect {
+        Rect::new(
+            APPS_BUTTON_X,
+            TASKBAR_HEIGHT,
+            APPS_MENU_W,
+            APPS_MENU_ITEM_H
+                .saturating_mul(APPS_MENU_ITEMS)
+                .saturating_add(2),
+        )
+    }
+
+    fn apps_menu_item_rect(&self, item_index: usize) -> Rect {
+        Rect::new(
+            APPS_BUTTON_X + 1,
+            TASKBAR_HEIGHT + 1 + item_index.saturating_mul(APPS_MENU_ITEM_H),
+            APPS_MENU_W.saturating_sub(2),
+            APPS_MENU_ITEM_H,
+        )
+    }
+
+    fn terminal_slot_for_window(index: usize) -> Option<usize> {
+        if index < TERMINAL_WINDOW_START {
+            return None;
+        }
+        let slot = index - TERMINAL_WINDOW_START;
+        if slot < TERMINAL_WINDOW_COUNT {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    fn terminal_window_for_slot(slot: usize) -> usize {
+        TERMINAL_WINDOW_START + slot
+    }
+
+    fn raise_window_to_front(&mut self, index: usize) -> bool {
+        if index >= WINDOW_COUNT {
+            return false;
+        }
+        let Some(position) = self.window_order.iter().position(|entry| *entry == index) else {
+            return false;
+        };
+        if position == WINDOW_COUNT - 1 {
+            return false;
+        }
+        for slot in position..(WINDOW_COUNT - 1) {
+            self.window_order[slot] = self.window_order[slot + 1];
+        }
+        self.window_order[WINDOW_COUNT - 1] = index;
+        true
+    }
+
+    fn terminal_process_for_window(&self, index: usize) -> Option<&TerminalProcess> {
+        let slot = Self::terminal_slot_for_window(index)?;
+        self.terminal_processes[slot].as_ref()
+    }
+
+    fn focused_terminal_window(&self) -> Option<usize> {
+        if self
+            .terminal_process_for_window(self.focused_window)
+            .is_some()
+        {
+            Some(self.focused_window)
+        } else {
+            None
+        }
+    }
+
+    fn point_in_rect(rect: Rect, x: usize, y: usize) -> bool {
+        x >= rect.x
+            && x < rect.x.saturating_add(rect.w)
+            && y >= rect.y
+            && y < rect.y.saturating_add(rect.h)
+    }
+
+    fn close_button_rect(&self, index: usize) -> Rect {
+        let window = self.windows[index];
+        Rect::new(
+            window
+                .x
+                .saturating_add(window.w)
+                .saturating_sub(CLOSE_BUTTON_W.saturating_add(6)),
+            window.y.saturating_add(3),
+            CLOSE_BUTTON_W,
+            CLOSE_BUTTON_H,
+        )
+    }
+
+    fn point_on_apps_button(&self, x: usize, y: usize) -> bool {
+        Self::point_in_rect(self.apps_button_rect(), x, y)
+    }
+
+    fn point_in_apps_menu(&self, x: usize, y: usize) -> bool {
+        self.apps_menu_open && Self::point_in_rect(self.apps_menu_rect(), x, y)
+    }
+
+    fn apps_menu_item_at(&self, x: usize, y: usize) -> Option<AppMenuItem> {
+        if !self.apps_menu_open {
+            return None;
+        }
+        APP_MENU_ORDER
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(index, item)| {
+                let rect = self.apps_menu_item_rect(index);
+                if Self::point_in_rect(rect, x, y) {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn set_apps_menu_open(&mut self, open: bool) {
+        if self.apps_menu_open == open {
+            return;
+        }
+        let menu_rect = self.apps_menu_rect();
+        self.apps_menu_open = open;
+        self.invalidate_rect(Rect::new(0, 0, self.info.width, TASKBAR_HEIGHT));
+        self.invalidate_rect(menu_rect);
+    }
+
+    fn queue_ui_action(&mut self, action: UiAction) {
+        if action == UiAction::None {
+            return;
+        }
+        self.pending_ui_action = action;
+    }
+
+    fn take_pending_ui_action(&mut self) -> UiAction {
+        let action = self.pending_ui_action;
+        self.pending_ui_action = UiAction::None;
+        action
+    }
+
+    fn push_terminal_text(&mut self, index: usize, text: &str) {
+        if index >= WINDOW_COUNT {
+            return;
+        }
+        self.windows[index].append_text(text);
+        self.invalidate_window(index);
+    }
+
+    fn push_terminal_prompt(&mut self, index: usize) {
+        self.push_terminal_text(index, "arrost$ ");
+    }
+
+    fn drain_serial_output_to_terminal(&mut self, index: usize) {
+        let Some(_) = self.terminal_process_for_window(index) else {
+            while serial::pop_mirror_byte().is_some() {
+                self.stdout_events = self.stdout_events.saturating_add(1);
+            }
+            return;
+        };
+
+        let mut changed = false;
+        while let Some(byte) = serial::pop_mirror_byte() {
+            self.stdout_events = self.stdout_events.saturating_add(1);
+            self.windows[index].append_byte(byte);
+            changed = true;
+        }
+        if changed {
+            self.invalidate_window(index);
+        }
+    }
+
+    fn launch_terminal(&mut self) -> bool {
+        let Some(slot) = self
+            .terminal_processes
+            .iter()
+            .position(|process| process.is_none())
+        else {
+            return false;
+        };
+
+        let window_index = Self::terminal_window_for_slot(slot);
+        let pid = self.next_terminal_pid;
+        let tty = self.next_terminal_tty;
+        self.next_terminal_pid = self.next_terminal_pid.saturating_add(1);
+        self.next_terminal_tty = self.next_terminal_tty.saturating_add(1);
+        self.terminal_processes[slot] = Some(TerminalProcess::new(pid, tty));
+
+        {
+            let window = &mut self.windows[window_index];
+            window.clear_text();
+            if window.minimized {
+                window.h = window.saved_h.max(MIN_WINDOW_HEIGHT);
+                window.w = window.saved_w.max(MIN_WINDOW_WIDTH);
+                window.minimized = false;
+                window.recalc_text_grid();
+            }
+        }
+        self.push_terminal_text(window_index, "ARR0ST terminal online\n");
+        self.push_terminal_text(
+            window_index,
+            "help | apps | pid | tty | clear | doom play | doom stop | exit\n",
+        );
+        self.push_terminal_text(
+            window_index,
+            "mouse: drag title | right-drag corner | click X to kill process\n\n",
+        );
+        self.push_terminal_prompt(window_index);
+        let _ = self.set_focus(window_index);
+        serial::write_fmt(format_args!(
+            "terminal(pid={} tty={}): started from UI\n",
+            pid, tty
+        ));
+        true
+    }
+
+    fn close_terminal_window(&mut self, index: usize, code: i32) {
+        let Some(slot) = Self::terminal_slot_for_window(index) else {
+            return;
+        };
+        let Some(process) = self.terminal_processes[slot] else {
+            return;
+        };
+
+        let previous = self.window_rect(index);
+        self.terminal_processes[slot] = None;
+        self.windows[index].clear_text();
+        if self.focused_window == index {
+            let previous_focus = self.focused_window;
+            self.focused_window = FILE_MANAGER_WINDOW_INDEX;
+            if self.doom_window_open {
+                self.focused_window = DOOM_WINDOW_INDEX;
+            }
+            self.invalidate_window_chrome(previous_focus);
+            self.invalidate_window_chrome(self.focused_window);
+        }
+        if self.drag.active && self.drag.window_index == index {
+            self.drag = DragState::inactive();
+        }
+        if self.resize.active && self.resize.window_index == index {
+            self.resize = ResizeState::inactive();
+        }
+        self.invalidate_rect(previous);
+        serial::write_fmt(format_args!(
+            "terminal(pid={}): exited code={}\n",
+            process.pid, code
+        ));
+    }
+
+    fn close_window_process(&mut self, index: usize) {
+        if index == DOOM_WINDOW_INDEX {
+            self.close_doom_window();
+            self.queue_ui_action(UiAction::StopDoom);
+            return;
+        }
+        if self.terminal_process_for_window(index).is_some() {
+            self.close_terminal_window(index, -1);
+        }
+    }
+
+    fn handle_terminal_input(&mut self, index: usize, byte: u8) {
+        let Some(slot) = Self::terminal_slot_for_window(index) else {
+            return;
+        };
+        if self.terminal_processes[slot].is_none() {
+            return;
+        }
+
+        match byte {
+            b'\n' | b'\r' => {
+                self.push_terminal_text(index, "\n");
+
+                let mut command_buf = [0u8; TERMINAL_LINE_MAX];
+                let mut command_len = 0usize;
+                if let Some(process) = self.terminal_processes[slot].as_mut() {
+                    command_len = process.line_len.min(TERMINAL_LINE_MAX);
+                    command_buf[..command_len].copy_from_slice(&process.line[..command_len]);
+                    process.clear_line();
+                }
+
+                let command = match str::from_utf8(&command_buf[..command_len]) {
+                    Ok(text) => text.trim(),
+                    Err(_) => {
+                        self.push_terminal_text(index, "terminal: invalid utf-8 input\n");
+                        self.push_terminal_prompt(index);
+                        return;
+                    }
+                };
+
+                let keep_open = self.run_terminal_command(index, command);
+                if keep_open && self.terminal_process_for_window(index).is_some() {
+                    self.push_terminal_prompt(index);
+                }
+            }
+            0x08 | 0x7f => {
+                let mut changed = false;
+                if let Some(process) = self.terminal_processes[slot].as_mut()
+                    && process.line_len > 0
+                {
+                    process.line_len -= 1;
+                    changed = true;
+                }
+                if changed {
+                    self.windows[index].append_byte(0x08);
+                    self.invalidate_window(index);
+                }
+            }
+            0x20..=0x7e => {
+                let mut accepted = false;
+                if let Some(process) = self.terminal_processes[slot].as_mut()
+                    && process.line_len < TERMINAL_LINE_MAX.saturating_sub(1)
+                {
+                    process.line[process.line_len] = byte;
+                    process.line_len += 1;
+                    accepted = true;
+                }
+                if accepted {
+                    self.windows[index].append_byte(byte);
+                    self.invalidate_window(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_terminal_command(&mut self, index: usize, command: &str) -> bool {
+        let command = command.trim();
+        if command.is_empty() {
+            return true;
+        }
+
+        if command == "help" {
+            self.push_terminal_text(
+                index,
+                "help: help version ticks uptime pid tty clear ls cat echo > fm doom ui user ring3 spawn wait ps syscalls net ping udp curl disk sync reload watch on|off exit\n",
+            );
+            return true;
+        }
+        if command == "apps" {
+            self.push_terminal_text(index, "apps: doom, terminal\n");
+            return true;
+        }
+        if command == "clear" {
+            self.windows[index].clear_text();
+            self.invalidate_window(index);
+            return true;
+        }
+        if command == "pid" {
+            if let Some(process) = self.terminal_process_for_window(index).copied() {
+                let mut digits = [0u8; 16];
+                let len = u32_to_ascii(process.pid, &mut digits);
+                self.push_terminal_text(index, "pid=");
+                if let Ok(pid_text) = str::from_utf8(&digits[..len]) {
+                    self.push_terminal_text(index, pid_text);
+                }
+                self.push_terminal_text(index, "\n");
+            }
+            return true;
+        }
+        if command == "tty" {
+            if let Some(process) = self.terminal_process_for_window(index).copied() {
+                let mut digits = [0u8; 16];
+                let len = u32_to_ascii(process.tty, &mut digits);
+                self.push_terminal_text(index, "tty=/dev/tty");
+                if let Ok(tty_text) = str::from_utf8(&digits[..len]) {
+                    self.push_terminal_text(index, tty_text);
+                }
+                self.push_terminal_text(index, "\n");
+            }
+            return true;
+        }
+
+        if command == "version" {
+            serial::write_fmt(format_args!(
+                "version: {}.{}.{}\n",
+                VERSION_MAJOR, VERSION_MINOR, VERSION_BUILD
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ticks" {
+            serial::write_fmt(format_args!("ticks: {}\n", time::ticks()));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "uptime" {
+            let millis = time::uptime_millis();
+            serial::write_fmt(format_args!(
+                "uptime: {} ms ({} s)\n",
+                millis,
+                millis / 1000
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "user" {
+            serial::write_fmt(format_args!(
+                "userland: app={} abi=v{} status=cooperative runtime (ring3 pending); use `user apps`\n",
+                USERLAND_INIT_APP, USERLAND_ABI_REVISION
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "user apps" {
+            proc::log_user_app_registry();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+
+        if command == "ring3" {
+            #[cfg(target_arch = "x86_64")]
+            {
+                serial::write_line(
+                    "ring3: mode=preemptive policy_smoke=available hw_transition=x86_64-int80 scheduler=round-robin/syscall-timeslice",
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                serial::write_line(
+                    "ring3: mode=preemptive policy_smoke=available hw_transition=aarch64-svc scheduler=round-robin/syscall-timeslice",
+                );
+            }
+            serial::write_fmt(format_args!(
+                "ring3: groundwork_elf_flag={} (ARROST_RING3_ELF_GROUNDWORK)\n",
+                if proc::ring3_elf_groundwork_enabled() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ));
+            serial::write_line(
+                "ring3: runtime commands=`ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`",
+            );
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ring3 smoke" {
+            match proc::run_ring3_policy_smoke() {
+                Ok(report) => {
+                    serial::write_fmt(format_args!(
+                        "ring3(smoke): pid={} caps={:#x} getpid={} time_before={} socket={} sendto_bad_ptr={} recvfrom_bad_ptr={} cap_get_before={} cap_drop={} cap_get_after={} time_after_drop={} exit={} result={}\n",
+                        report.pid,
+                        report.initial_caps,
+                        report.getpid_rc,
+                        report.time_before_drop_rc,
+                        report.socket_rc,
+                        report.sendto_bad_ptr_rc,
+                        report.recvfrom_bad_ptr_rc,
+                        report.cap_get_before_drop_rc,
+                        report.cap_drop_rc,
+                        report.cap_get_after_drop_rc,
+                        report.time_after_drop_rc,
+                        report.exit_rc,
+                        if report.passed() { "ok" } else { "fail" },
+                    ));
+                }
+                Err(error) => {
+                    serial::write_fmt(format_args!(
+                        "ring3(smoke): failed rc={} ({})\n",
+                        error,
+                        errno::name(error)
+                    ));
+                }
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ring3 groundwork" {
+            match proc::run_ring3_groundwork_smoke() {
+                Ok(report) => {
+                    if !report.enabled {
+                        serial::write_line(
+                            "ring3(groundwork): disabled (set ARROST_RING3_ELF_GROUNDWORK=true at build time)",
+                        );
+                    } else {
+                        serial::write_fmt(format_args!(
+                            "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} exit={} result={}\n",
+                            report.pid,
+                            report.entry_ip,
+                            report.entry_sp,
+                            report.kernel_stack_top,
+                            report.user_ranges,
+                            report.mapped_pages,
+                            report.getpid_rc,
+                            report.time_ms_rc,
+                            report.cap_get_rc,
+                            report.sendto_user_req_rc,
+                            report.recvfrom_user_req_rc,
+                            report.exit_rc,
+                            if report.passed() { "ok" } else { "fail" },
+                        ));
+                    }
+                }
+                Err(error) => {
+                    serial::write_fmt(format_args!(
+                        "ring3(groundwork): failed rc={} ({})\n",
+                        error,
+                        errno::name(error)
+                    ));
+                }
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ring3 ps" {
+            proc::log_ring3_process_table();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ring3 wait any" {
+            match proc::wait_any_ring3_user() {
+                proc::Ring3WaitAny::Exited { pid, code } => {
+                    serial::write_fmt(format_args!("ring3(wait): any pid={} exit={}\n", pid, code));
+                }
+                proc::Ring3WaitAny::Running => serial::write_line("ring3(wait): any running"),
+                proc::Ring3WaitAny::NoChildren => {
+                    serial::write_line("ring3(wait): any no-children")
+                }
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ring3 wait all" {
+            let report = proc::wait_all_ring3_user();
+            serial::write_fmt(format_args!(
+                "ring3(wait): all reaped={} running={}\n",
+                report.reaped, report.running
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("ring3 wait ") {
+            let Some(pid) = parse_pid(rest) else {
+                self.push_terminal_text(index, "usage: ring3 wait <pid|any|all>\n");
+                return true;
+            };
+            let waited = proc::wait_ring3_pid(pid);
+            if waited == errno::EAGAIN {
+                serial::write_fmt(format_args!("ring3(wait): pid={} running\n", pid));
+            } else if waited >= 0 {
+                serial::write_fmt(format_args!("ring3(wait): pid={} exit={}\n", pid, waited));
+            } else {
+                serial::write_fmt(format_args!(
+                    "ring3(wait): failed pid={} rc={} ({})\n",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                ));
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(target) = command.strip_prefix("ring3 run ") {
+            let app_id = match target.trim() {
+                "init" => Some(app::INIT),
+                "doom" => Some(app::DOOM),
+                _ => None,
+            };
+            let Some(app_id) = app_id else {
+                self.push_terminal_text(index, "usage: ring3 run <init|doom>\n");
+                return true;
+            };
+            let run_rc = proc::run_ring3_user_app(app_id);
+            if run_rc > 0 {
+                serial::write_fmt(format_args!(
+                    "ring3(run): queued app={} pid={}\n",
+                    app::name(app_id),
+                    run_rc
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "ring3(run): failed app={} rc={} ({})\n",
+                    app::name(app_id),
+                    run_rc,
+                    errno::name(run_rc)
+                ));
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+
+        if command == "spawn" {
+            self.push_terminal_text(index, "usage: spawn <init|doom>\n");
+            return true;
+        }
+        if let Some(target) = command.strip_prefix("spawn ") {
+            let app_id = match target.trim() {
+                "init" => Some(app::INIT),
+                "doom" => Some(app::DOOM),
+                _ => None,
+            };
+            let Some(app_id) = app_id else {
+                self.push_terminal_text(index, "usage: spawn <init|doom>\n");
+                return true;
+            };
+            let spawned = proc::spawn_user_app(app_id);
+            if spawned > 0 {
+                serial::write_fmt(format_args!(
+                    "user(spawn): app={} pid={}\n",
+                    app::name(app_id),
+                    spawned
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "user(spawn): failed app={} rc={} ({})\n",
+                    app::name(app_id),
+                    spawned,
+                    errno::name(spawned)
+                ));
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "wait" {
+            self.push_terminal_text(index, "usage: wait <pid|any|all>\n");
+            return true;
+        }
+        if command == "wait any" {
+            match proc::wait_any_user() {
+                proc::UserWaitAny::Exited { pid, code } => {
+                    serial::write_fmt(format_args!("user(wait): any pid={} exit={}\n", pid, code));
+                }
+                proc::UserWaitAny::Running => serial::write_line("user(wait): any running"),
+                proc::UserWaitAny::NoChildren => serial::write_line("user(wait): any no-children"),
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "wait all" {
+            let report = proc::wait_all_user();
+            serial::write_fmt(format_args!(
+                "user(wait): all reaped={} running={}\n",
+                report.reaped, report.running
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("wait ") {
+            let Some(pid) = parse_pid(rest) else {
+                self.push_terminal_text(index, "usage: wait <pid|any|all>\n");
+                return true;
+            };
+            let waited = proc::wait_user_pid(pid);
+            if waited == errno::EAGAIN {
+                serial::write_fmt(format_args!("user(wait): pid={} running\n", pid));
+            } else if waited >= 0 {
+                serial::write_fmt(format_args!("user(wait): pid={} exit={}\n", pid, waited));
+            } else {
+                serial::write_fmt(format_args!(
+                    "user(wait): failed pid={} rc={} ({})\n",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                ));
+            }
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+
+        if command == "ps" {
+            proc::log_process_table();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "syscalls" {
+            proc::log_syscall_stats();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "disk" {
+            storage::log_info();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+
+        if command == "ls" {
+            fs::list_to_serial();
+            self.drain_serial_output_to_terminal(index);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+        if command == "cat" {
+            self.push_terminal_text(index, "usage: cat <file>\n");
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("cat ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: cat <file>\n");
+            } else {
+                fs::cat_to_serial(path);
+                self.drain_serial_output_to_terminal(index);
+            }
+            return true;
+        }
+        if let Some((text, path)) = parse_echo_redirect(command) {
+            fs::write_from_echo(path, text);
+            self.drain_serial_output_to_terminal(index);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+        if let Some(text) = command.strip_prefix("echo ") {
+            self.push_terminal_text(index, text);
+            self.push_terminal_text(index, "\n");
+            return true;
+        }
+        if command == "echo" {
+            self.push_terminal_text(index, "usage: echo <text> > <file>\n");
+            return true;
+        }
+
+        if command == "fm" || command == "fm list" {
+            fs::list_to_serial();
+            self.drain_serial_output_to_terminal(index);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+        if command == "fm open" {
+            self.push_terminal_text(index, "usage: fm open <file>\n");
+            return true;
+        }
+        if command == "fm copy" {
+            self.push_terminal_text(index, "usage: fm copy <src> <dst>\n");
+            return true;
+        }
+        if command == "fm delete" {
+            self.push_terminal_text(index, "usage: fm delete <file>\n");
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("fm open ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: fm open <file>\n");
+                return true;
+            }
+            let mut buffer = [0u8; fs::MAX_FILE_BYTES];
+            match fs::read_file(path, &mut buffer) {
+                Ok(len) => {
+                    fs::cat_to_serial(path);
+                    self.drain_serial_output_to_terminal(index);
+                    self.refresh_file_manager_preview_view(path, &buffer[..len]);
+                }
+                Err(err) => {
+                    serial::write_fmt(format_args!("fm: open {} ({})\n", path, err.as_str()));
+                    self.drain_serial_output_to_terminal(index);
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("fm copy ") {
+            let Some((source, destination)) = parse_file_manager_copy(rest) else {
+                self.push_terminal_text(index, "usage: fm copy <src> <dst>\n");
+                return true;
+            };
+            fs::copy_file_to_serial(source, destination);
+            self.drain_serial_output_to_terminal(index);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("fm delete ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: fm delete <file>\n");
+            } else {
+                fs::delete_file_to_serial(path);
+                self.drain_serial_output_to_terminal(index);
+                self.refresh_file_manager_list_view();
+            }
+            return true;
+        }
+
+        if command == "doom play" {
+            self.queue_ui_action(UiAction::LaunchDoom);
+            self.push_terminal_text(index, "launching doom play...\n");
+            return true;
+        }
+        if command == "doom run" {
+            if doom::start(time::ticks()) {
+                self.push_terminal_text(index, "doom: runtime started\n");
+            } else {
+                self.push_terminal_text(index, "doom: runtime already running\n");
+            }
+            doom::render_ui_status();
+            return true;
+        }
+        if command == "doom stop" {
+            self.queue_ui_action(UiAction::StopDoom);
+            self.push_terminal_text(index, "stopping doom...\n");
+            return true;
+        }
+        if command == "doom" || command == "doom status" {
+            doom::log_status();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "doom source" {
+            doom::log_doomgeneric_info();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "doom doctor" {
+            doom::log_doomgeneric_doctor();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "doom ui" {
+            doom::render_ui_status();
+            self.push_terminal_text(index, "doom: ui status pushed to doom window\n");
+            return true;
+        }
+        if command == "doom reset" {
+            doom::reset(time::ticks());
+            doom::render_ui_status();
+            self.push_terminal_text(index, "doom: simulation reset\n");
+            return true;
+        }
+        if command == "doom capture on" {
+            if shell::set_ui_doom_capture(true) {
+                self.push_terminal_text(index, "doom: capture enabled\n");
+            } else {
+                self.push_terminal_text(index, "doom: capture requires doom play running\n");
+            }
+            return true;
+        }
+        if command == "doom capture off" {
+            let _ = shell::set_ui_doom_capture(false);
+            self.push_terminal_text(index, "doom: capture disabled\n");
+            return true;
+        }
+        if let Some(mode) = command.strip_prefix("doom view ") {
+            let changed = match mode.trim() {
+                "bilinear" | "smooth" => self.set_doom_view_filter(DoomViewFilter::Bilinear),
+                "nearest" | "fast" => self.set_doom_view_filter(DoomViewFilter::Nearest),
+                _ => {
+                    self.push_terminal_text(index, "usage: doom view <bilinear|nearest>\n");
+                    return true;
+                }
+            };
+            serial::write_fmt(format_args!(
+                "doom: viewport filter={}{}\n",
+                self.doom_view_filter().as_str(),
+                if changed { "" } else { " (unchanged)" }
+            ));
+            self.drain_serial_output_to_terminal(index);
+            doom::render_ui_status();
+            return true;
+        }
+
+        if command == "ui" {
+            let status = self.status();
+            serial::write_fmt(format_args!(
+                "ui: backend={} ready=true {}x{} stride={} bpp={} fmt={} focused={} events={} dropped={} stdout_events={} stdout_dropped={} frames={} full_redraws={} partial_redraws={} present_full={} present_partial={} damage_dropped={} damage_coalesced={} double_buffer={} mouse=({}, {}) mouse_events={} mouse_focus_clicks={} drag_steps={} resize_steps={} minimize_toggles={} drag_active={} resize_active={} focused_minimized={} minimized_windows={}\n",
+                status.backend,
+                status.width,
+                status.height,
+                status.stride,
+                status.bytes_per_pixel,
+                status.pixel_format,
+                status.focused_window,
+                status.events,
+                status.dropped,
+                status.stdout_events,
+                status.stdout_dropped,
+                status.frames,
+                status.full_redraws,
+                status.partial_redraws,
+                status.present_full,
+                status.present_partial,
+                status.damage_dropped,
+                status.damage_coalesced,
+                status.double_buffer,
+                status.mouse_x,
+                status.mouse_y,
+                status.mouse_events,
+                status.mouse_click_focus,
+                status.mouse_drag_steps,
+                status.mouse_resize_steps,
+                status.mouse_minimize_toggles,
+                status.drag_active,
+                status.resize_active,
+                status.focused_minimized,
+                status.minimized_windows
+            ));
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "ui redraw" {
+            self.redraw();
+            self.push_terminal_text(index, "ui: redraw requested\n");
+            return true;
+        }
+        if command == "ui next" {
+            self.focus_next_internal();
+            self.push_terminal_text(index, "ui: focus advanced\n");
+            return true;
+        }
+        if command == "ui minimize" {
+            let focused = self.focused_window;
+            self.toggle_minimize(focused);
+            self.push_terminal_text(index, "ui: focused window minimize toggled\n");
+            return true;
+        }
+
+        if command == "mouse" {
+            mouse::log_info();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "net" {
+            net::log_info();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(ip) = command.strip_prefix("ping ") {
+            let ip = ip.trim();
+            if ip.is_empty() {
+                self.push_terminal_text(index, "usage: ping <a.b.c.d>\n");
+            } else {
+                net::ping_to_serial(ip);
+                self.drain_serial_output_to_terminal(index);
+            }
+            return true;
+        }
+        if command == "udp last" {
+            net::log_last_udp();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("udp send ") {
+            let Some((ip, port, payload)) = parse_udp_send(rest) else {
+                self.push_terminal_text(index, "usage: udp send <a.b.c.d> <port> <text>\n");
+                return true;
+            };
+            net::udp_send_to_serial(ip, port, payload);
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("curl ") {
+            let url = rest.trim();
+            if url.is_empty() {
+                self.push_terminal_text(
+                    index,
+                    "usage: curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path>\n",
+                );
+            } else {
+                net::curl_to_serial(url);
+                self.drain_serial_output_to_terminal(index);
+            }
+            return true;
+        }
+
+        if command == "sync" {
+            fs::sync_to_disk_to_serial();
+            self.drain_serial_output_to_terminal(index);
+            return true;
+        }
+        if command == "reload" {
+            fs::reload_from_disk_to_serial();
+            self.drain_serial_output_to_terminal(index);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+        if command == "watch on" {
+            time::set_heartbeat(true);
+            self.push_terminal_text(index, "watch: tick heartbeat enabled\n");
+            return true;
+        }
+        if command == "watch off" {
+            time::set_heartbeat(false);
+            self.push_terminal_text(index, "watch: tick heartbeat disabled\n");
+            return true;
+        }
+
+        if command == "exit" {
+            self.close_terminal_window(index, 0);
+            return false;
+        }
+
+        self.push_terminal_text(index, "unknown command\n");
         true
     }
 
@@ -832,7 +1904,11 @@ impl GfxState {
                 restored_from_minimized = true;
             }
         }
-        let focused_changed = self.set_focus(DOOM_WINDOW_INDEX);
+        let focused_changed = if !was_open {
+            self.set_focus(DOOM_WINDOW_INDEX)
+        } else {
+            false
+        };
         if !was_open || restored_from_minimized || focused_changed {
             self.invalidate_window(DOOM_WINDOW_INDEX);
         }
@@ -871,6 +1947,48 @@ impl GfxState {
             let rect = self.window_text_area_rect(index);
             self.invalidate_rect(rect);
         }
+    }
+
+    fn refresh_file_manager_list_view(&mut self) {
+        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
+        let count = fs::list_entries(&mut entries);
+
+        let mut view = String::new();
+        let _ = writeln!(view, "FILES ({count})");
+        let _ = writeln!(view, "name               size");
+        for entry in entries.iter().take(count).take(FILE_MANAGER_LIST_LINES) {
+            let _ = writeln!(view, "{} {}b", entry.name(), entry.size());
+        }
+        if count == 0 {
+            let _ = writeln!(view, "<empty>");
+        }
+        let _ = writeln!(view, "fm open <file>");
+        let _ = writeln!(view, "fm copy <src> <dst>");
+        let _ = writeln!(view, "fm delete <file>");
+
+        self.set_window_text(FILE_MANAGER_WINDOW_INDEX, &view);
+    }
+
+    fn refresh_file_manager_preview_view(&mut self, path: &str, bytes: &[u8]) {
+        let mut view = String::new();
+        let _ = writeln!(view, "OPEN {}", path.trim());
+        let _ = writeln!(view, "{} bytes", bytes.len());
+        let _ = writeln!(view, "----------------");
+
+        for &byte in bytes.iter().take(FILE_MANAGER_PREVIEW_BYTES) {
+            match byte {
+                b'\r' => {}
+                b'\n' => view.push('\n'),
+                0x20..=0x7e => view.push(byte as char),
+                _ => view.push('.'),
+            }
+        }
+        if bytes.len() > FILE_MANAGER_PREVIEW_BYTES {
+            let _ = writeln!(view, "\n...truncated...");
+        }
+        let _ = writeln!(view, "\nfm list");
+
+        self.set_window_text(FILE_MANAGER_WINDOW_INDEX, &view);
     }
 
     fn set_doom_view(&mut self, width: usize, height: usize, pixels: &[u32]) {
@@ -946,13 +2064,24 @@ impl GfxState {
         let left_released = !event.left_button && self.pointer_left;
         let right_released = !event.right_button && self.pointer_right;
 
-        if doom::inject_mouse(
-            event.dx,
-            event.dy,
-            event.left_button,
-            event.right_button,
-            event.middle_button,
-        ) {
+        let pointer_window = self.window_at(self.pointer_x, self.pointer_y);
+        let pointer_on_doom = pointer_window == Some(DOOM_WINDOW_INDEX);
+        let pointer_on_doom_controls =
+            self.point_on_close_button(DOOM_WINDOW_INDEX, self.pointer_x, self.pointer_y)
+                || self.point_on_title_bar(DOOM_WINDOW_INDEX, self.pointer_x, self.pointer_y)
+                || self.point_on_resize_handle(DOOM_WINDOW_INDEX, self.pointer_x, self.pointer_y);
+        let route_mouse_to_doom = self.focused_window == DOOM_WINDOW_INDEX
+            && pointer_on_doom
+            && !pointer_on_doom_controls;
+        if route_mouse_to_doom
+            && doom::inject_mouse(
+                event.dx,
+                event.dy,
+                event.left_button,
+                event.right_button,
+                event.middle_button,
+            )
+        {
             if moved
                 || previous_pointer_left != event.left_button
                 || previous_pointer_right != event.right_button
@@ -968,29 +2097,60 @@ impl GfxState {
         let now_tick = time::ticks();
 
         if left_pressed {
-            if let Some(index) = self.window_at(self.pointer_x, self.pointer_y) {
-                if self.set_focus(index) {
-                    self.mouse_click_focus = self.mouse_click_focus.saturating_add(1);
+            let mut consumed = false;
+            if self.point_on_apps_button(self.pointer_x, self.pointer_y) {
+                self.set_apps_menu_open(!self.apps_menu_open);
+                self.drag = DragState::inactive();
+                self.resize = ResizeState::inactive();
+                consumed = true;
+            } else if self.apps_menu_open {
+                if let Some(item) = self.apps_menu_item_at(self.pointer_x, self.pointer_y) {
+                    self.set_apps_menu_open(false);
+                    match item {
+                        AppMenuItem::Doom => self.queue_ui_action(UiAction::LaunchDoom),
+                        AppMenuItem::Terminal => {
+                            if !self.launch_terminal() {
+                                serial::write_line("ui: no free terminal slots");
+                            }
+                        }
+                    }
+                    consumed = true;
+                } else if !self.point_in_apps_menu(self.pointer_x, self.pointer_y) {
+                    self.set_apps_menu_open(false);
+                    consumed = true;
                 }
+            }
 
-                if self.point_on_title_bar(index, self.pointer_x, self.pointer_y) {
-                    if self.is_title_double_click(index, now_tick) {
-                        self.toggle_minimize(index);
-                        self.mouse_minimize_toggles = self.mouse_minimize_toggles.saturating_add(1);
+            if !consumed {
+                if let Some(index) = self.window_at(self.pointer_x, self.pointer_y) {
+                    if self.set_focus(index) {
+                        self.mouse_click_focus = self.mouse_click_focus.saturating_add(1);
+                    }
+
+                    if self.point_on_close_button(index, self.pointer_x, self.pointer_y) {
+                        self.close_window_process(index);
                         self.drag = DragState::inactive();
                         self.resize = ResizeState::inactive();
-                    } else if !self.windows[index].minimized {
-                        let window = self.windows[index];
-                        self.drag = DragState {
-                            active: true,
-                            window_index: index,
-                            offset_x: self.pointer_x.saturating_sub(window.x),
-                            offset_y: self.pointer_y.saturating_sub(window.y),
-                        };
+                    } else if self.point_on_title_bar(index, self.pointer_x, self.pointer_y) {
+                        if self.is_title_double_click(index, now_tick) {
+                            self.toggle_minimize(index);
+                            self.mouse_minimize_toggles =
+                                self.mouse_minimize_toggles.saturating_add(1);
+                            self.drag = DragState::inactive();
+                            self.resize = ResizeState::inactive();
+                        } else if !self.windows[index].minimized {
+                            let window = self.windows[index];
+                            self.drag = DragState {
+                                active: true,
+                                window_index: index,
+                                offset_x: self.pointer_x.saturating_sub(window.x),
+                                offset_y: self.pointer_y.saturating_sub(window.y),
+                            };
+                        }
                     }
+                } else {
+                    self.drag = DragState::inactive();
                 }
-            } else {
-                self.drag = DragState::inactive();
             }
         }
 
@@ -1040,9 +2200,13 @@ impl GfxState {
     }
 
     fn window_at(&self, x: usize, y: usize) -> Option<usize> {
-        (0..WINDOW_COUNT)
-            .rev()
-            .find(|&index| self.window_visible(index) && self.point_in_window(index, x, y))
+        for depth in (0..WINDOW_COUNT).rev() {
+            let index = self.window_order[depth];
+            if self.window_visible(index) && self.point_in_window(index, x, y) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     fn point_in_window(&self, index: usize, x: usize, y: usize) -> bool {
@@ -1060,6 +2224,13 @@ impl GfxState {
         let title_top = window.y.saturating_add(1);
         let title_bottom = title_top.saturating_add(TITLE_BAR_HEIGHT);
         self.point_in_window(index, x, y) && y >= title_top && y < title_bottom
+    }
+
+    fn point_on_close_button(&self, index: usize, x: usize, y: usize) -> bool {
+        if !self.window_closable(index) {
+            return false;
+        }
+        Self::point_in_rect(self.close_button_rect(index), x, y)
     }
 
     fn point_on_resize_handle(&self, index: usize, x: usize, y: usize) -> bool {
@@ -1082,13 +2253,20 @@ impl GfxState {
         if !self.window_visible(index) {
             return false;
         }
-        if self.focused_window == index {
+        let previous = self.focused_window;
+        let focused_changed = previous != index;
+        let raised = self.raise_window_to_front(index);
+        if !focused_changed && !raised {
             return false;
         }
-        let previous = self.focused_window;
         self.focused_window = index;
-        self.invalidate_window_chrome(previous);
+        if focused_changed {
+            self.invalidate_window_chrome(previous);
+        }
         self.invalidate_window_chrome(index);
+        if raised {
+            self.invalidate_rect(Rect::new(0, 0, self.info.width, self.info.height));
+        }
         true
     }
 
@@ -1161,7 +2339,8 @@ impl GfxState {
             .saturating_sub(DESKTOP_MARGIN);
 
         new_x = new_x.clamp(DESKTOP_MARGIN, max_x.max(DESKTOP_MARGIN));
-        new_y = new_y.clamp(32, max_y.max(32));
+        let min_y = TASKBAR_HEIGHT.saturating_add(DESKTOP_MARGIN);
+        new_y = new_y.clamp(min_y, max_y.max(min_y));
 
         if new_x == window.x && new_y == window.y {
             return false;
@@ -1227,22 +2406,6 @@ impl GfxState {
         )
     }
 
-    fn rect_inside_rect(rect: Rect, bounds: Rect) -> bool {
-        let rect_x1 = rect.x.saturating_add(rect.w);
-        let rect_y1 = rect.y.saturating_add(rect.h);
-        let bounds_x1 = bounds.x.saturating_add(bounds.w);
-        let bounds_y1 = bounds.y.saturating_add(bounds.h);
-        rect.x >= bounds.x && rect.y >= bounds.y && rect_x1 <= bounds_x1 && rect_y1 <= bounds_y1
-    }
-
-    fn rect_inside_window(&self, index: usize, rect: Rect) -> bool {
-        if index >= WINDOW_COUNT || !self.window_visible(index) {
-            return false;
-        }
-        let window = self.window_rect(index);
-        Self::rect_inside_rect(rect, window)
-    }
-
     fn window_text_area_rect(&self, index: usize) -> Rect {
         let window = self.windows[index];
         let x = window.x.saturating_add(WINDOW_PADDING);
@@ -1250,13 +2413,6 @@ impl GfxState {
         let w = window.visible_cols().saturating_mul(CHAR_W);
         let h = window.visible_rows().saturating_mul(CHAR_H);
         Rect::new(x, y, w, h)
-    }
-
-    fn window_text_cell_rect(&self, index: usize, row: usize, col: usize) -> Rect {
-        let area = self.window_text_area_rect(index);
-        let x = area.x.saturating_add(col.saturating_mul(CHAR_W));
-        let y = area.y.saturating_add(row.saturating_mul(CHAR_H));
-        Rect::new(x, y, CHAR_W, CHAR_H)
     }
 
     fn window_chrome_rects(&self, index: usize) -> [Rect; 5] {
@@ -1394,42 +2550,19 @@ impl GfxState {
 
     fn redraw_region(&mut self, rect: Rect) {
         self.clip = Some(rect);
-        let mut rendered = false;
-        if self.doom_window_open
-            && self.doom_view.active
-            && self.focused_window == DOOM_WINDOW_INDEX
-        {
-            let doom_window = self.windows[DOOM_WINDOW_INDEX];
-            let viewport_only = self
-                .doom_view_damage_rect(doom_window)
-                .map(|damage| Self::rect_inside_rect(rect, damage))
-                .unwrap_or(false);
-            if viewport_only {
-                // Doom focused + viewport-only damage: skip full window text/chrome redraw.
-                self.draw_doom_view(doom_window);
-                self.draw_pointer();
-                rendered = true;
-            } else if self.rect_inside_window(DOOM_WINDOW_INDEX, rect) {
-                let focused = true;
-                self.draw_window(DOOM_WINDOW_INDEX, doom_window, focused);
-                self.draw_pointer();
-                rendered = true;
-            }
-        }
+        self.draw_desktop_background();
+        self.draw_top_bar();
 
-        if !rendered {
-            self.draw_desktop_background();
-            self.draw_top_bar();
-
-            for index in 0..WINDOW_COUNT {
-                if !self.window_visible(index) {
-                    continue;
-                }
-                let focused = index == self.focused_window;
-                self.draw_window(index, self.windows[index], focused);
+        for depth in 0..WINDOW_COUNT {
+            let index = self.window_order[depth];
+            if !self.window_visible(index) {
+                continue;
             }
-            self.draw_pointer();
+            let focused = index == self.focused_window;
+            self.draw_window(index, self.windows[index], focused);
         }
+        self.draw_apps_menu_overlay();
+        self.draw_pointer();
 
         self.clip = None;
         self.present_rect(rect);
@@ -1521,13 +2654,15 @@ impl GfxState {
         self.draw_desktop_background();
         self.draw_top_bar();
 
-        for index in 0..WINDOW_COUNT {
+        for depth in 0..WINDOW_COUNT {
+            let index = self.window_order[depth];
             if !self.window_visible(index) {
                 continue;
             }
             let focused = index == self.focused_window;
             self.draw_window(index, self.windows[index], focused);
         }
+        self.draw_apps_menu_overlay();
         self.draw_pointer();
 
         self.present_rect(Rect::new(0, 0, self.info.width, self.info.height));
@@ -1561,7 +2696,13 @@ impl GfxState {
         }
 
         let accent = Color::rgb(44, 86, 128);
-        self.fill_rect(0, 34, self.info.width, 2, accent);
+        self.fill_rect(
+            0,
+            TASKBAR_HEIGHT.saturating_add(2),
+            self.info.width,
+            2,
+            accent,
+        );
         self.fill_rect(
             0,
             self.info.height.saturating_sub(30),
@@ -1573,14 +2714,68 @@ impl GfxState {
 
     fn draw_top_bar(&mut self) {
         let bar = Color::rgb(9, 22, 40);
-        self.fill_rect(0, 0, self.info.width, 26, bar);
+        let bar_text = Color::rgb(230, 235, 242);
+        self.fill_rect(0, 0, self.info.width, TASKBAR_HEIGHT, bar);
+        let apps_rect = self.apps_button_rect();
+        let apps_color = if self.apps_menu_open {
+            Color::rgb(69, 103, 147)
+        } else {
+            Color::rgb(43, 65, 92)
+        };
+        self.fill_rect(
+            apps_rect.x,
+            apps_rect.y,
+            apps_rect.w,
+            apps_rect.h,
+            apps_color,
+        );
         self.draw_text(
-            10,
+            apps_rect.x.saturating_add(8),
+            apps_rect.y.saturating_add(6),
+            "Apps",
+            bar_text,
+            Some(apps_color),
+        );
+        self.draw_text(
+            APPS_BUTTON_X
+                .saturating_add(APPS_BUTTON_W)
+                .saturating_add(14),
             8,
-            "ARR0ST M9 APPS | TERMINAL + FILE MANAGER + DOOM | TAB/MOUSE FOCUS",
-            Color::rgb(230, 235, 242),
+            "ARR0ST M9 | apps launcher | tab switches focus",
+            bar_text,
             Some(bar),
         );
+    }
+
+    fn draw_apps_menu_overlay(&mut self) {
+        if !self.apps_menu_open {
+            return;
+        }
+        let menu_rect = self.apps_menu_rect();
+        let menu_bg = Color::rgb(18, 33, 54);
+        let menu_item = Color::rgb(24, 46, 74);
+        let menu_hover = Color::rgb(51, 81, 116);
+        let text = Color::rgb(230, 235, 242);
+        self.fill_rect(menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h, menu_bg);
+        for (index, item) in APP_MENU_ORDER.iter().copied().enumerate() {
+            let item_rect = self.apps_menu_item_rect(index);
+            let hovered = Self::point_in_rect(item_rect, self.pointer_x, self.pointer_y);
+            let item_color = if hovered { menu_hover } else { menu_item };
+            self.fill_rect(
+                item_rect.x,
+                item_rect.y,
+                item_rect.w,
+                item_rect.h,
+                item_color,
+            );
+            self.draw_text(
+                item_rect.x.saturating_add(8),
+                item_rect.y.saturating_add(7),
+                item.label(),
+                text,
+                Some(item_color),
+            );
+        }
     }
 
     fn draw_window(&mut self, index: usize, window: UiWindow, focused: bool) {
@@ -1638,6 +2833,9 @@ impl GfxState {
                 text,
                 Some(title),
             );
+            if self.window_closable(index) {
+                self.draw_close_button(index, focused);
+            }
             return;
         }
 
@@ -1648,6 +2846,9 @@ impl GfxState {
             text,
             Some(title),
         );
+        if self.window_closable(index) {
+            self.draw_close_button(index, focused);
+        }
 
         let origin_x = window.x.saturating_add(WINDOW_PADDING);
         let origin_y = window.y.saturating_add(TITLE_BAR_HEIGHT + WINDOW_PADDING);
@@ -1968,6 +3169,24 @@ impl GfxState {
         );
     }
 
+    fn draw_close_button(&mut self, index: usize, focused: bool) {
+        let rect = self.close_button_rect(index);
+        let bg = if focused {
+            Color::rgb(180, 58, 44)
+        } else {
+            Color::rgb(120, 52, 44)
+        };
+        let fg = Color::rgb(248, 240, 234);
+        self.fill_rect(rect.x, rect.y, rect.w, rect.h, bg);
+        self.draw_text(
+            rect.x.saturating_add(4),
+            rect.y.saturating_add(3),
+            "X",
+            fg,
+            Some(bg),
+        );
+    }
+
     fn draw_resize_handle(&mut self, window: UiWindow, focused: bool) {
         let color = if focused {
             Color::rgb(232, 188, 98)
@@ -2264,15 +3483,21 @@ pub fn init_headless() -> GfxInitReport {
 }
 
 pub fn poll() {
-    let _ = with_state_mut(|state| state.process_events());
+    let (action, capture_target) = with_state_mut(|state| {
+        state.process_events();
+        (state.take_pending_ui_action(), state.doom_capture_target())
+    })
+    .unwrap_or((UiAction::None, false));
+    run_ui_action(action);
+    let _ = shell::set_ui_doom_capture(capture_target);
 }
 
 pub fn try_enable_backbuffer() -> bool {
     with_state_mut(|state| state.try_enable_backbuffer()).unwrap_or(false)
 }
 
-pub fn on_input_byte(byte: u8) {
-    let _ = with_state_mut(|state| state.push_event(byte));
+pub fn on_input_byte(byte: u8) -> bool {
+    with_state_mut(|state| state.on_input_byte(byte)).unwrap_or(false)
 }
 
 pub fn set_file_manager_text(text: &str) {
@@ -2404,11 +3629,108 @@ pub fn log_info() {
     }
 }
 
+fn run_ui_action(action: UiAction) {
+    match action {
+        UiAction::None => {}
+        UiAction::LaunchDoom => {
+            let start = doom::play(time::ticks());
+            match start {
+                doom::PlayStart::DoomGeneric => {
+                    serial::write_line("doom: play mode started from UI");
+                }
+                doom::PlayStart::Fallback => {
+                    serial::write_line(
+                        "doom: doomgeneric not ready; fallback started from UI (check doom doctor)",
+                    );
+                }
+                doom::PlayStart::AlreadyRunning => {
+                    serial::write_line("doom: runtime already running");
+                }
+            }
+            let _ = shell::set_ui_doom_capture(true);
+            doom::render_ui_status();
+        }
+        UiAction::StopDoom => {
+            if doom::stop(time::ticks()) {
+                serial::write_line("doom: runtime stopped from UI");
+            } else {
+                serial::write_line("doom: runtime already stopped");
+            }
+            let _ = shell::set_ui_doom_capture(false);
+        }
+    }
+}
+
 fn with_state_mut<T>(f: impl FnOnce(&mut GfxState) -> T) -> Option<T> {
     // SAFETY: ArrOSt kernel main loop is single-threaded in current milestones.
     let slot = unsafe { &mut *GFX_STATE.0.get() };
     let state = slot.as_mut()?;
     Some(f(state))
+}
+
+fn parse_pid(text: &str) -> Option<u32> {
+    let pid = text.trim().parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
+}
+
+fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
+    if !input.starts_with("echo ") {
+        return None;
+    }
+    let (left, right) = input.split_once('>')?;
+    let text = left.strip_prefix("echo ")?.trim_end();
+    let path = right.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some((text, path))
+}
+
+fn parse_udp_send(input: &str) -> Option<(&str, u16, &str)> {
+    let mut parts = input.trim().splitn(3, ' ');
+    let ip = parts.next()?;
+    let port = parts.next()?.parse::<u16>().ok()?;
+    let payload = parts.next()?;
+    if payload.is_empty() {
+        return None;
+    }
+    Some((ip, port, payload))
+}
+
+fn parse_file_manager_copy(input: &str) -> Option<(&str, &str)> {
+    let mut parts = input.trim().splitn(3, ' ');
+    let source = parts.next()?.trim();
+    let destination = parts.next()?.trim();
+    if source.is_empty() || destination.is_empty() {
+        return None;
+    }
+    Some((source, destination))
+}
+
+fn u32_to_ascii(mut value: u32, out: &mut [u8]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+
+    let mut scratch = [0u8; 16];
+    let mut len = 0usize;
+    while value > 0 && len < scratch.len() {
+        scratch[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    let write_len = len.min(out.len());
+    for index in 0..write_len {
+        out[index] = scratch[write_len - index - 1];
+    }
+    write_len
 }
 
 fn pixel_format_name(format: PixelFormat) -> &'static str {

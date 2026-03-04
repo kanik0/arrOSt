@@ -171,6 +171,9 @@ pub fn poll() {
         if doom_capture_enabled() {
             continue;
         }
+        if gfx::on_input_byte(byte) {
+            continue;
+        }
         process_byte(byte);
     }
     while let Some(byte) = serial::try_read_byte() {
@@ -226,6 +229,26 @@ fn doom_capture_enabled() -> bool {
     shell.doom_capture
 }
 
+pub fn set_ui_doom_capture(enabled: bool) -> bool {
+    // SAFETY: shell is single-threaded and only mutated from main loop.
+    let shell = unsafe { &mut *SHELL_STATE.0.get() };
+    if enabled {
+        if doom::set_capture(true) {
+            shell.doom_capture = true;
+            return true;
+        }
+        shell.doom_capture = false;
+        return false;
+    }
+
+    if shell.doom_capture {
+        shell.release_all_serial_capture_keys();
+    }
+    shell.doom_capture = false;
+    let _ = doom::set_capture(false);
+    false
+}
+
 fn process_byte(byte: u8) {
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
@@ -241,10 +264,6 @@ fn process_byte(byte: u8) {
         shell.refresh_serial_capture_key(byte, time::ticks());
         return;
     }
-    if byte == b'\t' {
-        gfx::on_input_byte(byte);
-    }
-
     match byte {
         b'\n' | b'\r' => {
             serial::write_str("\n");
