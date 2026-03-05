@@ -42,9 +42,12 @@ The project focuses on practical kernel engineering with observable behavior, re
 - Shell command `ring3 smoke` runs a cross-platform ring-3 policy smoke (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the shared process-layer syscall context checks.
 - In-kernel serial shell with filesystem, UI, network, and Doom control commands.
 - Framebuffer desktop compositor with top taskbar and `Apps` launcher (`doom`, `terminal`).
+- Taskbar `System` menu with `shutdown` action (graceful stop path: capture off, Doom stop, filesystem sync, halt).
 - Windowed UI includes file manager, on-demand Doom viewport window, and multiple terminal windows.
 - GUI terminal emulator sessions are compositor-managed, multi-instance, and isolated from the serial shell parser/state.
 - Each GUI terminal has its own UI-local PID/TTY identity, input line buffer, and output surface.
+- GUI terminal command handling is API-driven (no serial-output mirroring), including process/runtime diagnostics and network tooling (`net`/`ping`/`udp`/`curl`).
+- Filesystem-backed `/bin` command namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`) runs as scheduler-visible external processes (`ps`/`kill`/`waitx` lifecycle).
 - Window chrome supports close (`X`) for app windows (terminal kill/close, doom stop/close).
 - Click focus updates z-order (focused window raised to front) and Doom keyboard capture target.
 - Virtio block storage backend with persistent disk image.

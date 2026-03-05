@@ -17,11 +17,13 @@ ArrOSt uses a framebuffer compositor that keeps serial diagnostics as the primar
 - `Apps` menu currently exposes:
   - `doom` (same runtime effect as `doom play`)
   - `terminal` (opens a new terminal emulator instance)
+- Taskbar also exposes a `System` menu:
+  - `shutdown` (graceful shutdown: capture off, Doom stop, filesystem sync, halt)
 - Windowed text interface with:
   - file-manager window
   - doom window (shown on demand by launcher or `doom play` / `doom ui`)
   - multiple terminal windows (spawned from `Apps -> terminal`)
-- Each terminal window has its own UI-local process id + TTY id and independent input line/output buffer.
+- Each terminal window has its own scheduler-managed process id + TTY id and independent input line/output buffer.
 - Terminal windows run an isolated command loop (no fallback into the base serial shell parser/global shell state).
 - App windows include title-bar controls; currently `X` (top-right) is implemented:
   - terminal: kills the terminal process and closes the window
@@ -49,6 +51,9 @@ When Doom runtime is active, a dedicated Doom window is opened for viewport + st
 - `ui next`
 - `ui minimize`
 - `fm` and related subcommands
+- GUI terminal command loop includes process controls (`ps`, `kill <pid>`, `waitx <pid|any|all>`) against scheduler-visible entries.
+- `ps`, `doom status`, runtime process controls (`spawn`/`wait`/`waitx`/`ring3 wait`), diagnostics (`syscalls`/`disk`/`mouse`/`ui`/`sync`/`reload`), and network tooling (`net`/`ping`/`udp`/`curl`) in GUI terminal are rendered from internal snapshots/APIs (no serial-mirror dependency).
+- GUI terminal now exposes a filesystem-backed `/bin` namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`; discoverable via `ls /bin`), executed as scheduler-visible external processes.
 
 ## Limits
 

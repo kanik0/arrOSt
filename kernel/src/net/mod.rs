@@ -3,7 +3,9 @@ use crate::arch::port;
 use crate::mem;
 use crate::serial;
 use crate::time;
+use alloc::string::String;
 use core::cell::UnsafeCell;
+use core::fmt::Write;
 use core::hint::spin_loop;
 use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
@@ -430,6 +432,55 @@ pub struct NetInitReport {
 }
 
 #[derive(Clone, Copy)]
+pub struct NetStatsSnapshot {
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub rx_arp: u64,
+    pub rx_ipv4: u64,
+    pub rx_icmp: u64,
+    pub rx_udp: u64,
+    pub rx_tcp: u64,
+    pub dhcp_discover: u64,
+    pub dhcp_offer: u64,
+    pub dhcp_ack: u64,
+    pub dns_query: u64,
+    pub dns_answer: u64,
+    pub curl_udp: u64,
+    pub curl_http: u64,
+    pub route_direct: u64,
+    pub route_gateway: u64,
+    pub dropped: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct NetStatus {
+    pub backend: &'static str,
+    pub ready: bool,
+    pub io_base: u16,
+    pub pci_bus: u8,
+    pub pci_device: u8,
+    pub pci_function: u8,
+    pub pci_device_id: u16,
+    pub mac: [u8; 6],
+    pub ipv4: [u8; 4],
+    pub gateway: [u8; 4],
+    pub netmask: [u8; 4],
+    pub dns: [u8; 4],
+    pub config_source: &'static str,
+    pub stats: NetStatsSnapshot,
+}
+
+#[derive(Clone, Copy)]
+pub struct LastUdpReport {
+    pub src_ip: [u8; 4],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub len: usize,
+    pub preview: [u8; 64],
+    pub preview_len: usize,
+}
+
+#[derive(Clone, Copy)]
 pub struct UdpRxMeta {
     pub src_ip: [u8; 4],
     pub src_port: u16,
@@ -574,6 +625,47 @@ impl NetState {
             mac: self.mac,
             ipv4: self.ipv4,
             config_source: self.config_source.as_str(),
+        }
+    }
+
+    fn status(&self) -> NetStatus {
+        NetStatus {
+            backend: if self.ready {
+                "virtio-net-legacy"
+            } else {
+                "none"
+            },
+            ready: self.ready,
+            io_base: self.io_base,
+            pci_bus: self.pci_bus,
+            pci_device: self.pci_device,
+            pci_function: self.pci_function,
+            pci_device_id: self.pci_device_id,
+            mac: self.mac,
+            ipv4: self.ipv4,
+            gateway: self.gateway,
+            netmask: self.netmask,
+            dns: self.dns,
+            config_source: self.config_source.as_str(),
+            stats: NetStatsSnapshot {
+                rx_frames: self.stats.rx_frames,
+                tx_frames: self.stats.tx_frames,
+                rx_arp: self.stats.rx_arp,
+                rx_ipv4: self.stats.rx_ipv4,
+                rx_icmp: self.stats.rx_icmp,
+                rx_udp: self.stats.rx_udp,
+                rx_tcp: self.stats.rx_tcp,
+                dhcp_discover: self.stats.dhcp_discover,
+                dhcp_offer: self.stats.dhcp_offer,
+                dhcp_ack: self.stats.dhcp_ack,
+                dns_query: self.stats.dns_query,
+                dns_answer: self.stats.dns_answer,
+                curl_udp: self.stats.curl_udp,
+                curl_http: self.stats.curl_http,
+                route_direct: self.stats.route_direct,
+                route_gateway: self.stats.route_gateway,
+                dropped: self.stats.dropped,
+            },
         }
     }
 
@@ -1957,6 +2049,10 @@ pub fn poll() {
     with_net_mut(|state| state.poll());
 }
 
+pub fn status() -> NetStatus {
+    with_net(|state| state.status())
+}
+
 pub fn log_info() {
     with_net(|state| {
         if !state.ready {
@@ -2013,6 +2109,10 @@ pub fn log_info() {
     });
 }
 
+pub fn ping(target: [u8; 4]) -> Result<u64, NetError> {
+    with_net_mut(|state| state.send_ping(target))
+}
+
 pub fn ping_to_serial(ip_text: &str) {
     let Some(target) = parse_ipv4(ip_text) else {
         serial::write_line("ping: invalid ip (usage: ping <a.b.c.d>)");
@@ -2033,30 +2133,37 @@ pub fn ping_to_serial(ip_text: &str) {
 }
 
 pub fn curl_to_serial(spec: &str) {
+    let text = curl_text(spec);
+    serial::write_str(&text);
+}
+
+pub fn curl_text(spec: &str) -> String {
+    let spec = spec.trim();
     if let Some((target, port, payload)) = parse_udp_url(spec) {
         with_net_mut(|state| {
             state.stats.curl_udp = state.stats.curl_udp.saturating_add(1);
         });
-        curl_udp_to_serial_ip(target, port, payload);
-        return;
+        return curl_udp_text_ip(target, port, payload);
     }
     if let Some((host, port, path)) = parse_http_url(spec) {
         with_net_mut(|state| {
             state.stats.curl_http = state.stats.curl_http.saturating_add(1);
         });
+        let mut out = String::new();
         let target = match parse_ipv4(host) {
             Some(ip) => ip,
             None => match with_net_mut(|state| state.dns_resolve_ipv4(host)) {
                 Ok(ip) => {
-                    serial::write_fmt(format_args!(
-                        "curl: dns {} -> {}.{}.{}.{}\n",
+                    let _ = writeln!(
+                        out,
+                        "curl: dns {} -> {}.{}.{}.{}",
                         host, ip[0], ip[1], ip[2], ip[3]
-                    ));
+                    );
                     ip
                 }
                 Err(err) => {
-                    serial::write_fmt(format_args!("curl: dns failed ({})\n", err.as_str()));
-                    return;
+                    let _ = writeln!(out, "curl: dns failed ({})", err.as_str());
+                    return out;
                 }
             },
         };
@@ -2064,23 +2171,27 @@ pub fn curl_to_serial(spec: &str) {
         match with_net_mut(|state| state.curl_http_roundtrip(target, port, path)) {
             Ok((bytes, status)) => {
                 if status != 0 {
-                    serial::write_fmt(format_args!(
-                        "curl: http {}.{}.{}.{}:{}{} status={} bytes={}\n",
+                    let _ = writeln!(
+                        out,
+                        "curl: http {}.{}.{}.{}:{}{} status={} bytes={}",
                         target[0], target[1], target[2], target[3], port, path, status, bytes
-                    ));
+                    );
                 } else {
-                    serial::write_fmt(format_args!(
-                        "curl: http {}.{}.{}.{}:{}{} bytes={}\n",
+                    let _ = writeln!(
+                        out,
+                        "curl: http {}.{}.{}.{}:{}{} bytes={}",
                         target[0], target[1], target[2], target[3], port, path, bytes
-                    ));
+                    );
                 }
             }
-            Err(err) => serial::write_fmt(format_args!("curl: http failed ({})\n", err.as_str())),
+            Err(err) => {
+                let _ = writeln!(out, "curl: http failed ({})", err.as_str());
+            }
         }
-        return;
+        return out;
     }
 
-    let mut parts = spec.trim().splitn(3, ' ');
+    let mut parts = spec.splitn(3, ' ');
     let ip = parts.next().unwrap_or_default();
     let port = parts.next().and_then(|value| value.parse::<u16>().ok());
     let payload = parts.next().unwrap_or_default();
@@ -2089,10 +2200,10 @@ pub fn curl_to_serial(spec: &str) {
             with_net_mut(|state| {
                 state.stats.curl_udp = state.stats.curl_udp.saturating_add(1);
             });
-            curl_udp_to_serial_ip(target, port, payload)
+            curl_udp_text_ip(target, port, payload)
         }
-        _ => serial::write_line(
-            "usage: curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<ip>[:port]/<path>",
+        _ => String::from(
+            "usage: curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path>\n",
         ),
     }
 }
@@ -2116,15 +2227,21 @@ pub fn udp_send_to_serial(ip_text: &str, port: u16, payload: &str) {
     }
 }
 
-fn curl_udp_to_serial_ip(target: [u8; 4], port: u16, payload: &str) {
+pub fn udp_send_shell(target: [u8; 4], port: u16, payload: &[u8]) -> Result<(), NetError> {
+    with_net_mut(|state| state.send_udp_shell(target, port, payload))
+}
+
+fn curl_udp_text_ip(target: [u8; 4], port: u16, payload: &str) -> String {
+    let mut out = String::new();
     let mut response = [0u8; UDP_MAILBOX_CAP];
     match with_net_mut(|state| {
         state.curl_udp_roundtrip(target, port, payload.as_bytes(), &mut response)
     }) {
         Ok(Some(meta)) => {
             let body = core::str::from_utf8(&response[..meta.len]).unwrap_or("<binary>");
-            serial::write_fmt(format_args!(
-                "curl: udp {}.{}.{}.{}:{} -> {} bytes from {}.{}.{}.{}:{} `{}`\n",
+            let _ = writeln!(
+                out,
+                "curl: udp {}.{}.{}.{}:{} -> {} bytes from {}.{}.{}.{}:{} `{}`",
                 target[0],
                 target[1],
                 target[2],
@@ -2137,11 +2254,16 @@ fn curl_udp_to_serial_ip(target: [u8; 4], port: u16, payload: &str) {
                 meta.src_ip[3],
                 meta.src_port,
                 body
-            ));
+            );
         }
-        Ok(None) => serial::write_line("curl: timeout waiting response"),
-        Err(err) => serial::write_fmt(format_args!("curl: failed ({})\n", err.as_str())),
+        Ok(None) => {
+            let _ = writeln!(out, "curl: timeout waiting response");
+        }
+        Err(err) => {
+            let _ = writeln!(out, "curl: failed ({})", err.as_str());
+        }
     }
+    out
 }
 
 pub fn udp_send(
@@ -2183,6 +2305,23 @@ pub fn log_last_udp() {
             preview
         ));
     });
+}
+
+pub fn last_udp() -> Option<LastUdpReport> {
+    with_net(|state| {
+        if !state.last_udp.valid {
+            return None;
+        }
+        let preview_len = state.last_udp.len.min(state.last_udp.preview.len());
+        Some(LastUdpReport {
+            src_ip: state.last_udp.src_ip,
+            src_port: state.last_udp.src_port,
+            dst_port: state.last_udp.dst_port,
+            len: state.last_udp.len,
+            preview: state.last_udp.preview,
+            preview_len,
+        })
+    })
 }
 
 pub fn parse_ipv4(text: &str) -> Option<[u8; 4]> {

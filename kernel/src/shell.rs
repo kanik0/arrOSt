@@ -24,6 +24,14 @@ const SERIAL_CAPTURE_HOLD_TICKS_MOVE: u64 = 12;
 const SERIAL_CAPTURE_HOLD_TICKS_ACTION: u64 = 14;
 const FILE_MANAGER_LIST_LINES: usize = 5;
 const FILE_MANAGER_PREVIEW_BYTES: usize = 180;
+const SERIAL_BIN_LS: &str = "/bin/ls";
+const SERIAL_BIN_PS: &str = "/bin/ps";
+const SERIAL_BIN_KILL: &str = "/bin/kill";
+const SERIAL_BIN_CAT: &str = "/bin/cat";
+const SERIAL_BIN_ECHO: &str = "/bin/echo";
+const SERIAL_BIN_FM: &str = "/bin/fm";
+const SERIAL_BIN_DOOM: &str = "/bin/doom";
+const SERIAL_BIN_TERMINAL: &str = "/bin/terminal";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -156,7 +164,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, ps, syscalls, ls, cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, ls [ /bin ], cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -304,32 +312,73 @@ fn run_command(shell: &mut ShellState) {
     };
     let input = input_owned.as_str();
 
-    if input == "ls" {
-        fs::list_to_serial();
+    if input == "ls /bin" || input == "/bin/ls /bin" {
+        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_bin_dir_listing());
+        return;
+    }
+    if input == "ls" || input == SERIAL_BIN_LS {
+        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command());
         return;
     }
 
-    if input == "cat" {
+    if input == "cat" || input == SERIAL_BIN_CAT {
         serial::write_line("usage: cat <file>");
         return;
     }
-    if let Some(path) = input.strip_prefix("cat ") {
+    if let Some(path) = input
+        .strip_prefix("cat ")
+        .or_else(|| input.strip_prefix("/bin/cat "))
+    {
         let path = path.trim();
         if path.is_empty() {
             serial::write_line("usage: cat <file>");
             return;
         }
-        fs::cat_to_serial(path);
+        with_shell_bin_process(SERIAL_BIN_CAT, |_pid| fs::cat_to_serial(path));
         return;
     }
 
     if let Some((text, path)) = parse_echo_redirect(input) {
-        fs::write_from_echo(path, text);
+        with_shell_bin_process(SERIAL_BIN_ECHO, |_pid| fs::write_from_echo(path, text));
         refresh_file_manager_list_view();
         return;
     }
-    if input.starts_with("echo ") || input == "echo" {
+    if input.starts_with("echo ")
+        || input == "echo"
+        || input.starts_with("/bin/echo ")
+        || input == "/bin/echo"
+    {
         serial::write_line("usage: echo <text> > <file>");
+        return;
+    }
+
+    if input == "terminal" || input == SERIAL_BIN_TERMINAL {
+        with_shell_bin_process(SERIAL_BIN_TERMINAL, |_pid| run_shell_terminal_command());
+        return;
+    }
+
+    if input == "doom"
+        || input == "doom status"
+        || input == SERIAL_BIN_DOOM
+        || input == "/bin/doom status"
+    {
+        with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_status_command());
+        return;
+    }
+    if input == "doom play" || input == "/bin/doom play" {
+        with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_play_command(shell));
+        return;
+    }
+    if input == "doom run" || input == "/bin/doom run" {
+        with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_run_command());
+        return;
+    }
+    if input == "doom stop" || input == "/bin/doom stop" {
+        with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_stop_command(shell));
+        return;
+    }
+    if input.starts_with("/bin/doom ") {
+        serial::write_line("usage: /bin/doom [status|play|run|stop]");
         return;
     }
 
@@ -542,7 +591,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | ps | syscalls | ls | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid> | syscalls | terminal | ls [ /bin ] | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal",
             );
         }
         "version" => {
@@ -723,8 +772,100 @@ fn run_command(shell: &mut ShellState) {
                 ));
             }
         }
-        "ps" => {
-            proc::log_process_table();
+        "waitx" => {
+            serial::write_line("usage: waitx <pid|any|all>");
+        }
+        "waitx any" => match proc::wait_any_external() {
+            proc::ExternalWaitAny::Exited { pid, code } => {
+                serial::write_fmt(format_args!(
+                    "external(wait): any pid={} exit={}\n",
+                    pid, code
+                ));
+            }
+            proc::ExternalWaitAny::Running => {
+                serial::write_line("external(wait): any running");
+            }
+            proc::ExternalWaitAny::NoChildren => {
+                serial::write_line("external(wait): any no-children");
+            }
+        },
+        "waitx all" => {
+            let report = proc::wait_all_external();
+            serial::write_fmt(format_args!(
+                "external(wait): all reaped={} running={}\n",
+                report.reaped, report.running
+            ));
+        }
+        _ if input.starts_with("waitx ") => {
+            let Some(pid_text) = input.strip_prefix("waitx ") else {
+                serial::write_line("usage: waitx <pid|any|all>");
+                return;
+            };
+            let Some(pid) = pid_text.trim().parse::<u32>().ok() else {
+                serial::write_line("usage: waitx <pid|any|all>");
+                return;
+            };
+            if pid == 0 {
+                serial::write_line("usage: waitx <pid|any|all>");
+                return;
+            }
+            let waited = proc::wait_external_pid(pid);
+            if waited == errno::EAGAIN {
+                serial::write_fmt(format_args!("external(wait): pid={} running\n", pid));
+            } else if waited >= 0 {
+                serial::write_fmt(format_args!(
+                    "external(wait): pid={} exit={}\n",
+                    pid, waited
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "external(wait): failed pid={} rc={} ({})\n",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                ));
+            }
+        }
+        "kill" => {
+            serial::write_line("usage: kill <pid>");
+        }
+        "/bin/kill" => serial::write_line("usage: /bin/kill <pid|self>"),
+        _ if input.starts_with("kill ") || input.starts_with("/bin/kill ") => {
+            let command_is_bin = input.starts_with("/bin/kill ");
+            let pid_text = if let Some(rest) = input.strip_prefix("kill ") {
+                rest
+            } else if let Some(rest) = input.strip_prefix("/bin/kill ") {
+                rest
+            } else {
+                serial::write_line("usage: kill <pid>");
+                return;
+            };
+            if pid_text.trim() == "self" {
+                if !command_is_bin {
+                    serial::write_line("usage: kill <pid>");
+                    return;
+                }
+                with_shell_bin_process(SERIAL_BIN_KILL, |active_pid| {
+                    let Some(pid) = active_pid else {
+                        serial::write_line("kill: self unavailable");
+                        return;
+                    };
+                    run_shell_kill_command(pid);
+                });
+                return;
+            }
+            let Some(pid) = pid_text.trim().parse::<u32>().ok() else {
+                serial::write_line("usage: kill <pid>");
+                return;
+            };
+            if pid == 0 {
+                serial::write_line("usage: kill <pid>");
+                return;
+            }
+            with_shell_bin_process(SERIAL_BIN_KILL, |_active_pid| run_shell_kill_command(pid));
+        }
+        "ps" | "/bin/ps" => {
+            with_shell_bin_process(SERIAL_BIN_PS, |_active_pid| run_shell_ps_command());
         }
         "syscalls" => {
             proc::log_syscall_stats();
@@ -732,54 +873,15 @@ fn run_command(shell: &mut ShellState) {
         "disk" => {
             storage::log_info();
         }
-        "doom" | "doom status" => doom::log_status(),
+        "terminal" | "/bin/terminal" => run_shell_terminal_command(),
+        "doom" | "doom status" | "/bin/doom" | "/bin/doom status" => {
+            run_shell_doom_status_command()
+        }
         "doom source" => doom::log_doomgeneric_info(),
         "doom doctor" => doom::log_doomgeneric_doctor(),
-        "doom play" => {
-            let start = doom::play(time::ticks());
-            match start {
-                doom::PlayStart::DoomGeneric => {
-                    serial::write_line("doom: play mode started (doomgeneric)");
-                }
-                doom::PlayStart::Fallback => {
-                    serial::write_line(
-                        "doom: doomgeneric not ready; starting fallback runtime (run scripts/vendor_doomgeneric.sh and provide user/doom/wad/doom1.wad)",
-                    );
-                }
-                doom::PlayStart::AlreadyRunning => {
-                    serial::write_line("doom: runtime already running");
-                }
-            }
-            if !matches!(start, doom::PlayStart::AlreadyRunning) {
-                if doom::set_capture(true) {
-                    shell.doom_capture = true;
-                    serial::write_line("doom: capture enabled (press ESC to exit)");
-                } else {
-                    shell.doom_capture = false;
-                    serial::write_line("doom: capture unavailable (fallback mode)");
-                }
-            }
-            doom::render_ui_status();
-        }
-        "doom run" => {
-            if doom::start(time::ticks()) {
-                serial::write_line("doom: runtime started");
-            } else {
-                serial::write_line("doom: runtime already running");
-            }
-            doom::render_ui_status();
-        }
-        "doom stop" => {
-            if doom::stop(time::ticks()) {
-                shell.release_all_serial_capture_keys();
-                shell.doom_capture = false;
-                let _ = doom::set_capture(false);
-                serial::write_line("doom: runtime stopped");
-            } else {
-                serial::write_line("doom: runtime already stopped");
-            }
-            doom::render_ui_status();
-        }
+        "doom play" | "/bin/doom play" => run_shell_doom_play_command(shell),
+        "doom run" | "/bin/doom run" => run_shell_doom_run_command(),
+        "doom stop" | "/bin/doom stop" => run_shell_doom_stop_command(shell),
         "doom ui" => {
             doom::render_ui_status();
             serial::write_line("doom: ui status pushed to doom window");
@@ -959,12 +1061,150 @@ fn run_ring3_groundwork_smoke() {
     }
 }
 
-fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
-    if !input.starts_with("echo ") {
-        return None;
+fn with_shell_bin_process(path: &'static str, run: impl FnOnce(Option<u32>)) {
+    if !fs::file_exists(path) {
+        serial::write_fmt(format_args!("shell(exec): missing bin={}\n", path));
+        run(None);
+        return;
     }
-    let (left, right) = input.split_once('>')?;
-    let text = left.strip_prefix("echo ")?.trim_end();
+    let pid_rc = proc::spawn_shell_bin_process(path);
+    let Ok(pid) = u32::try_from(pid_rc) else {
+        serial::write_fmt(format_args!(
+            "shell(exec): failed bin={} rc={} ({})\n",
+            path,
+            pid_rc,
+            errno::name(pid_rc)
+        ));
+        run(None);
+        return;
+    };
+    run(Some(pid));
+    let _ = proc::exit_external_process(pid);
+}
+
+fn run_shell_ps_command() {
+    proc::log_process_table();
+}
+
+fn run_shell_ls_command() {
+    fs::list_to_serial();
+    refresh_file_manager_list_view();
+}
+
+fn run_shell_bin_dir_listing() {
+    let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
+    let count = fs::list_entries(&mut entries);
+    let listed = entries
+        .iter()
+        .take(count)
+        .filter(|entry| entry.name().starts_with("bin/"))
+        .count();
+    serial::write_fmt(format_args!("ls: entries={}\n", listed));
+    for entry in entries.iter().take(count) {
+        if let Some(name) = entry.name().strip_prefix("bin/") {
+            serial::write_fmt(format_args!("/bin/{} (exec)\n", name));
+        }
+    }
+}
+
+fn run_shell_kill_command(pid: u32) {
+    if gfx::kill_process(pid) {
+        serial::write_fmt(format_args!("kill: pid={} rc=0\n", pid));
+        return;
+    }
+    let was_doom = {
+        let status = doom::status();
+        status.running && status.pid == pid
+    };
+    let rc = proc::kill_process(pid);
+    if rc == 0 {
+        if was_doom {
+            let _ = doom::stop(time::ticks());
+        }
+        serial::write_fmt(format_args!("kill: pid={} rc=0\n", pid));
+    } else {
+        serial::write_fmt(format_args!(
+            "kill: failed pid={} rc={} ({})\n",
+            pid,
+            rc,
+            errno::name(rc)
+        ));
+    }
+}
+
+fn run_shell_terminal_command() {
+    if gfx::launch_terminal() {
+        serial::write_line("terminal: launched");
+    } else {
+        serial::write_line("terminal: unavailable");
+    }
+}
+
+fn run_shell_doom_status_command() {
+    doom::log_status();
+}
+
+fn run_shell_doom_play_command(shell: &mut ShellState) {
+    let start = doom::play(time::ticks());
+    match start {
+        doom::PlayStart::DoomGeneric => {
+            serial::write_line("doom: play mode started (doomgeneric)");
+        }
+        doom::PlayStart::Fallback => {
+            serial::write_line(
+                "doom: doomgeneric not ready; starting fallback runtime (run scripts/vendor_doomgeneric.sh and provide user/doom/wad/doom1.wad)",
+            );
+        }
+        doom::PlayStart::AlreadyRunning => {
+            serial::write_line("doom: runtime already running");
+        }
+    }
+    if !matches!(start, doom::PlayStart::AlreadyRunning) {
+        if doom::set_capture(true) {
+            shell.doom_capture = true;
+            serial::write_line("doom: capture enabled (press ESC to exit)");
+        } else {
+            shell.doom_capture = false;
+            serial::write_line("doom: capture unavailable (fallback mode)");
+        }
+    }
+    doom::render_ui_status();
+}
+
+fn run_shell_doom_run_command() {
+    if doom::start(time::ticks()) {
+        serial::write_line("doom: runtime started");
+    } else {
+        serial::write_line("doom: runtime already running");
+    }
+    doom::render_ui_status();
+}
+
+fn run_shell_doom_stop_command(shell: &mut ShellState) {
+    if doom::stop(time::ticks()) {
+        shell.release_all_serial_capture_keys();
+        shell.doom_capture = false;
+        let _ = doom::set_capture(false);
+        serial::write_line("doom: runtime stopped");
+    } else {
+        serial::write_line("doom: runtime already stopped");
+    }
+    doom::render_ui_status();
+}
+
+fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
+    let left = if input.starts_with("echo ") {
+        input
+    } else if input.starts_with("/bin/echo ") {
+        input
+    } else {
+        return None;
+    };
+    let (left, right) = left.split_once('>')?;
+    let text = left
+        .strip_prefix("echo ")
+        .or_else(|| left.strip_prefix("/bin/echo "))?
+        .trim_end();
     let path = right.trim();
     if path.is_empty() {
         return None;
@@ -1037,63 +1277,80 @@ fn parse_file_manager_copy(input: &str) -> Option<(&str, &str)> {
 
 fn handle_file_manager_command(input: &str) -> bool {
     match input {
-        "fm" | "fm list" => {
-            fs::list_to_serial();
-            refresh_file_manager_list_view();
+        "fm" | "fm list" | "/bin/fm" | "/bin/fm list" => {
+            with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
+                fs::list_to_serial();
+                refresh_file_manager_list_view();
+            });
             true
         }
-        "fm open" => {
+        "fm open" | "/bin/fm open" => {
             serial::write_line("usage: fm open <file>");
             true
         }
-        "fm copy" => {
+        "fm copy" | "/bin/fm copy" => {
             serial::write_line("usage: fm copy <src> <dst>");
             true
         }
-        "fm delete" => {
+        "fm delete" | "/bin/fm delete" => {
             serial::write_line("usage: fm delete <file>");
             true
         }
         _ => {
-            if let Some(path) = input.strip_prefix("fm open ") {
+            if let Some(path) = input
+                .strip_prefix("fm open ")
+                .or_else(|| input.strip_prefix("/bin/fm open "))
+            {
                 let path = path.trim();
                 if path.is_empty() {
                     serial::write_line("usage: fm open <file>");
                 } else {
-                    let mut buffer = [0u8; fs::MAX_FILE_BYTES];
-                    match fs::read_file(path, &mut buffer) {
-                        Ok(len) => {
-                            fs::cat_to_serial(path);
-                            refresh_file_manager_preview_view(path, &buffer[..len]);
+                    with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
+                        let mut buffer = [0u8; fs::MAX_FILE_BYTES];
+                        match fs::read_file(path, &mut buffer) {
+                            Ok(len) => {
+                                fs::cat_to_serial(path);
+                                refresh_file_manager_preview_view(path, &buffer[..len]);
+                            }
+                            Err(err) => serial::write_fmt(format_args!(
+                                "fm: open {} ({})\n",
+                                path,
+                                err.as_str()
+                            )),
                         }
-                        Err(err) => serial::write_fmt(format_args!(
-                            "fm: open {} ({})\n",
-                            path,
-                            err.as_str()
-                        )),
-                    }
+                    });
                 }
                 return true;
             }
 
-            if let Some(rest) = input.strip_prefix("fm copy ") {
+            if let Some(rest) = input
+                .strip_prefix("fm copy ")
+                .or_else(|| input.strip_prefix("/bin/fm copy "))
+            {
                 match parse_file_manager_copy(rest) {
                     Some((source, destination)) => {
-                        fs::copy_file_to_serial(source, destination);
-                        refresh_file_manager_list_view();
+                        with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
+                            fs::copy_file_to_serial(source, destination);
+                            refresh_file_manager_list_view();
+                        });
                     }
                     None => serial::write_line("usage: fm copy <src> <dst>"),
                 }
                 return true;
             }
 
-            if let Some(path) = input.strip_prefix("fm delete ") {
+            if let Some(path) = input
+                .strip_prefix("fm delete ")
+                .or_else(|| input.strip_prefix("/bin/fm delete "))
+            {
                 let path = path.trim();
                 if path.is_empty() {
                     serial::write_line("usage: fm delete <file>");
                 } else {
-                    fs::delete_file_to_serial(path);
-                    refresh_file_manager_list_view();
+                    with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
+                        fs::delete_file_to_serial(path);
+                        refresh_file_manager_list_view();
+                    });
                 }
                 return true;
             }

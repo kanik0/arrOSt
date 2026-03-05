@@ -51,6 +51,21 @@ pub struct MouseInitReport {
     pub ack_enable: u8,
 }
 
+#[derive(Clone, Copy)]
+pub struct MouseStatus {
+    pub backend: &'static str,
+    pub ready: bool,
+    pub bytes: u64,
+    pub packets: u64,
+    pub dropped: u64,
+    pub bad_sync: u64,
+    pub ctrl_before: u8,
+    pub ctrl_after: u8,
+    pub ack_defaults: u8,
+    pub ack_enable: u8,
+    pub last_event: Option<MouseEvent>,
+}
+
 struct EventStorage(UnsafeCell<[MouseEvent; EVENT_QUEUE_CAPACITY]>);
 struct PacketStorage(UnsafeCell<[u8; 3]>);
 struct LastEventCell(UnsafeCell<MouseEvent>);
@@ -153,36 +168,20 @@ pub fn pop_event() -> Option<MouseEvent> {
 }
 
 pub fn log_info() {
-    let ready = READY.load(Ordering::Acquire);
-    let backend = match BACKEND_KIND.load(Ordering::Acquire) {
-        1 => "ps2",
-        2 => "virtio-input",
-        _ => "none",
-    };
-    let bytes = BYTES_RX.load(Ordering::Relaxed);
-    let packets = PACKETS_RX.load(Ordering::Relaxed);
-    let dropped = EVENTS_DROPPED.load(Ordering::Relaxed);
-    let bad_sync = BAD_SYNC.load(Ordering::Relaxed);
-    let ctrl_before = CTRL_BEFORE.load(Ordering::Acquire) as u8;
-    let ctrl_after = CTRL_AFTER.load(Ordering::Acquire) as u8;
-    let ack_defaults = ACK_DEFAULTS.load(Ordering::Acquire) as u8;
-    let ack_enable = ACK_ENABLE.load(Ordering::Acquire) as u8;
-
-    if HAS_LAST_EVENT.load(Ordering::Acquire) {
-        // SAFETY: last event is written by IRQ producer before setting HAS_LAST_EVENT.
-        let last = unsafe { *LAST_EVENT.0.get() };
+    let status = status();
+    if let Some(last) = status.last_event {
         serial::write_fmt(format_args!(
             "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=dx:{} dy:{} l:{} r:{} m:{}\n",
-            backend,
-            ready,
-            bytes,
-            packets,
-            dropped,
-            bad_sync,
-            ctrl_before,
-            ctrl_after,
-            ack_defaults,
-            ack_enable,
+            status.backend,
+            status.ready,
+            status.bytes,
+            status.packets,
+            status.dropped,
+            status.bad_sync,
+            status.ctrl_before,
+            status.ctrl_after,
+            status.ack_defaults,
+            status.ack_enable,
             last.dx,
             last.dy,
             last.left_button,
@@ -192,17 +191,44 @@ pub fn log_info() {
     } else {
         serial::write_fmt(format_args!(
             "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=none\n",
-            backend,
-            ready,
-            bytes,
-            packets,
-            dropped,
-            bad_sync,
-            ctrl_before,
-            ctrl_after,
-            ack_defaults,
-            ack_enable
+            status.backend,
+            status.ready,
+            status.bytes,
+            status.packets,
+            status.dropped,
+            status.bad_sync,
+            status.ctrl_before,
+            status.ctrl_after,
+            status.ack_defaults,
+            status.ack_enable
         ));
+    }
+}
+
+pub fn status() -> MouseStatus {
+    let backend = match BACKEND_KIND.load(Ordering::Acquire) {
+        1 => "ps2",
+        2 => "virtio-input",
+        _ => "none",
+    };
+    let last_event = if HAS_LAST_EVENT.load(Ordering::Acquire) {
+        // SAFETY: last event is written by IRQ producer before setting HAS_LAST_EVENT.
+        Some(unsafe { *LAST_EVENT.0.get() })
+    } else {
+        None
+    };
+    MouseStatus {
+        backend,
+        ready: READY.load(Ordering::Acquire),
+        bytes: BYTES_RX.load(Ordering::Relaxed),
+        packets: PACKETS_RX.load(Ordering::Relaxed),
+        dropped: EVENTS_DROPPED.load(Ordering::Relaxed),
+        bad_sync: BAD_SYNC.load(Ordering::Relaxed),
+        ctrl_before: CTRL_BEFORE.load(Ordering::Acquire) as u8,
+        ctrl_after: CTRL_AFTER.load(Ordering::Acquire) as u8,
+        ack_defaults: ACK_DEFAULTS.load(Ordering::Acquire) as u8,
+        ack_enable: ACK_ENABLE.load(Ordering::Acquire) as u8,
+        last_event,
     }
 }
 

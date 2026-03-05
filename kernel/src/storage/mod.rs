@@ -504,6 +504,10 @@ pub fn capacity_sectors() -> u64 {
     with_storage(|state| state.capacity_sectors)
 }
 
+pub fn status() -> StorageInitReport {
+    with_storage(|state| state.report())
+}
+
 pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> Result<(), StorageError> {
     with_storage_mut(|state| state.read_sector(sector, out))
 }

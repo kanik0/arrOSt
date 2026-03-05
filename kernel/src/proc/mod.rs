@@ -25,10 +25,12 @@ use ring3_groundwork::{
 
 const MAX_TASKS: usize = 4;
 const MAX_RING3_TASKS: usize = 8;
+const MAX_EXTERNAL_TASKS: usize = 12;
 const MAX_LINE_LEN: usize = 96;
 const MAX_WRITE_BYTES: usize = 256;
 const MAX_RING3_IO_BYTES: usize = 4096;
 const RING3_SYSCALL_TIMESLICE: u32 = 8;
+const KILL_EXIT_CODE: i32 = 137;
 const USER_SHELL_SCRIPT: &[u8] = b"";
 const TASK_CAP_INIT: u32 = user_init::required_caps();
 const TASK_CAP_SHELL: u32 = caps::ALL;
@@ -60,6 +62,96 @@ pub enum UserWaitAny {
 pub struct UserWaitAllReport {
     pub reaped: u32,
     pub running: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum ExternalWaitAny {
+    Exited { pid: u32, code: i32 },
+    Running,
+    NoChildren,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExternalWaitAllReport {
+    pub reaped: u32,
+    pub running: u32,
+}
+
+pub const MAX_PROCESS_SNAPSHOTS: usize = MAX_TASKS + MAX_RING3_TASKS + MAX_EXTERNAL_TASKS;
+pub const MAX_USER_APP_INFOS: usize = USER_APP_IDS.len();
+
+#[derive(Clone, Copy)]
+pub enum ProcessDomain {
+    Cooperative,
+    Ring3,
+    External,
+}
+
+impl ProcessDomain {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cooperative => "coop",
+            Self::Ring3 => "ring3",
+            Self::External => "external",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ProcessState {
+    Ready,
+    Running,
+    Sleeping { until_tick: u64 },
+    Exited { code: i32 },
+    Faulted,
+}
+
+impl ProcessState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Sleeping { .. } => "sleep",
+            Self::Exited { .. } => "exited",
+            Self::Faulted => "faulted",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: &'static str,
+    pub syscall_caps: u32,
+    pub domain: ProcessDomain,
+    pub state: ProcessState,
+    pub external_kind: Option<&'static str>,
+    pub tty: Option<u32>,
+}
+
+impl ProcessSnapshot {
+    pub const fn empty() -> Self {
+        Self {
+            pid: 0,
+            parent_pid: 0,
+            name: "",
+            syscall_caps: 0,
+            domain: ProcessDomain::Cooperative,
+            state: ProcessState::Ready,
+            external_kind: None,
+            tty: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct UserAppInfo {
+    pub app_id: u64,
+    pub app_name: &'static str,
+    pub syscall_caps: u32,
+    pub sleep_ticks: u64,
+    pub exit_code: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -274,6 +366,38 @@ enum TaskKind {
 }
 
 #[derive(Clone, Copy)]
+enum ExternalTaskKind {
+    Terminal,
+    DoomRuntime,
+    Binary,
+}
+
+impl ExternalTaskKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::DoomRuntime => "doom-runtime",
+            Self::Binary => "binary",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExternalTaskState {
+    Running,
+    Exited { code: i32 },
+}
+
+impl ExternalTaskState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited { .. } => "exited",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct UserAppContract {
     app_id: u64,
     app_name: &'static str,
@@ -333,6 +457,38 @@ impl Task {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExternalTask {
+    pid: u32,
+    parent_pid: u32,
+    name: &'static str,
+    kind: ExternalTaskKind,
+    state: ExternalTaskState,
+    syscall_caps: u32,
+    tty: Option<u32>,
+}
+
+impl ExternalTask {
+    const fn new(
+        pid: u32,
+        parent_pid: u32,
+        name: &'static str,
+        kind: ExternalTaskKind,
+        syscall_caps: u32,
+        tty: Option<u32>,
+    ) -> Self {
+        Self {
+            pid,
+            parent_pid,
+            name,
+            kind,
+            state: ExternalTaskState::Running,
+            syscall_caps,
+            tty,
+        }
+    }
+}
+
 struct InputScript {
     data: &'static [u8],
     index: usize,
@@ -374,6 +530,7 @@ struct Scheduler {
     cursor: usize,
     tasks: [Option<Task>; MAX_TASKS],
     ring3_tasks: [Option<Ring3Task>; MAX_RING3_TASKS],
+    external_tasks: [Option<ExternalTask>; MAX_EXTERNAL_TASKS],
     ring3_cursor: usize,
     ring3_active_slot: Option<usize>,
     ring3_active_sleep_until: u64,
@@ -394,6 +551,7 @@ impl Scheduler {
             cursor: 0,
             tasks: [None; MAX_TASKS],
             ring3_tasks: [None; MAX_RING3_TASKS],
+            external_tasks: [None; MAX_EXTERNAL_TASKS],
             ring3_cursor: 0,
             ring3_active_slot: None,
             ring3_active_sleep_until: 0,
@@ -1278,7 +1436,9 @@ impl Scheduler {
             return Err(errno::ENODEV);
         }
 
-        let pid = self.next_pid;
+        let Some(pid) = self.take_next_pid() else {
+            return Err(errno::ENODEV);
+        };
         let context = Ring3ProcessContext::new(pid, contract.worker_name, contract.syscall_caps);
         let image = ring3_groundwork::load_native_process_image(elf).map_err(|error| {
             serial::write_fmt(format_args!("ring3 run: ELF load failed: {error}\n"));
@@ -1303,7 +1463,6 @@ impl Scheduler {
             process,
             image_ptr,
         });
-        self.next_pid = self.next_pid.saturating_add(1);
         Ok(pid)
     }
 
@@ -2162,6 +2321,15 @@ impl Scheduler {
         }
     }
 
+    fn take_next_pid(&mut self) -> Option<u32> {
+        let pid = self.next_pid;
+        if pid == 0 {
+            return None;
+        }
+        self.next_pid = self.next_pid.checked_add(1)?;
+        Some(pid)
+    }
+
     fn spawn_task(&mut self, name: &'static str, kind: TaskKind, syscall_caps: u32) -> Option<u32> {
         self.spawn_task_with_parent(name, kind, syscall_caps, 0)
     }
@@ -2173,14 +2341,285 @@ impl Scheduler {
         syscall_caps: u32,
         parent_pid: u32,
     ) -> Option<u32> {
-        let pid = self.next_pid;
-        self.next_pid = self.next_pid.saturating_add(1);
+        let pid = self.take_next_pid()?;
 
         for slot in &mut self.tasks {
             if slot.is_none() {
                 *slot = Some(Task::new(pid, parent_pid, name, kind, syscall_caps));
                 return Some(pid);
             }
+        }
+        None
+    }
+
+    fn register_external_task(
+        &mut self,
+        name: &'static str,
+        kind: ExternalTaskKind,
+        parent_pid: u32,
+        syscall_caps: u32,
+        tty: Option<u32>,
+    ) -> Result<u32, isize> {
+        let Some(slot_index) = self.external_tasks.iter().position(|slot| match slot {
+            None => true,
+            Some(task) => matches!(task.state, ExternalTaskState::Exited { .. }),
+        }) else {
+            return Err(errno::ENODEV);
+        };
+        let Some(pid) = self.take_next_pid() else {
+            return Err(errno::ENODEV);
+        };
+        self.external_tasks[slot_index] = Some(ExternalTask::new(
+            pid,
+            parent_pid,
+            name,
+            kind,
+            syscall_caps,
+            tty,
+        ));
+        Ok(pid)
+    }
+
+    fn unregister_external_task(&mut self, pid: u32, code: i32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        for slot in &mut self.external_tasks {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if task.pid == pid {
+                if matches!(task.state, ExternalTaskState::Running) {
+                    task.state = ExternalTaskState::Exited { code };
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn wait_external_pid(&mut self, requester_pid: u32, wait_pid: u32) -> isize {
+        if wait_pid == 0 || wait_pid == requester_pid {
+            return errno::EINVAL;
+        }
+
+        for slot in &mut self.external_tasks {
+            let Some(task) = slot else {
+                continue;
+            };
+            if task.pid != wait_pid {
+                continue;
+            }
+            if !is_external_child_task(task, requester_pid) {
+                return errno::EPERM;
+            }
+            match task.state {
+                ExternalTaskState::Running => return errno::EAGAIN,
+                ExternalTaskState::Exited { code } => {
+                    *slot = None;
+                    return code as isize;
+                }
+            }
+        }
+        errno::EINVAL
+    }
+
+    fn wait_any_external(&mut self, requester_pid: u32) -> ExternalWaitAny {
+        let mut has_children = false;
+        for slot in &mut self.external_tasks {
+            let Some(task) = slot else {
+                continue;
+            };
+            if !is_external_child_task(task, requester_pid) {
+                continue;
+            }
+            has_children = true;
+            if let ExternalTaskState::Exited { code } = task.state {
+                let pid = task.pid;
+                *slot = None;
+                return ExternalWaitAny::Exited { pid, code };
+            }
+        }
+        if has_children {
+            ExternalWaitAny::Running
+        } else {
+            ExternalWaitAny::NoChildren
+        }
+    }
+
+    fn reap_all_external(&mut self, requester_pid: u32) -> ExternalWaitAllReport {
+        let mut report = ExternalWaitAllReport {
+            reaped: 0,
+            running: 0,
+        };
+        for slot in &mut self.external_tasks {
+            let Some(task) = slot else {
+                continue;
+            };
+            if !is_external_child_task(task, requester_pid) {
+                continue;
+            }
+            if matches!(task.state, ExternalTaskState::Exited { .. }) {
+                *slot = None;
+                report.reaped = report.reaped.saturating_add(1);
+            } else {
+                report.running = report.running.saturating_add(1);
+            }
+        }
+        report
+    }
+
+    fn snapshot_processes(&self, out: &mut [ProcessSnapshot]) -> usize {
+        let mut written = 0usize;
+        for task in self.tasks.iter().flatten() {
+            if written >= out.len() {
+                return written;
+            }
+            let state = match task.state {
+                TaskState::Ready => ProcessState::Ready,
+                TaskState::Sleeping { until_tick } => ProcessState::Sleeping { until_tick },
+                TaskState::Exited { code } => ProcessState::Exited { code },
+            };
+            out[written] = ProcessSnapshot {
+                pid: task.pid,
+                parent_pid: task.parent_pid,
+                name: task.name,
+                syscall_caps: task.syscall_caps,
+                domain: ProcessDomain::Cooperative,
+                state,
+                external_kind: None,
+                tty: None,
+            };
+            written = written.saturating_add(1);
+        }
+
+        for task in self.ring3_tasks.iter().flatten() {
+            if written >= out.len() {
+                return written;
+            }
+            let state = match task.state {
+                Ring3TaskState::Ready => ProcessState::Ready,
+                Ring3TaskState::Running => ProcessState::Running,
+                Ring3TaskState::Sleeping { until_tick } => ProcessState::Sleeping { until_tick },
+                Ring3TaskState::Exited { code } => ProcessState::Exited { code },
+                Ring3TaskState::Faulted => ProcessState::Faulted,
+            };
+            out[written] = ProcessSnapshot {
+                pid: task.pid,
+                parent_pid: task.parent_pid,
+                name: task.name,
+                syscall_caps: task.syscall_caps,
+                domain: ProcessDomain::Ring3,
+                state,
+                external_kind: None,
+                tty: None,
+            };
+            written = written.saturating_add(1);
+        }
+
+        for task in self.external_tasks.iter().flatten() {
+            if written >= out.len() {
+                return written;
+            }
+            let state = match task.state {
+                ExternalTaskState::Running => ProcessState::Running,
+                ExternalTaskState::Exited { code } => ProcessState::Exited { code },
+            };
+            out[written] = ProcessSnapshot {
+                pid: task.pid,
+                parent_pid: task.parent_pid,
+                name: task.name,
+                syscall_caps: task.syscall_caps,
+                domain: ProcessDomain::External,
+                state,
+                external_kind: Some(task.kind.as_str()),
+                tty: task.tty,
+            };
+            written = written.saturating_add(1);
+        }
+
+        written
+    }
+
+    fn kill_process(&mut self, pid: u32) -> isize {
+        if pid == 0 {
+            return errno::EINVAL;
+        }
+        if let Some(code) = self.kill_cooperative_task(pid) {
+            return code;
+        }
+        if let Some(code) = self.kill_ring3_task(pid) {
+            return code;
+        }
+        if let Some(code) = self.kill_external_task(pid) {
+            return code;
+        }
+        errno::EINVAL
+    }
+
+    fn kill_cooperative_task(&mut self, pid: u32) -> Option<isize> {
+        for slot in &mut self.tasks {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if task.pid != pid {
+                continue;
+            }
+            if matches!(task.kind, TaskKind::Init | TaskKind::Shell) {
+                return Some(errno::EPERM);
+            }
+            if !matches!(task.state, TaskState::Exited { .. }) {
+                task.state = TaskState::Exited {
+                    code: KILL_EXIT_CODE,
+                };
+            }
+            return Some(0);
+        }
+        None
+    }
+
+    fn kill_ring3_task(&mut self, pid: u32) -> Option<isize> {
+        for index in 0..MAX_RING3_TASKS {
+            let Some(task) = self.ring3_tasks[index].as_mut() else {
+                continue;
+            };
+            if task.pid != pid {
+                continue;
+            }
+            if !matches!(
+                task.state,
+                Ring3TaskState::Exited { .. } | Ring3TaskState::Faulted
+            ) {
+                task.state = Ring3TaskState::Exited {
+                    code: KILL_EXIT_CODE,
+                };
+                task.process.state = Ring3ProcessState::Exited;
+            }
+            if self.ring3_active_slot == Some(index) {
+                self.ring3_active_sleep_until = 0;
+                self.ring3_active_exit_code = KILL_EXIT_CODE;
+                self.ring3_active_syscalls = 0;
+                self.ring3_context.process.state = Ring3ProcessState::Exited;
+            }
+            return Some(0);
+        }
+        None
+    }
+
+    fn kill_external_task(&mut self, pid: u32) -> Option<isize> {
+        for slot in &mut self.external_tasks {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if task.pid != pid {
+                continue;
+            }
+            if matches!(task.state, ExternalTaskState::Running) {
+                task.state = ExternalTaskState::Exited {
+                    code: KILL_EXIT_CODE,
+                };
+            }
+            return Some(0);
         }
         None
     }
@@ -2194,12 +2633,44 @@ impl Scheduler {
         None
     }
 
-    fn count_tasks(&self) -> usize {
+    fn count_kernel_tasks(&self) -> usize {
         self.tasks.iter().flatten().count()
     }
 
+    fn count_external_tasks(&self) -> usize {
+        self.external_tasks.iter().flatten().count()
+    }
+
+    fn count_external_running_tasks(&self) -> usize {
+        self.external_tasks
+            .iter()
+            .flatten()
+            .filter(|task| matches!(task.state, ExternalTaskState::Running))
+            .count()
+    }
+
+    fn count_external_exited_tasks(&self) -> usize {
+        self.external_tasks
+            .iter()
+            .flatten()
+            .filter(|task| matches!(task.state, ExternalTaskState::Exited { .. }))
+            .count()
+    }
+
+    fn count_tasks(&self) -> usize {
+        self.count_kernel_tasks()
+            .saturating_add(self.count_external_tasks())
+    }
+
     fn log_tasks(&self) {
-        serial::write_fmt(format_args!("proc: tasks={}\n", self.count_tasks()));
+        serial::write_fmt(format_args!(
+            "proc: tasks={} kernel={} external={} ext_running={} ext_exited={}\n",
+            self.count_tasks(),
+            self.count_kernel_tasks(),
+            self.count_external_tasks(),
+            self.count_external_running_tasks(),
+            self.count_external_exited_tasks()
+        ));
         for task in self.tasks.iter().flatten() {
             match task.state {
                 TaskState::Ready => {
@@ -2219,6 +2690,64 @@ impl Scheduler {
                         "proc: pid={} parent={} name={} caps={:#x} state=exited code={}\n",
                         task.pid, task.parent_pid, task.name, task.syscall_caps, code
                     ));
+                }
+            }
+        }
+        for task in self.external_tasks.iter().flatten() {
+            let state = task.state.as_str();
+            if let Some(tty) = task.tty {
+                match task.state {
+                    ExternalTaskState::Running => {
+                        serial::write_fmt(format_args!(
+                            "proc: pid={} parent={} name={} caps={:#x} state={} kind={} tty={}\n",
+                            task.pid,
+                            task.parent_pid,
+                            task.name,
+                            task.syscall_caps,
+                            state,
+                            task.kind.as_str(),
+                            tty
+                        ));
+                    }
+                    ExternalTaskState::Exited { code } => {
+                        serial::write_fmt(format_args!(
+                            "proc: pid={} parent={} name={} caps={:#x} state={} code={} kind={} tty={}\n",
+                            task.pid,
+                            task.parent_pid,
+                            task.name,
+                            task.syscall_caps,
+                            state,
+                            code,
+                            task.kind.as_str(),
+                            tty
+                        ));
+                    }
+                }
+            } else {
+                match task.state {
+                    ExternalTaskState::Running => {
+                        serial::write_fmt(format_args!(
+                            "proc: pid={} parent={} name={} caps={:#x} state={} kind={}\n",
+                            task.pid,
+                            task.parent_pid,
+                            task.name,
+                            task.syscall_caps,
+                            state,
+                            task.kind.as_str()
+                        ));
+                    }
+                    ExternalTaskState::Exited { code } => {
+                        serial::write_fmt(format_args!(
+                            "proc: pid={} parent={} name={} caps={:#x} state={} code={} kind={}\n",
+                            task.pid,
+                            task.parent_pid,
+                            task.name,
+                            task.syscall_caps,
+                            state,
+                            code,
+                            task.kind.as_str()
+                        ));
+                    }
                 }
             }
         }
@@ -2368,6 +2897,10 @@ fn is_user_child_task(task: &Task, parent_pid: u32) -> bool {
     task.parent_pid == parent_pid && is_user_worker_kind(task.kind)
 }
 
+fn is_external_child_task(task: &ExternalTask, parent_pid: u32) -> bool {
+    task.parent_pid == parent_pid
+}
+
 fn parse_cap_drop_mask(text: &str) -> Option<u32> {
     match text {
         "core" => Some(caps::CORE),
@@ -2441,6 +2974,10 @@ pub fn log_syscall_stats() {
     with_scheduler(|scheduler| scheduler.log_syscall_stats());
 }
 
+pub fn syscall_stats() -> SyscallStats {
+    with_scheduler(|scheduler| scheduler.stats)
+}
+
 pub fn log_user_app_registry() {
     for app_id in USER_APP_IDS {
         let Some(contract) = user_app_contract(app_id) else {
@@ -2455,6 +2992,27 @@ pub fn log_user_app_registry() {
             contract.exit_code
         ));
     }
+}
+
+pub fn user_app_registry(out: &mut [UserAppInfo]) -> usize {
+    let mut written = 0usize;
+    for app_id in USER_APP_IDS {
+        if written >= out.len() {
+            break;
+        }
+        let Some(contract) = user_app_contract(app_id) else {
+            continue;
+        };
+        out[written] = UserAppInfo {
+            app_id: contract.app_id,
+            app_name: contract.app_name,
+            syscall_caps: contract.syscall_caps,
+            sleep_ticks: contract.sleep_ticks,
+            exit_code: contract.exit_code,
+        };
+        written = written.saturating_add(1);
+    }
+    written
 }
 
 pub fn spawn_user_app(app_id: u64) -> isize {
@@ -2497,6 +3055,116 @@ pub fn wait_all_user() -> UserWaitAllReport {
         };
         scheduler.reap_all_task_exits(shell_pid)
     })
+}
+
+pub fn wait_external_pid(pid: u32) -> isize {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return errno::ENODEV;
+        };
+        scheduler.wait_external_pid(shell_pid, pid)
+    })
+}
+
+pub fn wait_any_external() -> ExternalWaitAny {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return ExternalWaitAny::NoChildren;
+        };
+        scheduler.wait_any_external(shell_pid)
+    })
+}
+
+pub fn wait_all_external() -> ExternalWaitAllReport {
+    with_scheduler(|scheduler| {
+        let Some(shell_pid) = scheduler.find_pid("sh") else {
+            return ExternalWaitAllReport {
+                reaped: 0,
+                running: 0,
+            };
+        };
+        scheduler.reap_all_external(shell_pid)
+    })
+}
+
+pub fn spawn_terminal_process(tty: u32) -> isize {
+    with_scheduler(|scheduler| {
+        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
+        match scheduler.register_external_task(
+            "terminal",
+            ExternalTaskKind::Terminal,
+            parent_pid,
+            TASK_CAP_SHELL,
+            Some(tty),
+        ) {
+            Ok(pid) => pid as isize,
+            Err(error) => error,
+        }
+    })
+}
+
+pub fn spawn_doom_runtime_process() -> isize {
+    with_scheduler(|scheduler| {
+        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
+        match scheduler.register_external_task(
+            "doom",
+            ExternalTaskKind::DoomRuntime,
+            parent_pid,
+            user_doom::required_caps(),
+            None,
+        ) {
+            Ok(pid) => pid as isize,
+            Err(error) => error,
+        }
+    })
+}
+
+pub fn spawn_terminal_bin_process(path: &'static str, tty: u32) -> isize {
+    with_scheduler(|scheduler| {
+        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
+        match scheduler.register_external_task(
+            path,
+            ExternalTaskKind::Binary,
+            parent_pid,
+            TASK_CAP_SHELL,
+            Some(tty),
+        ) {
+            Ok(pid) => pid as isize,
+            Err(error) => error,
+        }
+    })
+}
+
+pub fn spawn_shell_bin_process(path: &'static str) -> isize {
+    with_scheduler(|scheduler| {
+        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
+        match scheduler.register_external_task(
+            path,
+            ExternalTaskKind::Binary,
+            parent_pid,
+            TASK_CAP_SHELL,
+            None,
+        ) {
+            Ok(pid) => pid as isize,
+            Err(error) => error,
+        }
+    })
+}
+
+pub fn exit_external_process(pid: u32) -> bool {
+    exit_external_process_with_code(pid, 0)
+}
+
+pub fn exit_external_process_with_code(pid: u32, code: i32) -> bool {
+    with_scheduler(|scheduler| scheduler.unregister_external_task(pid, code))
+}
+
+pub fn snapshot_processes(out: &mut [ProcessSnapshot]) -> usize {
+    with_scheduler(|scheduler| scheduler.snapshot_processes(out))
+}
+
+pub fn kill_process(pid: u32) -> isize {
+    with_scheduler(|scheduler| scheduler.kill_process(pid))
 }
 
 pub fn arm_ring3_context(process: Ring3ProcessContext) -> bool {

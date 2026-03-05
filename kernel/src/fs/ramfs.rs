@@ -45,11 +45,11 @@ impl RamFs {
 
     fn normalize_name(path: &str) -> Result<&str, FsError> {
         let trimmed = path.trim();
-        let name = match trimmed.strip_prefix('/') {
-            Some(rest) => rest,
-            None => trimmed,
-        };
-        if name.is_empty() || name.contains('/') {
+        let mut name = trimmed;
+        while let Some(rest) = name.strip_prefix('/') {
+            name = rest;
+        }
+        if name.is_empty() || name.ends_with('/') || name.contains("//") {
             return Err(FsError::InvalidPath);
         }
         if name.len() > MAX_FILE_NAME_BYTES {

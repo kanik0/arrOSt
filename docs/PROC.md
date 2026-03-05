@@ -6,6 +6,8 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 
 - Fixed small cooperative kernel task table (`init`, `sh`, workers).
 - Dedicated ring-3 process table for ELF user processes (`init`, `doom`) with parent ownership (`sh`) and explicit reap.
+- Additional scheduler-managed external process table for compositor-launched runtime entries (GUI terminals and Doom runtime session).
+- External table also hosts short-lived shell/GUI binary exec entries (filesystem-backed `/bin/*` commands).
 - Ring-3 runtime state machine: `ready`, `running`, `sleep`, `exited`, `faulted`.
 - Round-robin ring-3 scheduling with syscall-timeslice preemption (`yield/sleep/exit` force kernel return; other syscalls can be timesliced).
 - Per-task syscall capability masks (coarse-grained isolation step).
@@ -20,6 +22,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Shell command `ring3 run <init|doom>` now enqueues ring-3 processes into the multiprocess scheduler (non-blocking).
 - Shell commands `ring3 ps` and `ring3 wait <pid|any|all>` expose ring-3 process table and reap flow.
 - Cross-platform `xtask` smoke `smoke-ring3-run` now validates multiprocess runtime (`init` + `doom`) and ring-3 preemption points (`yield/sleep/exit`).
+- Unified `kill <pid>` path now targets cooperative, ring-3, and external scheduler entries.
 
 ## Responsibilities
 
@@ -39,9 +42,19 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `ring3 ps`
 - `ring3 wait <pid|any|all>`
 - `ps`
+- `kill <pid>`
+- `/bin/ls`
+- `/bin/ps`
+- `/bin/kill <pid|self>`
+- `/bin/cat <file>`
+- `/bin/echo <text> > <file>`
+- `/bin/fm [list|open|copy|delete]`
+- `/bin/doom [status|play|run|stop]`
+- `/bin/terminal`
 - `syscalls`
 - `spawn <init|doom>`
 - `wait <pid|any|all>`
+- `waitx <pid|any|all>`
 
 ## Limits
 
@@ -50,7 +63,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `aarch64` runtime launch now uses per-process trapframe stack metadata from the loaded process image; user-page permission tagging remains best-effort when firmware/MMU tables expose only block mappings.
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).
 - Capability masks are policy checks in shared address space, not hardware isolation.
-- GUI terminal emulator sessions (PID/TTY shown in desktop terminals) are compositor-local processes and are not represented in `proc`/`ring3 ps` tables yet.
+- External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.
 
 ## Relevant files
 

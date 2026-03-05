@@ -1,4 +1,5 @@
 // kernel/src/gfx/mod.rs: M8 framebuffer desktop with minimal compositor/event queue.
+use crate::arch;
 use crate::doom;
 use crate::fs;
 use crate::mouse;
@@ -50,16 +51,30 @@ const APPS_BUTTON_X: usize = 8;
 const APPS_BUTTON_Y: usize = 4;
 const APPS_BUTTON_W: usize = 44;
 const APPS_BUTTON_H: usize = 20;
+const SYSTEM_BUTTON_GAP: usize = 8;
+const SYSTEM_BUTTON_W: usize = 66;
+const SYSTEM_BUTTON_H: usize = 20;
 const APPS_MENU_W: usize = 148;
 const APPS_MENU_ITEM_H: usize = 22;
 const APPS_MENU_ITEMS: usize = 2;
+const SYSTEM_MENU_W: usize = 148;
+const SYSTEM_MENU_ITEM_H: usize = 22;
+const SYSTEM_MENU_ITEMS: usize = 1;
 const CLOSE_BUTTON_W: usize = 14;
 const CLOSE_BUTTON_H: usize = 14;
 const TERMINAL_LINE_MAX: usize = 96;
-const TERMINAL_BASE_PID: u32 = 700;
 const TERMINAL_BASE_TTY: u32 = 1;
 const FILE_MANAGER_LIST_LINES: usize = 5;
 const FILE_MANAGER_PREVIEW_BYTES: usize = 180;
+const EXTERNAL_EXIT_SIGNAL_BASE: i32 = 128;
+const TERMINAL_BIN_LS: &str = "/bin/ls";
+const TERMINAL_BIN_PS: &str = "/bin/ps";
+const TERMINAL_BIN_KILL: &str = "/bin/kill";
+const TERMINAL_BIN_CAT: &str = "/bin/cat";
+const TERMINAL_BIN_ECHO: &str = "/bin/echo";
+const TERMINAL_BIN_FM: &str = "/bin/fm";
+const TERMINAL_BIN_DOOM: &str = "/bin/doom";
+const TERMINAL_BIN_TERMINAL: &str = "/bin/terminal";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -246,6 +261,21 @@ impl AppMenuItem {
 }
 
 const APP_MENU_ORDER: [AppMenuItem; APPS_MENU_ITEMS] = [AppMenuItem::Doom, AppMenuItem::Terminal];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemMenuItem {
+    Shutdown,
+}
+
+impl SystemMenuItem {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+const SYSTEM_MENU_ORDER: [SystemMenuItem; SYSTEM_MENU_ITEMS] = [SystemMenuItem::Shutdown];
 const DEFAULT_WINDOW_ORDER: [usize; WINDOW_COUNT] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,6 +283,8 @@ enum UiAction {
     None,
     LaunchDoom,
     StopDoom,
+    RestartDoom,
+    Shutdown,
 }
 
 #[derive(Clone, Copy)]
@@ -639,6 +671,7 @@ struct GfxState {
     terminal_processes: [Option<TerminalProcess>; TERMINAL_WINDOW_COUNT],
     focused_window: usize,
     apps_menu_open: bool,
+    system_menu_open: bool,
     events: u64,
     dropped: u64,
     stdout_events: u64,
@@ -668,7 +701,6 @@ struct GfxState {
     present_full: u64,
     doom_window_open: bool,
     doom_view: DoomViewLayer,
-    next_terminal_pid: u32,
     next_terminal_tty: u32,
     pending_ui_action: UiAction,
 }
@@ -699,6 +731,7 @@ impl GfxState {
             terminal_processes: [None; TERMINAL_WINDOW_COUNT],
             focused_window: FILE_MANAGER_WINDOW_INDEX,
             apps_menu_open: false,
+            system_menu_open: false,
             events: 0,
             dropped: 0,
             stdout_events: 0,
@@ -728,7 +761,6 @@ impl GfxState {
             present_full: 0,
             doom_window_open: false,
             doom_view: DoomViewLayer::new(),
-            next_terminal_pid: TERMINAL_BASE_PID,
             next_terminal_tty: TERMINAL_BASE_TTY,
             pending_ui_action: UiAction::None,
         }
@@ -773,6 +805,7 @@ impl GfxState {
         self.terminal_processes = [None; TERMINAL_WINDOW_COUNT];
         self.focused_window = FILE_MANAGER_WINDOW_INDEX;
         self.apps_menu_open = false;
+        self.system_menu_open = false;
         self.events = 0;
         self.dropped = 0;
         self.stdout_events = 0;
@@ -802,7 +835,6 @@ impl GfxState {
         self.present_full = 0;
         self.doom_window_open = false;
         self.doom_view = DoomViewLayer::new();
-        self.next_terminal_pid = TERMINAL_BASE_PID;
         self.next_terminal_tty = TERMINAL_BASE_TTY;
         self.pending_ui_action = UiAction::None;
 
@@ -864,7 +896,7 @@ impl GfxState {
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm open <file>\n");
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm copy <src> <dst>\n");
         self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm delete <file>\n");
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("\nUse taskbar Apps to launch.\n");
+        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("\nUse taskbar Apps/System menu.\n");
     }
 
     fn try_enable_backbuffer(&mut self) -> bool {
@@ -960,6 +992,17 @@ impl GfxState {
         Rect::new(APPS_BUTTON_X, APPS_BUTTON_Y, APPS_BUTTON_W, APPS_BUTTON_H)
     }
 
+    fn system_button_rect(&self) -> Rect {
+        Rect::new(
+            APPS_BUTTON_X
+                .saturating_add(APPS_BUTTON_W)
+                .saturating_add(SYSTEM_BUTTON_GAP),
+            APPS_BUTTON_Y,
+            SYSTEM_BUTTON_W,
+            SYSTEM_BUTTON_H,
+        )
+    }
+
     fn apps_menu_rect(&self) -> Rect {
         Rect::new(
             APPS_BUTTON_X,
@@ -971,12 +1014,34 @@ impl GfxState {
         )
     }
 
+    fn system_menu_rect(&self) -> Rect {
+        let system_button = self.system_button_rect();
+        Rect::new(
+            system_button.x,
+            TASKBAR_HEIGHT,
+            SYSTEM_MENU_W,
+            SYSTEM_MENU_ITEM_H
+                .saturating_mul(SYSTEM_MENU_ITEMS)
+                .saturating_add(2),
+        )
+    }
+
     fn apps_menu_item_rect(&self, item_index: usize) -> Rect {
         Rect::new(
             APPS_BUTTON_X + 1,
             TASKBAR_HEIGHT + 1 + item_index.saturating_mul(APPS_MENU_ITEM_H),
             APPS_MENU_W.saturating_sub(2),
             APPS_MENU_ITEM_H,
+        )
+    }
+
+    fn system_menu_item_rect(&self, item_index: usize) -> Rect {
+        let menu = self.system_menu_rect();
+        Rect::new(
+            menu.x + 1,
+            TASKBAR_HEIGHT + 1 + item_index.saturating_mul(SYSTEM_MENU_ITEM_H),
+            SYSTEM_MENU_W.saturating_sub(2),
+            SYSTEM_MENU_ITEM_H,
         )
     }
 
@@ -1053,8 +1118,16 @@ impl GfxState {
         Self::point_in_rect(self.apps_button_rect(), x, y)
     }
 
+    fn point_on_system_button(&self, x: usize, y: usize) -> bool {
+        Self::point_in_rect(self.system_button_rect(), x, y)
+    }
+
     fn point_in_apps_menu(&self, x: usize, y: usize) -> bool {
         self.apps_menu_open && Self::point_in_rect(self.apps_menu_rect(), x, y)
+    }
+
+    fn point_in_system_menu(&self, x: usize, y: usize) -> bool {
+        self.system_menu_open && Self::point_in_rect(self.system_menu_rect(), x, y)
     }
 
     fn apps_menu_item_at(&self, x: usize, y: usize) -> Option<AppMenuItem> {
@@ -1075,6 +1148,24 @@ impl GfxState {
             })
     }
 
+    fn system_menu_item_at(&self, x: usize, y: usize) -> Option<SystemMenuItem> {
+        if !self.system_menu_open {
+            return None;
+        }
+        SYSTEM_MENU_ORDER
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(index, item)| {
+                let rect = self.system_menu_item_rect(index);
+                if Self::point_in_rect(rect, x, y) {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+    }
+
     fn set_apps_menu_open(&mut self, open: bool) {
         if self.apps_menu_open == open {
             return;
@@ -1085,11 +1176,28 @@ impl GfxState {
         self.invalidate_rect(menu_rect);
     }
 
+    fn set_system_menu_open(&mut self, open: bool) {
+        if self.system_menu_open == open {
+            return;
+        }
+        let menu_rect = self.system_menu_rect();
+        self.system_menu_open = open;
+        self.invalidate_rect(Rect::new(0, 0, self.info.width, TASKBAR_HEIGHT));
+        self.invalidate_rect(menu_rect);
+    }
+
     fn queue_ui_action(&mut self, action: UiAction) {
         if action == UiAction::None {
             return;
         }
-        self.pending_ui_action = action;
+        self.pending_ui_action = match (self.pending_ui_action, action) {
+            (_, UiAction::Shutdown) | (UiAction::Shutdown, _) => UiAction::Shutdown,
+            (UiAction::None, next) => next,
+            (UiAction::RestartDoom, _) | (_, UiAction::RestartDoom) => UiAction::RestartDoom,
+            (UiAction::LaunchDoom, UiAction::StopDoom)
+            | (UiAction::StopDoom, UiAction::LaunchDoom) => UiAction::RestartDoom,
+            (_, next) => next,
+        };
     }
 
     fn take_pending_ui_action(&mut self) -> UiAction {
@@ -1110,25 +1218,6 @@ impl GfxState {
         self.push_terminal_text(index, "arrost$ ");
     }
 
-    fn drain_serial_output_to_terminal(&mut self, index: usize) {
-        let Some(_) = self.terminal_process_for_window(index) else {
-            while serial::pop_mirror_byte().is_some() {
-                self.stdout_events = self.stdout_events.saturating_add(1);
-            }
-            return;
-        };
-
-        let mut changed = false;
-        while let Some(byte) = serial::pop_mirror_byte() {
-            self.stdout_events = self.stdout_events.saturating_add(1);
-            self.windows[index].append_byte(byte);
-            changed = true;
-        }
-        if changed {
-            self.invalidate_window(index);
-        }
-    }
-
     fn launch_terminal(&mut self) -> bool {
         let Some(slot) = self
             .terminal_processes
@@ -1139,9 +1228,16 @@ impl GfxState {
         };
 
         let window_index = Self::terminal_window_for_slot(slot);
-        let pid = self.next_terminal_pid;
         let tty = self.next_terminal_tty;
-        self.next_terminal_pid = self.next_terminal_pid.saturating_add(1);
+        let pid_rc = proc::spawn_terminal_process(tty);
+        let Ok(pid) = u32::try_from(pid_rc) else {
+            serial::write_fmt(format_args!(
+                "terminal: failed to register process rc={} ({})\n",
+                pid_rc,
+                errno::name(pid_rc)
+            ));
+            return false;
+        };
         self.next_terminal_tty = self.next_terminal_tty.saturating_add(1);
         self.terminal_processes[slot] = Some(TerminalProcess::new(pid, tty));
 
@@ -1158,7 +1254,7 @@ impl GfxState {
         self.push_terminal_text(window_index, "ARR0ST terminal online\n");
         self.push_terminal_text(
             window_index,
-            "help | apps | pid | tty | clear | doom play | doom stop | exit\n",
+            "help | apps | pid | tty | clear | terminal | doom play | doom stop | exit\n",
         );
         self.push_terminal_text(
             window_index,
@@ -1200,9 +1296,11 @@ impl GfxState {
             self.resize = ResizeState::inactive();
         }
         self.invalidate_rect(previous);
+        let external_code = map_external_exit_code(code);
+        let _ = proc::exit_external_process_with_code(process.pid, external_code);
         serial::write_fmt(format_args!(
-            "terminal(pid={}): exited code={}\n",
-            process.pid, code
+            "terminal(pid={}): exited code={} (proc_exit={})\n",
+            process.pid, code, external_code
         ));
     }
 
@@ -1215,6 +1313,398 @@ impl GfxState {
         if self.terminal_process_for_window(index).is_some() {
             self.close_terminal_window(index, -1);
         }
+    }
+
+    fn kill_ui_process(&mut self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+
+        for slot in 0..TERMINAL_WINDOW_COUNT {
+            let Some(process) = self.terminal_processes[slot] else {
+                continue;
+            };
+            if process.pid != pid {
+                continue;
+            }
+            let window_index = Self::terminal_window_for_slot(slot);
+            self.close_terminal_window(window_index, -9);
+            return true;
+        }
+
+        let status = doom::status();
+        if status.running && status.pid == pid {
+            self.close_doom_window();
+            self.queue_ui_action(UiAction::StopDoom);
+            return true;
+        }
+
+        false
+    }
+
+    fn append_terminal_file_bytes(&mut self, index: usize, bytes: &[u8]) {
+        let mut text = String::new();
+        for &byte in bytes {
+            match byte {
+                b'\r' => {}
+                b'\n' => text.push('\n'),
+                0x20..=0x7e => text.push(byte as char),
+                _ => text.push('.'),
+            }
+        }
+        self.push_terminal_text(index, &text);
+    }
+
+    fn with_terminal_bin_process(
+        &mut self,
+        index: usize,
+        bin_path: &'static str,
+        run: impl FnOnce(&mut Self),
+    ) -> bool {
+        if !fs::file_exists(bin_path) {
+            let mut line = String::new();
+            let _ = writeln!(line, "terminal(exec): missing bin={}", bin_path);
+            self.push_terminal_text(index, &line);
+            return false;
+        }
+        let Some(tty) = self
+            .terminal_process_for_window(index)
+            .map(|process| process.tty)
+        else {
+            return false;
+        };
+        let pid_rc = proc::spawn_terminal_bin_process(bin_path, tty);
+        let Ok(pid) = u32::try_from(pid_rc) else {
+            serial::write_fmt(format_args!(
+                "terminal(exec): failed bin={} rc={} ({})\n",
+                bin_path,
+                pid_rc,
+                errno::name(pid_rc)
+            ));
+            return false;
+        };
+        run(self);
+        let _ = proc::exit_external_process(pid);
+        true
+    }
+
+    fn run_terminal_ps_command(&mut self, index: usize) {
+        let mut entries = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+        let count = proc::snapshot_processes(&mut entries);
+        let mut text = String::new();
+        let _ = writeln!(text, "ps: entries={count}");
+        for entry in entries.iter().take(count) {
+            let domain = entry.domain.as_str();
+            let kind = entry.external_kind.unwrap_or("-");
+            match entry.state {
+                proc::ProcessState::Sleeping { until_tick } => {
+                    if let Some(tty) = entry.tty {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=sleep until_tick={} domain={} kind={} tty={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            until_tick,
+                            domain,
+                            kind,
+                            tty
+                        );
+                    } else {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=sleep until_tick={} domain={} kind={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            until_tick,
+                            domain,
+                            kind
+                        );
+                    }
+                }
+                proc::ProcessState::Exited { code } => {
+                    if let Some(tty) = entry.tty {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=exited code={} domain={} kind={} tty={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            code,
+                            domain,
+                            kind,
+                            tty
+                        );
+                    } else {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=exited code={} domain={} kind={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            code,
+                            domain,
+                            kind
+                        );
+                    }
+                }
+                _ => {
+                    if let Some(tty) = entry.tty {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state={} domain={} kind={} tty={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            entry.state.as_str(),
+                            domain,
+                            kind,
+                            tty
+                        );
+                    } else {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state={} domain={} kind={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            entry.state.as_str(),
+                            domain,
+                            kind
+                        );
+                    }
+                }
+            }
+        }
+        self.push_terminal_text(index, &text);
+    }
+
+    fn run_terminal_ls_command(&mut self, index: usize) {
+        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
+        let count = fs::list_entries(&mut entries);
+        let mut text = String::new();
+        let _ = writeln!(text, "ls: entries={count}");
+        for entry in entries.iter().take(count) {
+            let _ = writeln!(text, "{} ({} bytes)", entry.name(), entry.size());
+        }
+        self.push_terminal_text(index, &text);
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_bin_dir_listing(&mut self, index: usize) {
+        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
+        let count = fs::list_entries(&mut entries);
+        let listed = entries
+            .iter()
+            .take(count)
+            .filter(|entry| entry.name().starts_with("bin/"))
+            .count();
+        let mut text = String::new();
+        let _ = writeln!(text, "ls: entries={}", listed);
+        for entry in entries.iter().take(count) {
+            if let Some(name) = entry.name().strip_prefix("bin/") {
+                let _ = writeln!(text, "/bin/{} (exec)", name);
+            }
+        }
+        self.push_terminal_text(index, &text);
+    }
+
+    fn run_terminal_kill_command(&mut self, index: usize, pid: u32) {
+        if self.kill_ui_process(pid) {
+            self.push_terminal_text(index, "kill: ok\n");
+            return;
+        }
+
+        let was_doom = {
+            let status = doom::status();
+            status.running && status.pid == pid
+        };
+        let rc = proc::kill_process(pid);
+        if rc == 0 {
+            if was_doom {
+                let _ = doom::stop(time::ticks());
+            }
+            self.push_terminal_text(index, "kill: ok\n");
+        } else {
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "kill: failed pid={} rc={} ({})",
+                pid,
+                rc,
+                errno::name(rc)
+            );
+            self.push_terminal_text(index, &line);
+        }
+    }
+
+    fn run_terminal_cat_command(&mut self, index: usize, path: &str) {
+        let mut data = [0u8; fs::MAX_FILE_BYTES];
+        match fs::read_file(path, &mut data) {
+            Ok(len) => {
+                let mut header = String::new();
+                let _ = writeln!(header, "cat: {} bytes from {}", len, path);
+                self.push_terminal_text(index, &header);
+                self.append_terminal_file_bytes(index, &data[..len]);
+                if len == 0 || data[len.saturating_sub(1)] != b'\n' {
+                    self.push_terminal_text(index, "\n");
+                }
+            }
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "cat: {} ({})", path, err.as_str());
+                self.push_terminal_text(index, &line);
+            }
+        }
+    }
+
+    fn run_terminal_echo_redirect_command(&mut self, index: usize, text: &str, path: &str) {
+        match fs::write_file(path, text.as_bytes()) {
+            Ok(written) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "echo: wrote {} bytes to {}", written, path.trim());
+                self.push_terminal_text(index, &line);
+            }
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "echo: {} ({})", path.trim(), err.as_str());
+                self.push_terminal_text(index, &line);
+            }
+        }
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_fm_list_command(&mut self, index: usize) {
+        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
+        let count = fs::list_entries(&mut entries);
+        let mut text = String::new();
+        let _ = writeln!(text, "fm: entries={count}");
+        for entry in entries.iter().take(count) {
+            let _ = writeln!(text, "{} ({} bytes)", entry.name(), entry.size());
+        }
+        self.push_terminal_text(index, &text);
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_fm_open_command(&mut self, index: usize, path: &str) {
+        let mut buffer = [0u8; fs::MAX_FILE_BYTES];
+        match fs::read_file(path, &mut buffer) {
+            Ok(len) => {
+                let mut header = String::new();
+                let _ = writeln!(header, "fm: open {} ({} bytes)", path, len);
+                self.push_terminal_text(index, &header);
+                self.append_terminal_file_bytes(index, &buffer[..len]);
+                if len == 0 || buffer[len.saturating_sub(1)] != b'\n' {
+                    self.push_terminal_text(index, "\n");
+                }
+                self.refresh_file_manager_preview_view(path, &buffer[..len]);
+            }
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "fm: open {} ({})", path, err.as_str());
+                self.push_terminal_text(index, &line);
+            }
+        }
+    }
+
+    fn run_terminal_fm_copy_command(&mut self, index: usize, source: &str, destination: &str) {
+        match fs::copy_file(source, destination) {
+            Ok(written) => {
+                let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "fm: copied {} bytes {} -> {}",
+                    written,
+                    source.trim(),
+                    destination.trim()
+                );
+                self.push_terminal_text(index, &line);
+            }
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "fm: copy {} -> {} ({})",
+                    source.trim(),
+                    destination.trim(),
+                    err.as_str()
+                );
+                self.push_terminal_text(index, &line);
+            }
+        }
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_fm_delete_command(&mut self, index: usize, path: &str) {
+        match fs::delete_file(path) {
+            Ok(()) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "fm: deleted {}", path.trim());
+                self.push_terminal_text(index, &line);
+            }
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "fm: delete {} ({})", path.trim(), err.as_str());
+                self.push_terminal_text(index, &line);
+            }
+        }
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_launch_terminal_command(&mut self, index: usize) {
+        if self.launch_terminal() {
+            self.push_terminal_text(index, "terminal: launched\n");
+        } else {
+            self.push_terminal_text(index, "terminal: no free slots\n");
+        }
+    }
+
+    fn run_terminal_doom_status_command(&mut self, index: usize) {
+        let status = doom::status();
+        let mut line = String::new();
+        let _ = writeln!(
+            line,
+            "doom: app={} engine={} pid={} running={} play={} capture={} ticks={} frames={} inputs={} collisions={} dg_ready={} wad={}",
+            status.app,
+            status.engine,
+            status.pid,
+            status.running,
+            status.play_mode,
+            status.capture_mode,
+            status.runtime_ticks,
+            status.frames,
+            status.control_inputs,
+            status.collisions,
+            status.doomgeneric_ready,
+            status.wad_present
+        );
+        self.push_terminal_text(index, &line);
+    }
+
+    fn run_terminal_doom_play_command(&mut self, index: usize) {
+        self.queue_ui_action(UiAction::LaunchDoom);
+        self.push_terminal_text(index, "launching doom play...\n");
+    }
+
+    fn run_terminal_doom_run_command(&mut self, index: usize) {
+        if doom::start(time::ticks()) {
+            self.push_terminal_text(index, "doom: runtime started\n");
+        } else {
+            self.push_terminal_text(index, "doom: runtime already running\n");
+        }
+        doom::render_ui_status();
+    }
+
+    fn run_terminal_doom_stop_command(&mut self, index: usize) {
+        self.queue_ui_action(UiAction::StopDoom);
+        self.push_terminal_text(index, "stopping doom...\n");
     }
 
     fn handle_terminal_input(&mut self, index: usize, byte: u8) {
@@ -1291,12 +1781,20 @@ impl GfxState {
         if command == "help" {
             self.push_terminal_text(
                 index,
-                "help: help version ticks uptime pid tty clear ls cat echo > fm doom ui user ring3 spawn wait ps syscalls net ping udp curl disk sync reload watch on|off exit\n",
+                "help: help version ticks uptime pid tty clear terminal ls [ /bin ] cat echo > fm doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal)\n",
             );
             return true;
         }
         if command == "apps" {
             self.push_terminal_text(index, "apps: doom, terminal\n");
+            return true;
+        }
+        if command == "terminal" || command == TERMINAL_BIN_TERMINAL {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_TERMINAL, |state| {
+                state.run_terminal_launch_terminal_command(index);
+            }) {
+                self.run_terminal_launch_terminal_command(index);
+            }
             return true;
         }
         if command == "clear" {
@@ -1330,74 +1828,101 @@ impl GfxState {
         }
 
         if command == "version" {
-            serial::write_fmt(format_args!(
-                "version: {}.{}.{}\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "version: {}.{}.{}",
                 VERSION_MAJOR, VERSION_MINOR, VERSION_BUILD
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "ticks" {
-            serial::write_fmt(format_args!("ticks: {}\n", time::ticks()));
-            self.drain_serial_output_to_terminal(index);
+            let mut line = String::new();
+            let _ = writeln!(line, "ticks: {}", time::ticks());
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "uptime" {
             let millis = time::uptime_millis();
-            serial::write_fmt(format_args!(
-                "uptime: {} ms ({} s)\n",
-                millis,
-                millis / 1000
-            ));
-            self.drain_serial_output_to_terminal(index);
+            let mut line = String::new();
+            let _ = writeln!(line, "uptime: {} ms ({} s)", millis, millis / 1000);
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "user" {
-            serial::write_fmt(format_args!(
-                "userland: app={} abi=v{} status=cooperative runtime (ring3 pending); use `user apps`\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "userland: app={} abi=v{} status=cooperative runtime (ring3 pending); use `user apps`",
                 USERLAND_INIT_APP, USERLAND_ABI_REVISION
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "user apps" {
-            proc::log_user_app_registry();
-            self.drain_serial_output_to_terminal(index);
+            let mut apps = [proc::UserAppInfo {
+                app_id: 0,
+                app_name: "",
+                syscall_caps: 0,
+                sleep_ticks: 0,
+                exit_code: 0,
+            }; proc::MAX_USER_APP_INFOS];
+            let count = proc::user_app_registry(&mut apps);
+            let mut text = String::new();
+            for app in apps.iter().take(count) {
+                let _ = writeln!(
+                    text,
+                    "user(app): id={} name={} caps={:#x} sleep={} exit={}",
+                    app.app_id, app.app_name, app.syscall_caps, app.sleep_ticks, app.exit_code
+                );
+            }
+            if count == 0 {
+                let _ = writeln!(text, "user(app): none");
+            }
+            self.push_terminal_text(index, &text);
             return true;
         }
 
         if command == "ring3" {
+            let mut text = String::new();
             #[cfg(target_arch = "x86_64")]
             {
-                serial::write_line(
-                    "ring3: mode=preemptive policy_smoke=available hw_transition=x86_64-int80 scheduler=round-robin/syscall-timeslice",
+                let _ = writeln!(
+                    text,
+                    "ring3: mode=preemptive policy_smoke=available hw_transition=x86_64-int80 scheduler=round-robin/syscall-timeslice"
                 );
             }
             #[cfg(target_arch = "aarch64")]
             {
-                serial::write_line(
-                    "ring3: mode=preemptive policy_smoke=available hw_transition=aarch64-svc scheduler=round-robin/syscall-timeslice",
+                let _ = writeln!(
+                    text,
+                    "ring3: mode=preemptive policy_smoke=available hw_transition=aarch64-svc scheduler=round-robin/syscall-timeslice"
                 );
             }
-            serial::write_fmt(format_args!(
-                "ring3: groundwork_elf_flag={} (ARROST_RING3_ELF_GROUNDWORK)\n",
+            let _ = writeln!(
+                text,
+                "ring3: groundwork_elf_flag={} (ARROST_RING3_ELF_GROUNDWORK)",
                 if proc::ring3_elf_groundwork_enabled() {
                     "on"
                 } else {
                     "off"
                 }
-            ));
-            serial::write_line(
-                "ring3: runtime commands=`ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`",
             );
-            self.drain_serial_output_to_terminal(index);
+            let _ = writeln!(
+                text,
+                "ring3: runtime commands=`ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`"
+            );
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "ring3 smoke" {
+            let mut text = String::new();
             match proc::run_ring3_policy_smoke() {
                 Ok(report) => {
-                    serial::write_fmt(format_args!(
-                        "ring3(smoke): pid={} caps={:#x} getpid={} time_before={} socket={} sendto_bad_ptr={} recvfrom_bad_ptr={} cap_get_before={} cap_drop={} cap_get_after={} time_after_drop={} exit={} result={}\n",
+                    let _ = writeln!(
+                        text,
+                        "ring3(smoke): pid={} caps={:#x} getpid={} time_before={} socket={} sendto_bad_ptr={} recvfrom_bad_ptr={} cap_get_before={} cap_drop={} cap_get_after={} time_after_drop={} exit={} result={}",
                         report.pid,
                         report.initial_caps,
                         report.getpid_rc,
@@ -1411,29 +1936,33 @@ impl GfxState {
                         report.time_after_drop_rc,
                         report.exit_rc,
                         if report.passed() { "ok" } else { "fail" },
-                    ));
+                    );
                 }
                 Err(error) => {
-                    serial::write_fmt(format_args!(
-                        "ring3(smoke): failed rc={} ({})\n",
+                    let _ = writeln!(
+                        text,
+                        "ring3(smoke): failed rc={} ({})",
                         error,
                         errno::name(error)
-                    ));
+                    );
                 }
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "ring3 groundwork" {
+            let mut text = String::new();
             match proc::run_ring3_groundwork_smoke() {
                 Ok(report) => {
                     if !report.enabled {
-                        serial::write_line(
-                            "ring3(groundwork): disabled (set ARROST_RING3_ELF_GROUNDWORK=true at build time)",
+                        let _ = writeln!(
+                            text,
+                            "ring3(groundwork): disabled (set ARROST_RING3_ELF_GROUNDWORK=true at build time)"
                         );
                     } else {
-                        serial::write_fmt(format_args!(
-                            "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} exit={} result={}\n",
+                        let _ = writeln!(
+                            text,
+                            "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} exit={} result={}",
                             report.pid,
                             report.entry_ip,
                             report.entry_sp,
@@ -1447,45 +1976,91 @@ impl GfxState {
                             report.recvfrom_user_req_rc,
                             report.exit_rc,
                             if report.passed() { "ok" } else { "fail" },
-                        ));
+                        );
                     }
                 }
                 Err(error) => {
-                    serial::write_fmt(format_args!(
-                        "ring3(groundwork): failed rc={} ({})\n",
+                    let _ = writeln!(
+                        text,
+                        "ring3(groundwork): failed rc={} ({})",
                         error,
                         errno::name(error)
-                    ));
+                    );
                 }
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "ring3 ps" {
-            proc::log_ring3_process_table();
-            self.drain_serial_output_to_terminal(index);
+            let mut entries = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+            let count = proc::snapshot_processes(&mut entries);
+            let listed = entries
+                .iter()
+                .take(count)
+                .filter(|entry| matches!(entry.domain, proc::ProcessDomain::Ring3))
+                .count();
+            let mut text = String::new();
+            let _ = writeln!(text, "ring3(ps): entries={}", listed);
+            for entry in entries.iter().take(count) {
+                if !matches!(entry.domain, proc::ProcessDomain::Ring3) {
+                    continue;
+                }
+                match entry.state {
+                    proc::ProcessState::Sleeping { until_tick } => {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=sleep until_tick={}",
+                            entry.pid, entry.parent_pid, entry.name, entry.syscall_caps, until_tick
+                        );
+                    }
+                    proc::ProcessState::Exited { code } => {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state=exited code={}",
+                            entry.pid, entry.parent_pid, entry.name, entry.syscall_caps, code
+                        );
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            text,
+                            "pid={} parent={} name={} caps={:#x} state={}",
+                            entry.pid,
+                            entry.parent_pid,
+                            entry.name,
+                            entry.syscall_caps,
+                            entry.state.as_str()
+                        );
+                    }
+                }
+            }
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "ring3 wait any" {
+            let mut line = String::new();
             match proc::wait_any_ring3_user() {
                 proc::Ring3WaitAny::Exited { pid, code } => {
-                    serial::write_fmt(format_args!("ring3(wait): any pid={} exit={}\n", pid, code));
+                    let _ = writeln!(line, "ring3(wait): any pid={} exit={}", pid, code);
                 }
-                proc::Ring3WaitAny::Running => serial::write_line("ring3(wait): any running"),
+                proc::Ring3WaitAny::Running => {
+                    let _ = writeln!(line, "ring3(wait): any running");
+                }
                 proc::Ring3WaitAny::NoChildren => {
-                    serial::write_line("ring3(wait): any no-children")
+                    let _ = writeln!(line, "ring3(wait): any no-children");
                 }
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "ring3 wait all" {
             let report = proc::wait_all_ring3_user();
-            serial::write_fmt(format_args!(
-                "ring3(wait): all reaped={} running={}\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "ring3(wait): all reaped={} running={}",
                 report.reaped, report.running
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(rest) = command.strip_prefix("ring3 wait ") {
@@ -1494,19 +2069,21 @@ impl GfxState {
                 return true;
             };
             let waited = proc::wait_ring3_pid(pid);
+            let mut line = String::new();
             if waited == errno::EAGAIN {
-                serial::write_fmt(format_args!("ring3(wait): pid={} running\n", pid));
+                let _ = writeln!(line, "ring3(wait): pid={} running", pid);
             } else if waited >= 0 {
-                serial::write_fmt(format_args!("ring3(wait): pid={} exit={}\n", pid, waited));
+                let _ = writeln!(line, "ring3(wait): pid={} exit={}", pid, waited);
             } else {
-                serial::write_fmt(format_args!(
-                    "ring3(wait): failed pid={} rc={} ({})\n",
+                let _ = writeln!(
+                    line,
+                    "ring3(wait): failed pid={} rc={} ({})",
                     pid,
                     waited,
                     errno::name(waited)
-                ));
+                );
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(target) = command.strip_prefix("ring3 run ") {
@@ -1520,21 +2097,24 @@ impl GfxState {
                 return true;
             };
             let run_rc = proc::run_ring3_user_app(app_id);
+            let mut line = String::new();
             if run_rc > 0 {
-                serial::write_fmt(format_args!(
-                    "ring3(run): queued app={} pid={}\n",
+                let _ = writeln!(
+                    line,
+                    "ring3(run): queued app={} pid={}",
                     app::name(app_id),
                     run_rc
-                ));
+                );
             } else {
-                serial::write_fmt(format_args!(
-                    "ring3(run): failed app={} rc={} ({})\n",
+                let _ = writeln!(
+                    line,
+                    "ring3(run): failed app={} rc={} ({})",
                     app::name(app_id),
                     run_rc,
                     errno::name(run_rc)
-                ));
+                );
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
             return true;
         }
 
@@ -1553,21 +2133,24 @@ impl GfxState {
                 return true;
             };
             let spawned = proc::spawn_user_app(app_id);
+            let mut line = String::new();
             if spawned > 0 {
-                serial::write_fmt(format_args!(
-                    "user(spawn): app={} pid={}\n",
+                let _ = writeln!(
+                    line,
+                    "user(spawn): app={} pid={}",
                     app::name(app_id),
                     spawned
-                ));
+                );
             } else {
-                serial::write_fmt(format_args!(
-                    "user(spawn): failed app={} rc={} ({})\n",
+                let _ = writeln!(
+                    line,
+                    "user(spawn): failed app={} rc={} ({})",
                     app::name(app_id),
                     spawned,
                     errno::name(spawned)
-                ));
+                );
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "wait" {
@@ -1575,23 +2158,30 @@ impl GfxState {
             return true;
         }
         if command == "wait any" {
+            let mut line = String::new();
             match proc::wait_any_user() {
                 proc::UserWaitAny::Exited { pid, code } => {
-                    serial::write_fmt(format_args!("user(wait): any pid={} exit={}\n", pid, code));
+                    let _ = writeln!(line, "user(wait): any pid={} exit={}", pid, code);
                 }
-                proc::UserWaitAny::Running => serial::write_line("user(wait): any running"),
-                proc::UserWaitAny::NoChildren => serial::write_line("user(wait): any no-children"),
+                proc::UserWaitAny::Running => {
+                    let _ = writeln!(line, "user(wait): any running");
+                }
+                proc::UserWaitAny::NoChildren => {
+                    let _ = writeln!(line, "user(wait): any no-children");
+                }
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "wait all" {
             let report = proc::wait_all_user();
-            serial::write_fmt(format_args!(
-                "user(wait): all reaped={} running={}\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "user(wait): all reaped={} running={}",
                 report.reaped, report.running
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(rest) = command.strip_prefix("wait ") {
@@ -1600,166 +2190,352 @@ impl GfxState {
                 return true;
             };
             let waited = proc::wait_user_pid(pid);
+            let mut line = String::new();
             if waited == errno::EAGAIN {
-                serial::write_fmt(format_args!("user(wait): pid={} running\n", pid));
+                let _ = writeln!(line, "user(wait): pid={} running", pid);
             } else if waited >= 0 {
-                serial::write_fmt(format_args!("user(wait): pid={} exit={}\n", pid, waited));
+                let _ = writeln!(line, "user(wait): pid={} exit={}", pid, waited);
             } else {
-                serial::write_fmt(format_args!(
-                    "user(wait): failed pid={} rc={} ({})\n",
+                let _ = writeln!(
+                    line,
+                    "user(wait): failed pid={} rc={} ({})",
                     pid,
                     waited,
                     errno::name(waited)
-                ));
+                );
             }
-            self.drain_serial_output_to_terminal(index);
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if command == "waitx" {
+            self.push_terminal_text(index, "usage: waitx <pid|any|all>\n");
+            return true;
+        }
+        if command == "waitx any" {
+            let mut line = String::new();
+            match proc::wait_any_external() {
+                proc::ExternalWaitAny::Exited { pid, code } => {
+                    let _ = writeln!(line, "external(wait): any pid={} exit={}", pid, code);
+                }
+                proc::ExternalWaitAny::Running => {
+                    let _ = writeln!(line, "external(wait): any running");
+                }
+                proc::ExternalWaitAny::NoChildren => {
+                    let _ = writeln!(line, "external(wait): any no-children");
+                }
+            }
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if command == "waitx all" {
+            let report = proc::wait_all_external();
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "external(wait): all reaped={} running={}",
+                report.reaped, report.running
+            );
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("waitx ") {
+            let Some(pid) = parse_pid(rest) else {
+                self.push_terminal_text(index, "usage: waitx <pid|any|all>\n");
+                return true;
+            };
+            let waited = proc::wait_external_pid(pid);
+            let mut line = String::new();
+            if waited == errno::EAGAIN {
+                let _ = writeln!(line, "external(wait): pid={} running", pid);
+            } else if waited >= 0 {
+                let _ = writeln!(line, "external(wait): pid={} exit={}", pid, waited);
+            } else {
+                let _ = writeln!(
+                    line,
+                    "external(wait): failed pid={} rc={} ({})",
+                    pid,
+                    waited,
+                    errno::name(waited)
+                );
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
 
-        if command == "ps" {
-            proc::log_process_table();
-            self.drain_serial_output_to_terminal(index);
+        if command == "kill" || command == TERMINAL_BIN_KILL {
+            self.push_terminal_text(index, "usage: kill <pid> | /bin/kill self\n");
+            return true;
+        }
+        if let Some(rest) = command
+            .strip_prefix("kill ")
+            .or_else(|| command.strip_prefix("/bin/kill "))
+        {
+            let target = rest.trim();
+            if target == "self" {
+                let Some(pid) = self
+                    .terminal_process_for_window(index)
+                    .map(|process| process.pid)
+                else {
+                    self.push_terminal_text(index, "kill: self unavailable\n");
+                    return true;
+                };
+                if !self.with_terminal_bin_process(index, TERMINAL_BIN_KILL, |state| {
+                    state.run_terminal_kill_command(index, pid);
+                }) {
+                    self.run_terminal_kill_command(index, pid);
+                }
+                return true;
+            };
+            let Some(pid) = parse_pid(target) else {
+                self.push_terminal_text(index, "usage: kill <pid> | /bin/kill self\n");
+                return true;
+            };
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_KILL, |state| {
+                state.run_terminal_kill_command(index, pid);
+            }) {
+                self.run_terminal_kill_command(index, pid);
+            }
+            return true;
+        }
+
+        if command == "ps" || command == TERMINAL_BIN_PS {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_PS, |state| {
+                state.run_terminal_ps_command(index);
+            }) {
+                self.run_terminal_ps_command(index);
+            }
             return true;
         }
         if command == "syscalls" {
-            proc::log_syscall_stats();
-            self.drain_serial_output_to_terminal(index);
+            let stats = proc::syscall_stats();
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "syscalls: write={} read={} yield={} sleep={} exit={} getpid={} time_ms={} cap_get={} cap_drop={} spawn={} waitpid={} socket={} sendto={} recvfrom={} errors={}",
+                stats.write,
+                stats.read,
+                stats.yield_now,
+                stats.sleep,
+                stats.exit,
+                stats.getpid,
+                stats.time_ms,
+                stats.cap_get,
+                stats.cap_drop,
+                stats.spawn,
+                stats.waitpid,
+                stats.socket,
+                stats.sendto,
+                stats.recvfrom,
+                stats.errors
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "disk" {
-            storage::log_info();
-            self.drain_serial_output_to_terminal(index);
+            let report = storage::status();
+            let mut line = String::new();
+            if report.ready {
+                let _ = writeln!(
+                    line,
+                    "disk: backend={} pci={:02x}:{:02x}.{} devid={:#06x} io={:#06x} sectors={} bytes={}",
+                    report.backend,
+                    report.pci_bus,
+                    report.pci_device,
+                    report.pci_function,
+                    report.pci_device_id,
+                    report.io_base,
+                    report.capacity_sectors,
+                    report.capacity_bytes
+                );
+            } else {
+                let _ = writeln!(line, "disk: backend=none status=unavailable");
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
 
-        if command == "ls" {
-            fs::list_to_serial();
-            self.drain_serial_output_to_terminal(index);
-            self.refresh_file_manager_list_view();
+        if command == "ls /bin" || command == "/bin/ls /bin" {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
+                state.run_terminal_bin_dir_listing(index);
+            }) {
+                self.run_terminal_bin_dir_listing(index);
+            }
             return true;
         }
-        if command == "cat" {
+        if command == "ls" || command == TERMINAL_BIN_LS {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
+                state.run_terminal_ls_command(index);
+            }) {
+                self.run_terminal_ls_command(index);
+            }
+            return true;
+        }
+        if command == "cat" || command == TERMINAL_BIN_CAT {
             self.push_terminal_text(index, "usage: cat <file>\n");
             return true;
         }
-        if let Some(path) = command.strip_prefix("cat ") {
+        if let Some(path) = command
+            .strip_prefix("cat ")
+            .or_else(|| command.strip_prefix("/bin/cat "))
+        {
             let path = path.trim();
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: cat <file>\n");
             } else {
-                fs::cat_to_serial(path);
-                self.drain_serial_output_to_terminal(index);
+                if !self.with_terminal_bin_process(index, TERMINAL_BIN_CAT, |state| {
+                    state.run_terminal_cat_command(index, path);
+                }) {
+                    self.run_terminal_cat_command(index, path);
+                }
             }
             return true;
         }
         if let Some((text, path)) = parse_echo_redirect(command) {
-            fs::write_from_echo(path, text);
-            self.drain_serial_output_to_terminal(index);
-            self.refresh_file_manager_list_view();
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_ECHO, |state| {
+                state.run_terminal_echo_redirect_command(index, text, path);
+            }) {
+                self.run_terminal_echo_redirect_command(index, text, path);
+            }
             return true;
         }
-        if let Some(text) = command.strip_prefix("echo ") {
-            self.push_terminal_text(index, text);
-            self.push_terminal_text(index, "\n");
+        if let Some(text) = command
+            .strip_prefix("echo ")
+            .or_else(|| command.strip_prefix("/bin/echo "))
+        {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_ECHO, |state| {
+                state.push_terminal_text(index, text);
+                state.push_terminal_text(index, "\n");
+            }) {
+                self.push_terminal_text(index, text);
+                self.push_terminal_text(index, "\n");
+            }
             return true;
         }
-        if command == "echo" {
+        if command == "echo" || command == TERMINAL_BIN_ECHO {
             self.push_terminal_text(index, "usage: echo <text> > <file>\n");
             return true;
         }
 
-        if command == "fm" || command == "fm list" {
-            fs::list_to_serial();
-            self.drain_serial_output_to_terminal(index);
-            self.refresh_file_manager_list_view();
+        if command == "fm"
+            || command == "fm list"
+            || command == TERMINAL_BIN_FM
+            || command == "/bin/fm list"
+        {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
+                state.run_terminal_fm_list_command(index);
+            }) {
+                self.run_terminal_fm_list_command(index);
+            }
             return true;
         }
-        if command == "fm open" {
+        if command == "fm open" || command == "/bin/fm open" {
             self.push_terminal_text(index, "usage: fm open <file>\n");
             return true;
         }
-        if command == "fm copy" {
+        if command == "fm copy" || command == "/bin/fm copy" {
             self.push_terminal_text(index, "usage: fm copy <src> <dst>\n");
             return true;
         }
-        if command == "fm delete" {
+        if command == "fm delete" || command == "/bin/fm delete" {
             self.push_terminal_text(index, "usage: fm delete <file>\n");
             return true;
         }
-        if let Some(path) = command.strip_prefix("fm open ") {
+        if let Some(path) = command
+            .strip_prefix("fm open ")
+            .or_else(|| command.strip_prefix("/bin/fm open "))
+        {
             let path = path.trim();
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: fm open <file>\n");
                 return true;
             }
-            let mut buffer = [0u8; fs::MAX_FILE_BYTES];
-            match fs::read_file(path, &mut buffer) {
-                Ok(len) => {
-                    fs::cat_to_serial(path);
-                    self.drain_serial_output_to_terminal(index);
-                    self.refresh_file_manager_preview_view(path, &buffer[..len]);
-                }
-                Err(err) => {
-                    serial::write_fmt(format_args!("fm: open {} ({})\n", path, err.as_str()));
-                    self.drain_serial_output_to_terminal(index);
-                }
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
+                state.run_terminal_fm_open_command(index, path);
+            }) {
+                self.run_terminal_fm_open_command(index, path);
             }
             return true;
         }
-        if let Some(rest) = command.strip_prefix("fm copy ") {
+        if let Some(rest) = command
+            .strip_prefix("fm copy ")
+            .or_else(|| command.strip_prefix("/bin/fm copy "))
+        {
             let Some((source, destination)) = parse_file_manager_copy(rest) else {
                 self.push_terminal_text(index, "usage: fm copy <src> <dst>\n");
                 return true;
             };
-            fs::copy_file_to_serial(source, destination);
-            self.drain_serial_output_to_terminal(index);
-            self.refresh_file_manager_list_view();
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
+                state.run_terminal_fm_copy_command(index, source, destination);
+            }) {
+                self.run_terminal_fm_copy_command(index, source, destination);
+            }
             return true;
         }
-        if let Some(path) = command.strip_prefix("fm delete ") {
+        if let Some(path) = command
+            .strip_prefix("fm delete ")
+            .or_else(|| command.strip_prefix("/bin/fm delete "))
+        {
             let path = path.trim();
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: fm delete <file>\n");
             } else {
-                fs::delete_file_to_serial(path);
-                self.drain_serial_output_to_terminal(index);
-                self.refresh_file_manager_list_view();
+                if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
+                    state.run_terminal_fm_delete_command(index, path);
+                }) {
+                    self.run_terminal_fm_delete_command(index, path);
+                }
             }
             return true;
         }
 
-        if command == "doom play" {
-            self.queue_ui_action(UiAction::LaunchDoom);
-            self.push_terminal_text(index, "launching doom play...\n");
-            return true;
-        }
-        if command == "doom run" {
-            if doom::start(time::ticks()) {
-                self.push_terminal_text(index, "doom: runtime started\n");
-            } else {
-                self.push_terminal_text(index, "doom: runtime already running\n");
+        if command == "doom play" || command == "/bin/doom play" {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_DOOM, |state| {
+                state.run_terminal_doom_play_command(index);
+            }) {
+                self.run_terminal_doom_play_command(index);
             }
-            doom::render_ui_status();
             return true;
         }
-        if command == "doom stop" {
-            self.queue_ui_action(UiAction::StopDoom);
-            self.push_terminal_text(index, "stopping doom...\n");
+        if command == "doom run" || command == "/bin/doom run" {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_DOOM, |state| {
+                state.run_terminal_doom_run_command(index);
+            }) {
+                self.run_terminal_doom_run_command(index);
+            }
             return true;
         }
-        if command == "doom" || command == "doom status" {
-            doom::log_status();
-            self.drain_serial_output_to_terminal(index);
+        if command == "doom stop" || command == "/bin/doom stop" {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_DOOM, |state| {
+                state.run_terminal_doom_stop_command(index);
+            }) {
+                self.run_terminal_doom_stop_command(index);
+            }
+            return true;
+        }
+        if command == "doom"
+            || command == "doom status"
+            || command == TERMINAL_BIN_DOOM
+            || command == "/bin/doom status"
+        {
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_DOOM, |state| {
+                state.run_terminal_doom_status_command(index);
+            }) {
+                self.run_terminal_doom_status_command(index);
+            }
+            return true;
+        }
+        if command.starts_with("/bin/doom ") {
+            self.push_terminal_text(index, "usage: /bin/doom [status|play|run|stop]\n");
             return true;
         }
         if command == "doom source" {
-            doom::log_doomgeneric_info();
-            self.drain_serial_output_to_terminal(index);
+            let text = doom::doomgeneric_info_text();
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "doom doctor" {
-            doom::log_doomgeneric_doctor();
-            self.drain_serial_output_to_terminal(index);
+            let text = doom::doomgeneric_doctor_text();
+            self.push_terminal_text(index, &text);
             return true;
         }
         if command == "doom ui" {
@@ -1795,20 +2571,24 @@ impl GfxState {
                     return true;
                 }
             };
-            serial::write_fmt(format_args!(
-                "doom: viewport filter={}{}\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "doom: viewport filter={}{}",
                 self.doom_view_filter().as_str(),
                 if changed { "" } else { " (unchanged)" }
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             doom::render_ui_status();
             return true;
         }
 
         if command == "ui" {
             let status = self.status();
-            serial::write_fmt(format_args!(
-                "ui: backend={} ready=true {}x{} stride={} bpp={} fmt={} focused={} events={} dropped={} stdout_events={} stdout_dropped={} frames={} full_redraws={} partial_redraws={} present_full={} present_partial={} damage_dropped={} damage_coalesced={} double_buffer={} mouse=({}, {}) mouse_events={} mouse_focus_clicks={} drag_steps={} resize_steps={} minimize_toggles={} drag_active={} resize_active={} focused_minimized={} minimized_windows={}\n",
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "ui: backend={} ready=true {}x{} stride={} bpp={} fmt={} focused={} events={} dropped={} stdout_events={} stdout_dropped={} frames={} full_redraws={} partial_redraws={} present_full={} present_partial={} damage_dropped={} damage_coalesced={} double_buffer={} mouse=({}, {}) mouse_events={} mouse_focus_clicks={} drag_steps={} resize_steps={} minimize_toggles={} drag_active={} resize_active={} focused_minimized={} minimized_windows={}",
                 status.backend,
                 status.width,
                 status.height,
@@ -1839,8 +2619,8 @@ impl GfxState {
                 status.resize_active,
                 status.focused_minimized,
                 status.minimized_windows
-            ));
-            self.drain_serial_output_to_terminal(index);
+            );
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "ui redraw" {
@@ -1861,13 +2641,105 @@ impl GfxState {
         }
 
         if command == "mouse" {
-            mouse::log_info();
-            self.drain_serial_output_to_terminal(index);
+            let status = mouse::status();
+            let mut line = String::new();
+            if let Some(last) = status.last_event {
+                let _ = writeln!(
+                    line,
+                    "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=dx:{} dy:{} l:{} r:{} m:{}",
+                    status.backend,
+                    status.ready,
+                    status.bytes,
+                    status.packets,
+                    status.dropped,
+                    status.bad_sync,
+                    status.ctrl_before,
+                    status.ctrl_after,
+                    status.ack_defaults,
+                    status.ack_enable,
+                    last.dx,
+                    last.dy,
+                    last.left_button,
+                    last.right_button,
+                    last.middle_button
+                );
+            } else {
+                let _ = writeln!(
+                    line,
+                    "mouse: backend={} ready={} bytes={} packets={} dropped={} bad_sync={} ctrl={:#04x}->{:#04x} ack={:#04x}/{:#04x} last=none",
+                    status.backend,
+                    status.ready,
+                    status.bytes,
+                    status.packets,
+                    status.dropped,
+                    status.bad_sync,
+                    status.ctrl_before,
+                    status.ctrl_after,
+                    status.ack_defaults,
+                    status.ack_enable
+                );
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "net" {
-            net::log_info();
-            self.drain_serial_output_to_terminal(index);
+            let status = net::status();
+            let mut line = String::new();
+            if !status.ready {
+                let _ = writeln!(line, "net: backend=none status=unavailable");
+            } else {
+                let _ = writeln!(
+                    line,
+                    "net: backend={} cfg={} io={:#06x} pci={:02x}:{:02x}.{} devid={:#06x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ip={}.{}.{}.{} gw={}.{}.{}.{} mask={}.{}.{}.{} dns={}.{}.{}.{} rx={} tx={} arp={} ipv4={} icmp={} udp={} tcp={} dhcp_discover={} dhcp_offer={} dhcp_ack={} dns_query={} dns_answer={} curl_udp={} curl_http={} route_direct={} route_gw={} drop={}",
+                    status.backend,
+                    status.config_source,
+                    status.io_base,
+                    status.pci_bus,
+                    status.pci_device,
+                    status.pci_function,
+                    status.pci_device_id,
+                    status.mac[0],
+                    status.mac[1],
+                    status.mac[2],
+                    status.mac[3],
+                    status.mac[4],
+                    status.mac[5],
+                    status.ipv4[0],
+                    status.ipv4[1],
+                    status.ipv4[2],
+                    status.ipv4[3],
+                    status.gateway[0],
+                    status.gateway[1],
+                    status.gateway[2],
+                    status.gateway[3],
+                    status.netmask[0],
+                    status.netmask[1],
+                    status.netmask[2],
+                    status.netmask[3],
+                    status.dns[0],
+                    status.dns[1],
+                    status.dns[2],
+                    status.dns[3],
+                    status.stats.rx_frames,
+                    status.stats.tx_frames,
+                    status.stats.rx_arp,
+                    status.stats.rx_ipv4,
+                    status.stats.rx_icmp,
+                    status.stats.rx_udp,
+                    status.stats.rx_tcp,
+                    status.stats.dhcp_discover,
+                    status.stats.dhcp_offer,
+                    status.stats.dhcp_ack,
+                    status.stats.dns_query,
+                    status.stats.dns_answer,
+                    status.stats.curl_udp,
+                    status.stats.curl_http,
+                    status.stats.route_direct,
+                    status.stats.route_gateway,
+                    status.stats.dropped
+                );
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(ip) = command.strip_prefix("ping ") {
@@ -1875,14 +2747,53 @@ impl GfxState {
             if ip.is_empty() {
                 self.push_terminal_text(index, "usage: ping <a.b.c.d>\n");
             } else {
-                net::ping_to_serial(ip);
-                self.drain_serial_output_to_terminal(index);
+                let Some(target) = net::parse_ipv4(ip) else {
+                    self.push_terminal_text(index, "ping: invalid ip (usage: ping <a.b.c.d>)\n");
+                    return true;
+                };
+                let mut line = String::new();
+                match net::ping(target) {
+                    Ok(rtt_ticks) => {
+                        let _ = writeln!(
+                            line,
+                            "ping: reply from {}.{}.{}.{} time={} ticks ({} ms)",
+                            target[0],
+                            target[1],
+                            target[2],
+                            target[3],
+                            rtt_ticks,
+                            rtt_ticks.saturating_mul(10)
+                        );
+                    }
+                    Err(err) => {
+                        let _ = writeln!(line, "ping: failed ({})", err.as_str());
+                    }
+                }
+                self.push_terminal_text(index, &line);
             }
             return true;
         }
         if command == "udp last" {
-            net::log_last_udp();
-            self.drain_serial_output_to_terminal(index);
+            let mut line = String::new();
+            if let Some(report) = net::last_udp() {
+                let preview =
+                    str::from_utf8(&report.preview[..report.preview_len]).unwrap_or("<binary>");
+                let _ = writeln!(
+                    line,
+                    "udp: last src={}.{}.{}.{}:{} dst_port={} len={} preview=`{}`",
+                    report.src_ip[0],
+                    report.src_ip[1],
+                    report.src_ip[2],
+                    report.src_ip[3],
+                    report.src_port,
+                    report.dst_port,
+                    report.len,
+                    preview
+                );
+            } else {
+                let _ = writeln!(line, "udp: no packets received");
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(rest) = command.strip_prefix("udp send ") {
@@ -1890,32 +2801,61 @@ impl GfxState {
                 self.push_terminal_text(index, "usage: udp send <a.b.c.d> <port> <text>\n");
                 return true;
             };
-            net::udp_send_to_serial(ip, port, payload);
-            self.drain_serial_output_to_terminal(index);
+            let Some(target) = net::parse_ipv4(ip) else {
+                self.push_terminal_text(index, "udp: invalid ip\n");
+                return true;
+            };
+            let mut line = String::new();
+            match net::udp_send_shell(target, port, payload.as_bytes()) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        line,
+                        "udp: sent {} bytes to {}.{}.{}.{}:{}",
+                        payload.len(),
+                        target[0],
+                        target[1],
+                        target[2],
+                        target[3],
+                        port
+                    );
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "udp: failed ({})", err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
         if let Some(rest) = command.strip_prefix("curl ") {
-            let url = rest.trim();
-            if url.is_empty() {
-                self.push_terminal_text(
-                    index,
-                    "usage: curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path>\n",
-                );
-            } else {
-                net::curl_to_serial(url);
-                self.drain_serial_output_to_terminal(index);
-            }
+            let output = net::curl_text(rest);
+            self.push_terminal_text(index, &output);
             return true;
         }
 
         if command == "sync" {
-            fs::sync_to_disk_to_serial();
-            self.drain_serial_output_to_terminal(index);
+            let mut line = String::new();
+            match fs::sync_to_disk() {
+                Ok(()) => {
+                    let _ = writeln!(line, "sync: diskfs metadata saved");
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "sync: failed ({})", err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
             return true;
         }
         if command == "reload" {
-            fs::reload_from_disk_to_serial();
-            self.drain_serial_output_to_terminal(index);
+            let mut line = String::new();
+            match fs::reload_from_disk() {
+                Ok(()) => {
+                    let _ = writeln!(line, "reload: diskfs remounted");
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "reload: failed ({})", err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
             self.refresh_file_manager_list_view();
             return true;
         }
@@ -2161,7 +3101,16 @@ impl GfxState {
         if left_pressed {
             let mut consumed = false;
             if self.point_on_apps_button(self.pointer_x, self.pointer_y) {
-                self.set_apps_menu_open(!self.apps_menu_open);
+                let next = !self.apps_menu_open;
+                self.set_system_menu_open(false);
+                self.set_apps_menu_open(next);
+                self.drag = DragState::inactive();
+                self.resize = ResizeState::inactive();
+                consumed = true;
+            } else if self.point_on_system_button(self.pointer_x, self.pointer_y) {
+                let next = !self.system_menu_open;
+                self.set_apps_menu_open(false);
+                self.set_system_menu_open(next);
                 self.drag = DragState::inactive();
                 self.resize = ResizeState::inactive();
                 consumed = true;
@@ -2179,6 +3128,17 @@ impl GfxState {
                     consumed = true;
                 } else if !self.point_in_apps_menu(self.pointer_x, self.pointer_y) {
                     self.set_apps_menu_open(false);
+                    consumed = true;
+                }
+            } else if self.system_menu_open {
+                if let Some(item) = self.system_menu_item_at(self.pointer_x, self.pointer_y) {
+                    self.set_system_menu_open(false);
+                    match item {
+                        SystemMenuItem::Shutdown => self.queue_ui_action(UiAction::Shutdown),
+                    }
+                    consumed = true;
+                } else if !self.point_in_system_menu(self.pointer_x, self.pointer_y) {
+                    self.set_system_menu_open(false);
                     consumed = true;
                 }
             }
@@ -2624,6 +3584,7 @@ impl GfxState {
             self.draw_window(index, self.windows[index], focused);
         }
         self.draw_apps_menu_overlay();
+        self.draw_system_menu_overlay();
         self.draw_pointer();
 
         self.clip = None;
@@ -2725,6 +3686,7 @@ impl GfxState {
             self.draw_window(index, self.windows[index], focused);
         }
         self.draw_apps_menu_overlay();
+        self.draw_system_menu_overlay();
         self.draw_pointer();
 
         self.present_rect(Rect::new(0, 0, self.info.width, self.info.height));
@@ -2798,12 +3760,33 @@ impl GfxState {
             bar_text,
             Some(apps_color),
         );
+        let system_rect = self.system_button_rect();
+        let system_color = if self.system_menu_open {
+            Color::rgb(69, 103, 147)
+        } else {
+            Color::rgb(43, 65, 92)
+        };
+        self.fill_rect(
+            system_rect.x,
+            system_rect.y,
+            system_rect.w,
+            system_rect.h,
+            system_color,
+        );
         self.draw_text(
-            APPS_BUTTON_X
-                .saturating_add(APPS_BUTTON_W)
+            system_rect.x.saturating_add(8),
+            system_rect.y.saturating_add(6),
+            "System",
+            bar_text,
+            Some(system_color),
+        );
+        self.draw_text(
+            system_rect
+                .x
+                .saturating_add(system_rect.w)
                 .saturating_add(14),
             8,
-            "ARR0ST M9 | apps launcher | tab switches focus",
+            "ARR0ST M9 | apps/system | tab switches focus",
             bar_text,
             Some(bar),
         );
@@ -2821,6 +3804,37 @@ impl GfxState {
         self.fill_rect(menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h, menu_bg);
         for (index, item) in APP_MENU_ORDER.iter().copied().enumerate() {
             let item_rect = self.apps_menu_item_rect(index);
+            let hovered = Self::point_in_rect(item_rect, self.pointer_x, self.pointer_y);
+            let item_color = if hovered { menu_hover } else { menu_item };
+            self.fill_rect(
+                item_rect.x,
+                item_rect.y,
+                item_rect.w,
+                item_rect.h,
+                item_color,
+            );
+            self.draw_text(
+                item_rect.x.saturating_add(8),
+                item_rect.y.saturating_add(7),
+                item.label(),
+                text,
+                Some(item_color),
+            );
+        }
+    }
+
+    fn draw_system_menu_overlay(&mut self) {
+        if !self.system_menu_open {
+            return;
+        }
+        let menu_rect = self.system_menu_rect();
+        let menu_bg = Color::rgb(18, 33, 54);
+        let menu_item = Color::rgb(24, 46, 74);
+        let menu_hover = Color::rgb(51, 81, 116);
+        let text = Color::rgb(230, 235, 242);
+        self.fill_rect(menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h, menu_bg);
+        for (index, item) in SYSTEM_MENU_ORDER.iter().copied().enumerate() {
+            let item_rect = self.system_menu_item_rect(index);
             let hovered = Self::point_in_rect(item_rect, self.pointer_x, self.pointer_y);
             let item_color = if hovered { menu_hover } else { menu_item };
             self.fill_rect(
@@ -3580,6 +4594,28 @@ pub fn on_input_byte(byte: u8) -> bool {
     with_state_mut(|state| state.on_input_byte(byte)).unwrap_or(false)
 }
 
+pub fn kill_process(pid: u32) -> bool {
+    with_state_mut(|state| {
+        let killed = state.kill_ui_process(pid);
+        if killed && state.damage_len > 0 {
+            state.flush_damage();
+        }
+        killed
+    })
+    .unwrap_or(false)
+}
+
+pub fn launch_terminal() -> bool {
+    with_state_mut(|state| {
+        let launched = state.launch_terminal();
+        if launched && state.damage_len > 0 {
+            state.flush_damage();
+        }
+        launched
+    })
+    .unwrap_or(false)
+}
+
 pub fn set_file_manager_text(text: &str) {
     let _ = with_state_mut(|state| {
         state.set_window_text(FILE_MANAGER_WINDOW_INDEX, text);
@@ -3738,7 +4774,38 @@ fn run_ui_action(action: UiAction) {
             }
             let _ = shell::set_ui_doom_capture(false);
         }
+        UiAction::RestartDoom => {
+            let _ = doom::stop(time::ticks());
+            let _ = shell::set_ui_doom_capture(false);
+            let start = doom::play(time::ticks());
+            match start {
+                doom::PlayStart::DoomGeneric => {
+                    serial::write_line("doom: play mode restarted from UI");
+                }
+                doom::PlayStart::Fallback => {
+                    serial::write_line(
+                        "doom: doomgeneric not ready; fallback restarted from UI (check doom doctor)",
+                    );
+                }
+                doom::PlayStart::AlreadyRunning => {
+                    serial::write_line("doom: runtime already running");
+                }
+            }
+            let _ = shell::set_ui_doom_capture(true);
+            doom::render_ui_status();
+        }
+        UiAction::Shutdown => run_graceful_shutdown_from_ui(),
     }
+}
+
+fn run_graceful_shutdown_from_ui() -> ! {
+    serial::write_line("system: shutdown requested from UI");
+    let _ = shell::set_ui_doom_capture(false);
+    let _ = doom::stop(time::ticks());
+    time::set_heartbeat(false);
+    fs::sync_to_disk_to_serial();
+    serial::write_line("system: shutdown complete, halting");
+    arch::halt_forever()
 }
 
 fn with_state_mut<T>(f: impl FnOnce(&mut GfxState) -> T) -> Option<T> {
@@ -3760,12 +4827,26 @@ fn parse_pid(text: &str) -> Option<u32> {
     Some(pid)
 }
 
-fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
-    if !input.starts_with("echo ") {
-        return None;
+fn map_external_exit_code(code: i32) -> i32 {
+    if code >= 0 {
+        return code;
     }
-    let (left, right) = input.split_once('>')?;
-    let text = left.strip_prefix("echo ")?.trim_end();
+    EXTERNAL_EXIT_SIGNAL_BASE.saturating_add(code.saturating_neg())
+}
+
+fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
+    let left = if input.starts_with("echo ") {
+        input
+    } else if input.starts_with("/bin/echo ") {
+        input
+    } else {
+        return None;
+    };
+    let (left, right) = left.split_once('>')?;
+    let text = left
+        .strip_prefix("echo ")
+        .or_else(|| left.strip_prefix("/bin/echo "))?
+        .trim_end();
     let path = right.trim();
     if path.is_empty() {
         return None;

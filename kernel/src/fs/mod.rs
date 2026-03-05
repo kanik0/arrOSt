@@ -11,6 +11,17 @@ use diskfs::DiskFs;
 
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 
+pub const BIN_EXEC_PATHS: [&str; 8] = [
+    "/bin/ls",
+    "/bin/ps",
+    "/bin/kill",
+    "/bin/cat",
+    "/bin/echo",
+    "/bin/fm",
+    "/bin/doom",
+    "/bin/terminal",
+];
+
 #[derive(Clone, Copy)]
 pub struct FsInitReport {
     pub backend: &'static str,
@@ -139,6 +150,9 @@ impl FsState {
                     self.backend = FsBackend::DiskFs;
                     if self.diskfs.file_count() == 0 {
                         self.seed_defaults_diskfs();
+                    } else {
+                        self.ensure_builtin_bins_diskfs();
+                        let _ = self.diskfs.sync_metadata();
                     }
                 }
                 Err(err) => {
@@ -188,6 +202,7 @@ impl FsState {
         let _ = self
             .ramfs
             .write("/MILESTONE.TXT", b"M6.1: native diskfs block backend\n");
+        self.ensure_builtin_bins_ramfs();
     }
 
     fn seed_defaults_diskfs(&mut self) {
@@ -198,7 +213,20 @@ impl FsState {
         let _ = self
             .diskfs
             .write("/MILESTONE.TXT", b"M6.1: native diskfs block backend\n");
+        self.ensure_builtin_bins_diskfs();
         let _ = self.diskfs.sync_metadata();
+    }
+
+    fn ensure_builtin_bins_ramfs(&mut self) {
+        for path in BIN_EXEC_PATHS {
+            let _ = self.ramfs.write(path, b"#!/arrost/bin\n");
+        }
+    }
+
+    fn ensure_builtin_bins_diskfs(&mut self) {
+        for path in BIN_EXEC_PATHS {
+            let _ = self.diskfs.write(path, b"#!/arrost/bin\n");
+        }
     }
 }
 
@@ -217,6 +245,23 @@ pub fn list_to_serial() {
 
 pub fn list_entries(out: &mut [DirEntry]) -> usize {
     with_vfs(|vfs| vfs.list(out))
+}
+
+pub fn file_exists(path: &str) -> bool {
+    let trimmed = path.trim();
+    let normalized = trimmed
+        .strip_prefix('/')
+        .unwrap_or(trimmed)
+        .trim_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+    let mut entries = [DirEntry::empty(); MAX_FILES];
+    let count = list_entries(&mut entries);
+    entries
+        .iter()
+        .take(count)
+        .any(|entry| entry.name() == normalized)
 }
 
 pub fn cat_to_serial(path: &str) {
@@ -296,23 +341,31 @@ pub fn delete_file_to_serial(path: &str) {
 }
 
 pub fn sync_to_disk_to_serial() {
-    match with_fs_mut(|state| match state.backend {
-        FsBackend::DiskFs => state.diskfs.sync_metadata(),
-        FsBackend::RamFs => Err(FsError::StorageUnavailable),
-    }) {
+    match sync_to_disk() {
         Ok(()) => serial::write_line("sync: diskfs metadata saved"),
         Err(err) => serial::write_fmt(format_args!("sync: failed ({})\n", err.as_str())),
     }
 }
 
 pub fn reload_from_disk_to_serial() {
-    match with_fs_mut(|state| match state.backend {
-        FsBackend::DiskFs => state.diskfs.remount(),
-        FsBackend::RamFs => Err(FsError::StorageUnavailable),
-    }) {
+    match reload_from_disk() {
         Ok(()) => serial::write_line("reload: diskfs remounted"),
         Err(err) => serial::write_fmt(format_args!("reload: failed ({})\n", err.as_str())),
     }
+}
+
+pub fn sync_to_disk() -> Result<(), FsError> {
+    with_fs_mut(|state| match state.backend {
+        FsBackend::DiskFs => state.diskfs.sync_metadata(),
+        FsBackend::RamFs => Err(FsError::StorageUnavailable),
+    })
+}
+
+pub fn reload_from_disk() -> Result<(), FsError> {
+    with_fs_mut(|state| match state.backend {
+        FsBackend::DiskFs => state.diskfs.remount(),
+        FsBackend::RamFs => Err(FsError::StorageUnavailable),
+    })
 }
 
 fn with_vfs<R>(f: impl FnOnce(&dyn Vfs) -> R) -> R {

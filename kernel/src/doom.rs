@@ -2,9 +2,11 @@
 use crate::audio;
 use crate::doom_bridge;
 use crate::gfx;
+use crate::proc;
 use crate::serial;
 use crate::time;
 use alloc::string::String;
+use arrostd::syscall::errno;
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
@@ -132,6 +134,7 @@ pub enum PlayStart {
 #[derive(Clone, Copy)]
 pub struct DoomStatus {
     pub app: &'static str,
+    pub pid: u32,
     pub engine: &'static str,
     pub doomgeneric_ready: &'static str,
     pub wad_present: &'static str,
@@ -175,6 +178,7 @@ pub struct DoomStatus {
 
 struct DoomState {
     running: bool,
+    process_pid: u32,
     play_mode: bool,
     started_tick: u64,
     last_poll_tick: u64,
@@ -228,6 +232,7 @@ impl DoomState {
     const fn new() -> Self {
         Self {
             running: false,
+            process_pid: 0,
             play_mode: false,
             started_tick: 0,
             last_poll_tick: 0,
@@ -324,11 +329,38 @@ impl DoomState {
         doom_bridge::reset();
     }
 
+    fn ensure_process_registration(&mut self) {
+        if self.process_pid != 0 {
+            return;
+        }
+        let pid_rc = proc::spawn_doom_runtime_process();
+        let Ok(pid) = u32::try_from(pid_rc) else {
+            serial::write_fmt(format_args!(
+                "doom(proc): register failed rc={} ({})\n",
+                pid_rc,
+                errno::name(pid_rc)
+            ));
+            return;
+        };
+        self.process_pid = pid;
+        serial::write_fmt(format_args!("doom(proc): registered pid={}\n", pid));
+    }
+
+    fn unregister_process(&mut self) {
+        if self.process_pid == 0 {
+            return;
+        }
+        let pid = self.process_pid;
+        self.process_pid = 0;
+        let _ = proc::exit_external_process(pid);
+    }
+
     fn poll(&mut self, now_ticks: u64) {
         if !self.running {
             self.last_poll_tick = now_ticks;
             return;
         }
+        self.ensure_process_registration();
         if self.last_poll_tick == 0 {
             self.last_poll_tick = now_ticks;
             return;
@@ -913,6 +945,7 @@ impl DoomState {
     fn status(&self) -> DoomStatus {
         DoomStatus {
             app: DOOM_APP,
+            pid: self.process_pid,
             engine: if self.play_mode {
                 "doomgeneric-loop"
             } else {
@@ -1026,6 +1059,7 @@ pub fn start(now_ticks: u64) -> bool {
         }
         state.running = true;
         state.reset_runtime(now_ticks);
+        state.ensure_process_registration();
         audio::reset_runtime_metrics();
         true
     })
@@ -1040,6 +1074,7 @@ pub fn play(now_ticks: u64) -> PlayStart {
 
         state.running = true;
         state.reset_runtime(now_ticks);
+        state.ensure_process_registration();
         audio::reset_runtime_metrics();
         if doomgeneric_ready() {
             state.play_mode = true;
@@ -1056,10 +1091,12 @@ pub fn stop(now_ticks: u64) -> bool {
     let stopped = with_state_mut(|state| {
         state.shell_commands = state.shell_commands.saturating_add(1);
         if !state.running {
+            state.unregister_process();
             return false;
         }
         state.poll(now_ticks);
         state.running = false;
+        state.unregister_process();
         state.play_mode = false;
         state.capture_mode = false;
         state.release_capture_buttons();
@@ -1101,9 +1138,10 @@ pub fn log_status() {
     let status = status();
     let pcm = audio::status();
     serial::write_fmt(format_args!(
-        "doom: app={} engine={} bridge={} running={} play_mode={} capture={} started_tick={} runtime_ticks={} frames={} audio_mixes={} key_events={} mouse_events={} mouse_cfg=(turn:{} move:{} y:{}) inputs={} collisions={} pos=({}, {}) vel=({}, {}) wad_present={} shell_cmds={} ui_updates={} dg_frames={} dg_draw={} dg_nonzero={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_frame={} dg_pace={} pcm_mode={} pcm_backend={} pcm_active={} pcm_hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_buf={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x} last_key={:#04x}\n",
+        "doom: app={} engine={} pid={} bridge={} running={} play_mode={} capture={} started_tick={} runtime_ticks={} frames={} audio_mixes={} key_events={} mouse_events={} mouse_cfg=(turn:{} move:{} y:{}) inputs={} collisions={} pos=({}, {}) vel=({}, {}) wad_present={} shell_cmds={} ui_updates={} dg_frames={} dg_draw={} dg_nonzero={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_frame={} dg_pace={} pcm_mode={} pcm_backend={} pcm_active={} pcm_hz={} pcm_evt={} pcm_samples={} pcm_sw={} pcm_min={} pcm_max={} pcm_q={} pcm_buf={} pcm_tx={} pcm_done={} pcm_drop={} pcm_frames={} pcm_drop_frames={} pcm_rate={} pcm_ch={} pcm_stream={} pcm_ctrl={:#x} last_key={:#04x}\n",
         status.app,
         status.engine,
+        status.pid,
         status.dg_bridge,
         status.running,
         status.play_mode,
@@ -1165,9 +1203,16 @@ pub fn log_status() {
 }
 
 pub fn log_doomgeneric_info() {
+    let text = doomgeneric_info_text();
+    serial::write_str(&text);
+}
+
+pub fn doomgeneric_info_text() -> String {
     let bridge = doom_bridge::stats();
-    serial::write_fmt(format_args!(
-        "doomgeneric: ready={} root={} core={} core_obj={} ({} bytes) core_ready={} port={} ({} bytes) port_ready={} wad={} wad_present={} bridge={} dg_frames={} dg_draw={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_title_len={} dg_frame={}\n",
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "doomgeneric: ready={} root={} core={} core_obj={} ({} bytes) core_ready={} port={} ({} bytes) port_ready={} wad={} wad_present={} bridge={} dg_frames={} dg_draw={} dg_key={} dg_poll={} dg_drop={} dg_sleep={}({}ms) dg_audio={} dg_audio_samples={} dg_audio_q={} dg_audio_drop={} dg_title_len={} dg_frame={}",
         DOOM_GENERIC_READY,
         DOOM_GENERIC_ROOT,
         DOOM_GENERIC_CORE_SOURCE,
@@ -1193,36 +1238,50 @@ pub fn log_doomgeneric_info() {
         bridge.audio_dropped_samples,
         bridge.title_len,
         bridge.has_frame
-    ));
+    );
+    text
 }
 
 pub fn log_doomgeneric_doctor() {
+    let text = doomgeneric_doctor_text();
+    serial::write_str(&text);
+}
+
+pub fn doomgeneric_doctor_text() -> String {
+    let mut text = String::new();
     if DOOM_GENERIC_READY == "true" {
-        serial::write_fmt(format_args!(
-            "doom doctor: doomgeneric integration ready (core+port+wad) bridge={}\n",
+        let _ = writeln!(
+            text,
+            "doom doctor: doomgeneric integration ready (core+port+wad) bridge={}",
             DOOM_GENERIC_BRIDGE_MODE
-        ));
-        return;
+        );
+        return text;
     }
 
-    serial::write_line("doom doctor: doomgeneric integration NOT ready");
+    let _ = writeln!(text, "doom doctor: doomgeneric integration NOT ready");
     if DOOM_GENERIC_CORE_READY != "true" {
-        serial::write_fmt(format_args!(
-            " - core compile missing/failing: source={} object={} ({} bytes)\n",
+        let _ = writeln!(
+            text,
+            " - core compile missing/failing: source={} object={} ({} bytes)",
             DOOM_GENERIC_CORE_SOURCE, DOOM_GENERIC_CORE_OBJECT, DOOM_GENERIC_CORE_SIZE
-        ));
-        serial::write_line("   hint: run scripts/vendor_doomgeneric.sh");
+        );
+        let _ = writeln!(text, "   hint: run scripts/vendor_doomgeneric.sh");
     }
     if DOOM_GENERIC_PORT_READY != "true" {
-        serial::write_fmt(format_args!(
-            " - port compile failing: object={} ({} bytes)\n",
+        let _ = writeln!(
+            text,
+            " - port compile failing: object={} ({} bytes)",
             DOOM_GENERIC_PORT_OBJECT, DOOM_GENERIC_PORT_SIZE
-        ));
+        );
     }
     if DOOM_WAD_PRESENT != "true" {
-        serial::write_fmt(format_args!(" - missing wad: {}\n", DOOM_WAD_HINT));
+        let _ = writeln!(text, " - missing wad: {}", DOOM_WAD_HINT);
     }
-    serial::write_line("doom doctor: `doom play` will use fallback runtime until ready=true");
+    let _ = writeln!(
+        text,
+        "doom doctor: `doom play` will use fallback runtime until ready=true"
+    );
+    text
 }
 
 pub fn render_ui_status() {

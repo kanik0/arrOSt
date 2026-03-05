@@ -42,7 +42,7 @@ const USER_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_DOOM_ELF_HINT";
 const USER_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -85,6 +85,7 @@ enum TopLevelCommand {
     SmokeDoomFallback,
     SmokeProcCaps,
     SmokeProcSpawn,
+    SmokeBinExec,
     SmokeRing3,
     SmokeRing3Run,
     SmokeRing3Fault,
@@ -132,6 +133,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeDoomFallback) => smoke_doom_fallback(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcCaps) => smoke_proc_caps(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcSpawn) => smoke_proc_spawn(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeBinExec) => smoke_bin_exec(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Fault) => smoke_ring3_fault(parse_run_arch_arg(args)?),
@@ -158,6 +160,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-doom-fallback") => Ok(TopLevelCommand::SmokeDoomFallback),
         Some("smoke-proc-caps") => Ok(TopLevelCommand::SmokeProcCaps),
         Some("smoke-proc-spawn") => Ok(TopLevelCommand::SmokeProcSpawn),
+        Some("smoke-bin-exec") => Ok(TopLevelCommand::SmokeBinExec),
         Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
         Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
         Some("smoke-ring3-fault") => Ok(TopLevelCommand::SmokeRing3Fault),
@@ -1645,6 +1648,310 @@ fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
     Ok(())
 }
 
+fn smoke_bin_exec(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_bin_exec_impl(arch)
+}
+
+fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-bin-exec";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        send_serial_command(stdin, "ls /bin\n")?;
+        for marker in [
+            "/bin/ls (exec)",
+            "/bin/ps (exec)",
+            "/bin/kill (exec)",
+            "/bin/cat (exec)",
+            "/bin/echo (exec)",
+            "/bin/fm (exec)",
+            "/bin/doom (exec)",
+            "/bin/terminal (exec)",
+        ] {
+            wait_for_log(
+                &log,
+                marker,
+                Duration::from_secs(8),
+                "virtual /bin listing output",
+            )?;
+        }
+
+        send_serial_command(stdin, "/bin/ps\n")?;
+        wait_for_log(
+            &log,
+            "name=/bin/ps",
+            Duration::from_secs(8),
+            "binary ps process table line",
+        )?;
+        let ps_snapshot = snapshot_log(&log);
+        let Some(ps_line) = last_matching_line(&ps_snapshot, "name=/bin/ps") else {
+            bail!("missing /bin/ps process entry in process table output");
+        };
+        if !ps_line.contains("kind=binary") {
+            bail!("expected /bin/ps entry with kind=binary");
+        }
+        let Some(ps_pid) = parse_metric_value(ps_line, "pid=") else {
+            bail!("missing pid in /bin/ps process entry");
+        };
+        if ps_pid == 0 {
+            bail!("invalid /bin/ps pid in process entry");
+        }
+
+        send_serial_command(stdin, "/bin/cat README.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: ",
+            Duration::from_secs(8),
+            "bin cat output header",
+        )?;
+        wait_for_log(
+            &log,
+            "README.TXT",
+            Duration::from_secs(8),
+            "bin cat target file marker",
+        )?;
+
+        send_serial_command(stdin, "/bin/echo bin-smoke > BINSMOKE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "echo: wrote ",
+            Duration::from_secs(8),
+            "bin echo write output",
+        )?;
+
+        send_serial_command(stdin, "/bin/fm open BINSMOKE.TXT\n")?;
+        wait_for_log(&log, "cat: ", Duration::from_secs(8), "bin fm open output")?;
+        wait_for_log(
+            &log,
+            "BINSMOKE.TXT",
+            Duration::from_secs(8),
+            "bin fm open target marker",
+        )?;
+
+        send_serial_command(stdin, "/bin/doom status\n")?;
+        wait_for_log(
+            &log,
+            "doom: app=",
+            Duration::from_secs(8),
+            "bin doom status output",
+        )?;
+        send_serial_command(stdin, "waitx all\n")?;
+        wait_for_log(
+            &log,
+            "external(wait): all reaped=",
+            Duration::from_secs(8),
+            "external waitx all output after bin wrappers",
+        )?;
+        let waitx_snapshot = snapshot_log(&log);
+        let Some(waitx_line) = last_matching_line(&waitx_snapshot, "external(wait): all reaped=")
+        else {
+            bail!("missing waitx all output after /bin wrappers");
+        };
+        let Some(waitx_reaped) = parse_metric_value(waitx_line, "reaped=") else {
+            bail!("missing reaped metric in waitx all output");
+        };
+        if waitx_reaped == 0 {
+            bail!("expected waitx all to reap at least one external /bin wrapper process");
+        }
+
+        send_serial_shell_command(stdin, "doom play\n")?;
+        if wait_for_log(
+            &log,
+            "doom: play mode started (doomgeneric)",
+            Duration::from_secs(8),
+            "doom play confirmation",
+        )
+        .is_err()
+        {
+            wait_for_log(
+                &log,
+                "doom: doomgeneric not ready; starting fallback runtime",
+                Duration::from_secs(8),
+                "doom fallback play confirmation",
+            )?;
+        }
+        send_serial_shell_command(stdin, "ps\n")?;
+        wait_for_log(
+            &log,
+            "name=doom",
+            Duration::from_secs(8),
+            "doom runtime process table line",
+        )?;
+        let doom_snapshot = snapshot_log(&log);
+        let Some(doom_line) = last_matching_line(&doom_snapshot, "name=doom") else {
+            bail!("missing doom runtime process entry in process table output");
+        };
+        if !doom_line.contains("kind=doom-runtime") {
+            bail!("expected doom runtime process entry with kind=doom-runtime");
+        }
+        let Some(doom_pid) = parse_metric_value(doom_line, "pid=") else {
+            bail!("missing pid in doom runtime process entry");
+        };
+        if doom_pid == 0 {
+            bail!("invalid doom runtime pid in process entry");
+        }
+        wait_for_log(
+            &log,
+            "arrost> ",
+            Duration::from_secs(6),
+            "shell prompt before doom kill",
+        )?;
+        send_serial_shell_command(stdin, &format!("kill {doom_pid}\n"))?;
+        wait_for_log(
+            &log,
+            &format!("kill: pid={} rc=0", doom_pid),
+            Duration::from_secs(16),
+            "doom kill output",
+        )?;
+        send_serial_shell_command(stdin, &format!("waitx {doom_pid}\n"))?;
+        wait_for_log(
+            &log,
+            &format!("external(wait): pid={} exit=", doom_pid),
+            Duration::from_secs(16),
+            "doom waitx reap output",
+        )?;
+
+        send_serial_command(stdin, "terminal\n")?;
+        wait_for_log(
+            &log,
+            "terminal: launched",
+            Duration::from_secs(8),
+            "shell terminal launch output",
+        )?;
+        send_serial_command(stdin, "ps\n")?;
+        wait_for_log(
+            &log,
+            "name=terminal",
+            Duration::from_secs(8),
+            "external terminal process table line",
+        )?;
+        let terminal_snapshot = snapshot_log(&log);
+        let Some(terminal_line) = last_matching_line(&terminal_snapshot, "name=terminal") else {
+            bail!("missing terminal process entry in process table output");
+        };
+        let Some(terminal_pid) = parse_metric_value(terminal_line, "pid=") else {
+            bail!("missing pid in terminal process entry");
+        };
+        if terminal_pid == 0 {
+            bail!("invalid terminal pid in process entry");
+        }
+
+        send_serial_command(stdin, &format!("kill {terminal_pid}\n"))?;
+        wait_for_log(
+            &log,
+            &format!("kill: pid={} rc=0", terminal_pid),
+            Duration::from_secs(8),
+            "terminal kill output",
+        )?;
+        send_serial_command(stdin, &format!("waitx {terminal_pid}\n"))?;
+        wait_for_log(
+            &log,
+            &format!("external(wait): pid={} exit=", terminal_pid),
+            Duration::from_secs(8),
+            "external waitx terminal reap output",
+        )?;
+
+        send_serial_command(stdin, "/bin/kill self\n")?;
+        wait_for_log(
+            &log,
+            "kill: pid=",
+            Duration::from_secs(8),
+            "bin kill self output",
+        )?;
+        let kill_snapshot = snapshot_log(&log);
+        let Some(kill_line) = last_matching_line(&kill_snapshot, "kill: pid=") else {
+            bail!("missing kill result line for /bin/kill self");
+        };
+        let Some(kill_pid) = parse_metric_value(kill_line, "pid=") else {
+            bail!("missing pid in /bin/kill self result");
+        };
+        let Some(kill_rc) = parse_metric_value(kill_line, "rc=") else {
+            bail!("missing rc in /bin/kill self result");
+        };
+        if kill_pid == 0 {
+            bail!("invalid pid in /bin/kill self result");
+        }
+        if kill_rc != 0 {
+            bail!("expected /bin/kill self to succeed (rc={kill_rc})");
+        }
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "name=/bin/ps") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "kill: pid=") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "BINSMOKE.TXT") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
 fn smoke_ring3(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
     smoke_ring3_impl(arch)
@@ -3024,6 +3331,13 @@ mod tests {
         let parsed = parse_top_level_command(Some("smoke-ring3-run"))
             .expect("smoke-ring3-run should map to top-level command");
         assert!(parsed == TopLevelCommand::SmokeRing3Run);
+    }
+
+    #[test]
+    fn top_level_command_supports_bin_exec_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-bin-exec"))
+            .expect("smoke-bin-exec should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeBinExec);
     }
 
     #[test]

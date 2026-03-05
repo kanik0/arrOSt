@@ -44,6 +44,8 @@ Virtio-mmio mode selection remains available via `QEMU_VIRTIO_MMIO_MODE=modern|l
 - `cargo xtask smoke-doom-virtio --arch aarch64`
 - `cargo xtask smoke-doom-fallback --arch x86_64`
 - `cargo xtask smoke-doom-fallback --arch aarch64`
+- `cargo xtask smoke-bin-exec --arch x86_64`
+- `cargo xtask smoke-bin-exec --arch aarch64`
 - `cargo xtask smoke-ring3 --arch x86_64`
 - `cargo xtask smoke-ring3 --arch aarch64`
 - `cargo xtask smoke-ring3-run --arch x86_64`
