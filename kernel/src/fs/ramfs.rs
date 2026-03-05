@@ -4,7 +4,7 @@
 // Implements both VfsOps (new inode-based API) and Vfs (old path-based API
 // for backward compatibility with existing callers).
 
-use super::{DirEntry, FileType, FsError, InodeNum, Stat, Vfs, VfsDirEntry, VfsOps, ROOT_INO};
+use super::{DirEntry, FileType, FsError, InodeNum, ROOT_INO, Stat, Vfs, VfsDirEntry, VfsOps};
 
 // ── Backward-compatible constants (callers use these for buffer sizing) ──
 
@@ -86,13 +86,7 @@ impl Inode {
         Some((ino, name_len, ft, &self.data[base + 6..base + 6 + nlen]))
     }
 
-    fn write_dir_record(
-        &mut self,
-        index: usize,
-        ino: InodeNum,
-        name: &[u8],
-        ft: FileType,
-    ) {
+    fn write_dir_record(&mut self, index: usize, ino: InodeNum, name: &[u8], ft: FileType) {
         let base = index * DIR_RECORD_SIZE;
         self.data[base..base + 4].copy_from_slice(&ino.to_le_bytes());
         let nlen = name.len().min(DIR_RECORD_NAME_MAX);
@@ -266,8 +260,9 @@ impl RamFs {
         // Add entry in parent.
         self.add_dir_entry(parent_ino, ino, name, FileType::Directory)?;
         // Increment parent link count (for `..` reference).
-        self.inodes[parent_ino as usize].link_count =
-            self.inodes[parent_ino as usize].link_count.saturating_add(1);
+        self.inodes[parent_ino as usize].link_count = self.inodes[parent_ino as usize]
+            .link_count
+            .saturating_add(1);
         Ok(ino)
     }
 
@@ -314,9 +309,7 @@ impl RamFs {
                         continue;
                     }
                     if component == ".." {
-                        current = self
-                            .lookup_in_dir(current, b"..")
-                            .unwrap_or(ROOT_INO);
+                        current = self.lookup_in_dir(current, b"..").unwrap_or(ROOT_INO);
                         continue;
                     }
                     match self.lookup_in_dir(current, component.as_bytes()) {
@@ -448,12 +441,7 @@ impl VfsOps for RamFs {
         Ok(())
     }
 
-    fn create(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        mode: u16,
-    ) -> Result<InodeNum, FsError> {
+    fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
         if !self.valid_ino(parent) {
             return Err(FsError::InvalidPath);
         }
@@ -477,12 +465,7 @@ impl VfsOps for RamFs {
         Ok(ino)
     }
 
-    fn mkdir(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        _mode: u16,
-    ) -> Result<InodeNum, FsError> {
+    fn mkdir(&mut self, parent: InodeNum, name: &[u8], _mode: u16) -> Result<InodeNum, FsError> {
         if !self.valid_ino(parent) {
             return Err(FsError::InvalidPath);
         }
@@ -496,9 +479,7 @@ impl VfsOps for RamFs {
         if !self.valid_ino(parent) {
             return Err(FsError::InvalidPath);
         }
-        let ino = self
-            .lookup_in_dir(parent, name)
-            .ok_or(FsError::NotFound)?;
+        let ino = self.lookup_in_dir(parent, name).ok_or(FsError::NotFound)?;
         let inode = &self.inodes[ino as usize];
         if inode.file_type == FileType::Directory {
             return Err(FsError::IsADirectory);
@@ -518,9 +499,7 @@ impl VfsOps for RamFs {
         if !self.valid_ino(parent) {
             return Err(FsError::InvalidPath);
         }
-        let ino = self
-            .lookup_in_dir(parent, name)
-            .ok_or(FsError::NotFound)?;
+        let ino = self.lookup_in_dir(parent, name).ok_or(FsError::NotFound)?;
         let inode = &self.inodes[ino as usize];
         if inode.file_type != FileType::Directory {
             return Err(FsError::NotADirectory);
@@ -652,8 +631,7 @@ impl Vfs for RamFs {
                 if total > MAX_FILE_NAME_BYTES {
                     continue; // Name too long for compat output; skip.
                 }
-                full_name[..prefix_len]
-                    .copy_from_slice(&stack[frame_idx].prefix[..prefix_len]);
+                full_name[..prefix_len].copy_from_slice(&stack[frame_idx].prefix[..prefix_len]);
                 full_name[prefix_len] = b'/';
                 full_name[sep..sep + nlen].copy_from_slice(&name_bytes[..nlen]);
                 total

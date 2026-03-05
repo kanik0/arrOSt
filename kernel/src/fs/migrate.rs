@@ -6,7 +6,7 @@
 
 use super::diskfs_v1::DiskFs as DiskFsV1;
 use super::diskfs_v2::DiskFsV2;
-use super::{FsError, Vfs, DirEntry, MAX_FILE_BYTES, MAX_FILES};
+use super::{DirEntry, FsError, MAX_FILE_BYTES, MAX_FILES, Vfs};
 use crate::serial;
 use crate::storage;
 

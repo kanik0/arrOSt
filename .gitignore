@@ -1,3 +1,4 @@
 /target
 .arrost_build_count
 .DS_Store
+.claude/worktrees/
