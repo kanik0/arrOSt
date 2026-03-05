@@ -674,100 +674,37 @@ struct GfxState {
 }
 
 impl GfxState {
-    fn new(
-        backend: &'static str,
-        buffer_ptr: *mut u8,
-        buffer_len: usize,
-        info: FrameBufferInfo,
-    ) -> Self {
-        let backbuffer = None;
-        let manager_w = min(420, info.width.saturating_sub(110)).max(220);
-        let manager_h = min(210, info.height.saturating_sub(150)).max(140);
-        let terminal_w = min(660, info.width.saturating_sub(120)).max(320);
-        let terminal_h = min(340, info.height.saturating_sub(140)).max(180);
-        let terminal_x = info.width.saturating_sub(terminal_w) / 2;
-        let terminal_y = (info.height.saturating_sub(terminal_h) / 2).max(TASKBAR_HEIGHT + 8);
-        #[cfg(target_arch = "aarch64")]
-        let doom_w = min(360, info.width.saturating_sub(140)).max(280);
-        #[cfg(not(target_arch = "aarch64"))]
-        let doom_w = min(560, info.width.saturating_sub(120)).max(340);
-        #[cfg(target_arch = "aarch64")]
-        let doom_h = min(260, info.height.saturating_sub(140)).max(200);
-        #[cfg(not(target_arch = "aarch64"))]
-        let doom_h = min(420, info.height.saturating_sub(100)).max(260);
-        let doom_x = info.width.saturating_sub(doom_w) / 2;
-        let doom_y = (info.height.saturating_sub(doom_h) / 2).max(TASKBAR_HEIGHT + 8);
-
-        let windows = [
-            UiWindow::new(
-                info.width.saturating_sub(manager_w).saturating_sub(36),
-                info.height.saturating_sub(manager_h).saturating_sub(42),
-                manager_w,
-                manager_h,
-                "ARR0ST FILE MANAGER",
-            ),
-            UiWindow::new(doom_x, doom_y, doom_w, doom_h, "ARR0ST DOOM"),
-            UiWindow::new(
-                terminal_x,
-                terminal_y,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-            UiWindow::new(
-                terminal_x + 18,
-                terminal_y + 16,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-            UiWindow::new(
-                terminal_x + 36,
-                terminal_y + 32,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-            UiWindow::new(
-                terminal_x + 54,
-                terminal_y + 48,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-            UiWindow::new(
-                terminal_x + 72,
-                terminal_y + 64,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-            UiWindow::new(
-                terminal_x + 90,
-                terminal_y + 80,
-                terminal_w,
-                terminal_h,
-                "ARR0ST TERMINAL",
-            ),
-        ];
-
+    const fn placeholder() -> Self {
         Self {
-            backend,
-            buffer_ptr,
-            buffer_len,
-            backbuffer,
-            info,
-            windows,
+            backend: "none",
+            buffer_ptr: core::ptr::null_mut(),
+            buffer_len: 0,
+            backbuffer: None,
+            info: FrameBufferInfo {
+                byte_len: 0,
+                width: 0,
+                height: 0,
+                pixel_format: PixelFormat::Rgb,
+                bytes_per_pixel: 0,
+                stride: 0,
+            },
+            windows: [UiWindow::new(
+                DESKTOP_MARGIN,
+                TASKBAR_HEIGHT + DESKTOP_MARGIN,
+                MIN_WINDOW_WIDTH,
+                MIN_WINDOW_HEIGHT,
+                "ARR0ST WINDOW",
+            ); WINDOW_COUNT],
             window_order: DEFAULT_WINDOW_ORDER,
             terminal_processes: [None; TERMINAL_WINDOW_COUNT],
-            focused_window: 0,
+            focused_window: FILE_MANAGER_WINDOW_INDEX,
             apps_menu_open: false,
             events: 0,
             dropped: 0,
             stdout_events: 0,
             frames: 0,
-            pointer_x: info.width / 2,
-            pointer_y: info.height / 2,
+            pointer_x: 0,
+            pointer_y: 0,
             pointer_left: false,
             pointer_right: false,
             mouse_events: 0,
@@ -795,6 +732,131 @@ impl GfxState {
             next_terminal_tty: TERMINAL_BASE_TTY,
             pending_ui_action: UiAction::None,
         }
+    }
+
+    fn reset(
+        &mut self,
+        backend: &'static str,
+        buffer_ptr: *mut u8,
+        buffer_len: usize,
+        info: FrameBufferInfo,
+    ) {
+        let manager_w = min(420, info.width.saturating_sub(110)).max(220);
+        let manager_h = min(210, info.height.saturating_sub(150)).max(140);
+        let terminal_w = min(660, info.width.saturating_sub(120)).max(320);
+        let terminal_h = min(340, info.height.saturating_sub(140)).max(180);
+        let terminal_x = info.width.saturating_sub(terminal_w) / 2;
+        let terminal_y = (info.height.saturating_sub(terminal_h) / 2).max(TASKBAR_HEIGHT + 8);
+        #[cfg(target_arch = "aarch64")]
+        let doom_w = min(360, info.width.saturating_sub(140)).max(280);
+        #[cfg(not(target_arch = "aarch64"))]
+        let doom_w = min(560, info.width.saturating_sub(120)).max(340);
+        #[cfg(target_arch = "aarch64")]
+        let doom_h = min(260, info.height.saturating_sub(140)).max(200);
+        #[cfg(not(target_arch = "aarch64"))]
+        let doom_h = min(420, info.height.saturating_sub(100)).max(260);
+        let doom_x = info.width.saturating_sub(doom_w) / 2;
+        let doom_y = (info.height.saturating_sub(doom_h) / 2).max(TASKBAR_HEIGHT + 8);
+        self.backend = backend;
+        self.buffer_ptr = buffer_ptr;
+        self.buffer_len = buffer_len;
+        self.backbuffer = None;
+        self.info = info;
+        self.windows = [UiWindow::new(
+            DESKTOP_MARGIN,
+            TASKBAR_HEIGHT + DESKTOP_MARGIN,
+            MIN_WINDOW_WIDTH,
+            MIN_WINDOW_HEIGHT,
+            "ARR0ST WINDOW",
+        ); WINDOW_COUNT];
+        self.window_order = DEFAULT_WINDOW_ORDER;
+        self.terminal_processes = [None; TERMINAL_WINDOW_COUNT];
+        self.focused_window = FILE_MANAGER_WINDOW_INDEX;
+        self.apps_menu_open = false;
+        self.events = 0;
+        self.dropped = 0;
+        self.stdout_events = 0;
+        self.frames = 0;
+        self.pointer_x = info.width / 2;
+        self.pointer_y = info.height / 2;
+        self.pointer_left = false;
+        self.pointer_right = false;
+        self.mouse_events = 0;
+        self.mouse_click_focus = 0;
+        self.mouse_drag_steps = 0;
+        self.mouse_resize_steps = 0;
+        self.mouse_minimize_toggles = 0;
+        self.drag = DragState::inactive();
+        self.resize = ResizeState::inactive();
+        self.last_title_click_tick = 0;
+        self.last_title_click_window = 0;
+        self.last_title_click_valid = false;
+        self.clip = None;
+        self.damage = [Rect::ZERO; DAMAGE_CAPACITY];
+        self.damage_len = 0;
+        self.partial_redraws = 0;
+        self.full_redraws = 0;
+        self.damage_dropped = 0;
+        self.damage_coalesced = 0;
+        self.present_partial = 0;
+        self.present_full = 0;
+        self.doom_window_open = false;
+        self.doom_view = DoomViewLayer::new();
+        self.next_terminal_pid = TERMINAL_BASE_PID;
+        self.next_terminal_tty = TERMINAL_BASE_TTY;
+        self.pending_ui_action = UiAction::None;
+
+        self.windows[FILE_MANAGER_WINDOW_INDEX] = UiWindow::new(
+            info.width.saturating_sub(manager_w).saturating_sub(36),
+            info.height.saturating_sub(manager_h).saturating_sub(42),
+            manager_w,
+            manager_h,
+            "ARR0ST FILE MANAGER",
+        );
+        self.windows[DOOM_WINDOW_INDEX] =
+            UiWindow::new(doom_x, doom_y, doom_w, doom_h, "ARR0ST DOOM");
+        self.windows[TERMINAL_WINDOW_START] = UiWindow::new(
+            terminal_x,
+            terminal_y,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
+        self.windows[TERMINAL_WINDOW_START + 1] = UiWindow::new(
+            terminal_x + 18,
+            terminal_y + 16,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
+        self.windows[TERMINAL_WINDOW_START + 2] = UiWindow::new(
+            terminal_x + 36,
+            terminal_y + 32,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
+        self.windows[TERMINAL_WINDOW_START + 3] = UiWindow::new(
+            terminal_x + 54,
+            terminal_y + 48,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
+        self.windows[TERMINAL_WINDOW_START + 4] = UiWindow::new(
+            terminal_x + 72,
+            terminal_y + 64,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
+        self.windows[TERMINAL_WINDOW_START + 5] = UiWindow::new(
+            terminal_x + 90,
+            terminal_y + 80,
+            terminal_w,
+            terminal_h,
+            "ARR0ST TERMINAL",
+        );
     }
 
     fn seed_content(&mut self) {
@@ -3406,12 +3468,18 @@ impl GfxState {
     }
 }
 
-struct GfxCell(UnsafeCell<Option<GfxState>>);
+struct GfxCell {
+    state: UnsafeCell<GfxState>,
+    ready: UnsafeCell<bool>,
+}
 
 // SAFETY: access to graphics state is serialized on the main loop thread.
 unsafe impl Sync for GfxCell {}
 
-static GFX_STATE: GfxCell = GfxCell(UnsafeCell::new(None));
+static GFX_STATE: GfxCell = GfxCell {
+    state: UnsafeCell::new(GfxState::placeholder()),
+    ready: UnsafeCell::new(false),
+};
 
 fn headless_report() -> GfxInitReport {
     GfxInitReport {
@@ -3433,16 +3501,20 @@ fn init_framebuffer(
     info: FrameBufferInfo,
 ) -> GfxInitReport {
     if buffer_len == 0 || info.width == 0 || info.height == 0 {
+        // SAFETY: single-threaded init path.
+        unsafe {
+            *GFX_STATE.ready.get() = false;
+        }
         return headless_report();
     }
 
-    let mut state = GfxState::new(backend, buffer_ptr, buffer_len, info);
-    state.seed_content();
-    state.redraw();
-
     // SAFETY: initialization happens once in early boot before concurrent access.
     unsafe {
-        *GFX_STATE.0.get() = Some(state);
+        let state = &mut *GFX_STATE.state.get();
+        state.reset(backend, buffer_ptr, buffer_len, info);
+        state.seed_content();
+        state.redraw();
+        *GFX_STATE.ready.get() = true;
     }
 
     GfxInitReport {
@@ -3459,6 +3531,10 @@ fn init_framebuffer(
 
 pub fn init(boot_info: &mut BootInfo) -> GfxInitReport {
     let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
+        // SAFETY: single-threaded init path.
+        unsafe {
+            *GFX_STATE.ready.get() = false;
+        }
         return headless_report();
     };
 
@@ -3479,6 +3555,10 @@ pub fn init_aarch64_framebuffer(
 
 #[cfg(target_arch = "aarch64")]
 pub fn init_headless() -> GfxInitReport {
+    // SAFETY: single-threaded init path.
+    unsafe {
+        *GFX_STATE.ready.get() = false;
+    }
     headless_report()
 }
 
@@ -3663,9 +3743,13 @@ fn run_ui_action(action: UiAction) {
 
 fn with_state_mut<T>(f: impl FnOnce(&mut GfxState) -> T) -> Option<T> {
     // SAFETY: ArrOSt kernel main loop is single-threaded in current milestones.
-    let slot = unsafe { &mut *GFX_STATE.0.get() };
-    let state = slot.as_mut()?;
-    Some(f(state))
+    unsafe {
+        if !*GFX_STATE.ready.get() {
+            return None;
+        }
+        let state = &mut *GFX_STATE.state.get();
+        Some(f(state))
+    }
 }
 
 fn parse_pid(text: &str) -> Option<u32> {

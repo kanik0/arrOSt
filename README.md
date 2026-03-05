@@ -40,8 +40,13 @@ The project focuses on practical kernel engineering with observable behavior, re
 - Shell ring3 controls include `ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`.
 - Shell command `user apps` exposes cooperative userland app contracts (`id/name/caps/sleep/exit`) sourced from user crates.
 - Shell command `ring3 smoke` runs a cross-platform ring-3 policy smoke (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the shared process-layer syscall context checks.
-- In-kernel shell with filesystem, UI, network, and Doom control commands.
-- Framebuffer compositor with shell and file-manager windows.
+- In-kernel serial shell with filesystem, UI, network, and Doom control commands.
+- Framebuffer desktop compositor with top taskbar and `Apps` launcher (`doom`, `terminal`).
+- Windowed UI includes file manager, on-demand Doom viewport window, and multiple terminal windows.
+- GUI terminal emulator sessions are compositor-managed, multi-instance, and isolated from the serial shell parser/state.
+- Each GUI terminal has its own UI-local PID/TTY identity, input line buffer, and output surface.
+- Window chrome supports close (`X`) for app windows (terminal kill/close, doom stop/close).
+- Click focus updates z-order (focused window raised to front) and Doom keyboard capture target.
 - Virtio block storage backend with persistent disk image.
 - Filesystem layer with disk-backed and RAM fallback implementations.
 - Virtio network backend with ARP/IPv4, ICMP ping, UDP send/receive, and basic HTTP/UDP curl paths.
@@ -64,6 +69,7 @@ The project focuses on practical kernel engineering with observable behavior, re
 - `doom play` starts DoomGeneric when sources and WAD are available.
 - Frame output is rendered in a dedicated Doom compositor window.
 - Runtime input supports shell injection (`doom key`/`doom keyup`) and capture mode.
+- Doom capture follows focused Doom window in UI, with serial-shell fallback controls (`doom capture on|off` and `ESC`).
 - Viewport filter can be switched at runtime (`doom view bilinear|nearest`, default `nearest`).
 - Minimal `/arr.cfg` persistence is wired through the Doom shim.
 - PCM pipeline is active with runtime metrics (`doom status`, `doom audio status`).

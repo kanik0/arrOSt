@@ -2280,18 +2280,26 @@ fn smoke_doom_impl(
                 Duration::from_secs(8),
                 "doom auto-capture enabled",
             )?;
-            send_serial_command(stdin, "\u{1b}")?;
+            // Escape capture and advance UI focus in the same serial burst so gfx poll
+            // cannot immediately re-arm capture before the next shell command.
+            send_serial_command(stdin, "\u{1b}ui next\n")?;
             wait_for_log(
                 &log,
                 "doom: capture disabled",
                 Duration::from_secs(8),
                 "doom auto-capture escape",
             )?;
+            wait_for_log(
+                &log,
+                "ui: focus advanced",
+                Duration::from_secs(8),
+                "ui focus advance after auto-capture escape",
+            )?;
         }
 
         wait_for_music_pcm_activity(&log, stdin, Duration::from_secs(10))?;
 
-        send_serial_command(stdin, "doom audio off\n")?;
+        send_serial_shell_command(stdin, "doom audio off\n")?;
         wait_for_log(
             &log,
             "doom: audio mode set to off",
@@ -2299,7 +2307,7 @@ fn smoke_doom_impl(
             "doom audio off",
         )?;
 
-        send_serial_command(stdin, "doom audio on\n")?;
+        send_serial_shell_command(stdin, "doom audio on\n")?;
         wait_for_log(
             &log,
             "doom: audio mode set to ",
@@ -2308,7 +2316,7 @@ fn smoke_doom_impl(
         )?;
 
         if !long_run {
-            send_serial_command(stdin, "doom audio test\n")?;
+            send_serial_shell_command(stdin, "doom audio test\n")?;
             wait_for_log(
                 &log,
                 "doom: audio test tone queued",
@@ -2317,7 +2325,7 @@ fn smoke_doom_impl(
             )?;
         }
 
-        send_serial_command(stdin, "doom capture on\n")?;
+        send_serial_shell_command(stdin, "doom capture on\n")?;
         wait_for_log(
             &log,
             "doom: capture enabled (press ESC to exit)",
@@ -2328,15 +2336,21 @@ fn smoke_doom_impl(
         send_serial_command(stdin, "ww  ww")?;
         thread::sleep(Duration::from_millis(220));
 
-        send_serial_command(stdin, "\u{1b}")?;
+        send_serial_command(stdin, "\u{1b}ui next\n")?;
         wait_for_log(
             &log,
             "doom: capture disabled",
             Duration::from_secs(8),
             "doom capture escape",
         )?;
+        wait_for_log(
+            &log,
+            "ui: focus advanced",
+            Duration::from_secs(8),
+            "ui focus advance after doom capture escape",
+        )?;
 
-        send_serial_command(stdin, "doom status\n")?;
+        send_serial_shell_command(stdin, "doom status\n")?;
         wait_for_log(
             &log,
             "doom: app=doom engine=",
@@ -2361,7 +2375,7 @@ fn smoke_doom_impl(
             );
         }
 
-        send_serial_command(stdin, "doom mouse y on\n")?;
+        send_serial_shell_command(stdin, "doom mouse y on\n")?;
         wait_for_log(
             &log,
             "doom: mouse y mapping enabled",
@@ -2369,7 +2383,7 @@ fn smoke_doom_impl(
             "doom mouse y on",
         )?;
 
-        send_serial_command(stdin, "doom mouse turn 5\n")?;
+        send_serial_shell_command(stdin, "doom mouse turn 5\n")?;
         wait_for_log(
             &log,
             "doom: mouse turn threshold set to 5",
@@ -2377,7 +2391,7 @@ fn smoke_doom_impl(
             "doom mouse turn",
         )?;
 
-        send_serial_command(stdin, "doom mouse move 7\n")?;
+        send_serial_shell_command(stdin, "doom mouse move 7\n")?;
         wait_for_log(
             &log,
             "doom: mouse move threshold set to 7",
@@ -2385,7 +2399,7 @@ fn smoke_doom_impl(
             "doom mouse move",
         )?;
 
-        send_serial_command(stdin, "doom status\n")?;
+        send_serial_shell_command(stdin, "doom status\n")?;
         wait_for_log(
             &log,
             "doom: app=doom engine=",
@@ -2399,7 +2413,7 @@ fn smoke_doom_impl(
             "doom mouse config status",
         )?;
 
-        send_serial_command(stdin, "doom key left\n")?;
+        send_serial_shell_command(stdin, "doom key left\n")?;
         wait_for_log(
             &log,
             "doom: injected key 0x61",
@@ -2407,7 +2421,7 @@ fn smoke_doom_impl(
             "doom key injection",
         )?;
 
-        send_serial_command(stdin, "doom keyup left\n")?;
+        send_serial_shell_command(stdin, "doom keyup left\n")?;
         wait_for_log(
             &log,
             "doom: injected keyup 0x61",
@@ -2415,7 +2429,7 @@ fn smoke_doom_impl(
             "doom keyup injection",
         )?;
 
-        send_serial_command(stdin, "doom key fire\n")?;
+        send_serial_shell_command(stdin, "doom key fire\n")?;
         wait_for_log(
             &log,
             "doom: injected key 0x20",
@@ -2424,7 +2438,7 @@ fn smoke_doom_impl(
         )?;
         thread::sleep(Duration::from_millis(220));
 
-        send_serial_command(stdin, "doom keyup fire\n")?;
+        send_serial_shell_command(stdin, "doom keyup fire\n")?;
         wait_for_log(
             &log,
             "doom: injected keyup 0x20",
@@ -2432,7 +2446,7 @@ fn smoke_doom_impl(
             "doom fire keyup injection",
         )?;
 
-        send_serial_command(stdin, "doom key enter\n")?;
+        send_serial_shell_command(stdin, "doom key enter\n")?;
         wait_for_log(
             &log,
             "doom: injected key 0x0a",
@@ -2440,7 +2454,7 @@ fn smoke_doom_impl(
             "doom enter injection",
         )?;
 
-        send_serial_command(stdin, "doom keyup enter\n")?;
+        send_serial_shell_command(stdin, "doom keyup enter\n")?;
         wait_for_log(
             &log,
             "doom: injected keyup 0x0a",
@@ -2448,7 +2462,7 @@ fn smoke_doom_impl(
             "doom enter keyup injection",
         )?;
 
-        send_serial_command(stdin, "doom status\n")?;
+        send_serial_shell_command(stdin, "doom status\n")?;
         wait_for_log(
             &log,
             "last_key=0x0a",
@@ -2546,14 +2560,14 @@ fn smoke_doom_impl(
         }
         let dg_frames_before_progress = dg_frames;
 
-        send_serial_command(stdin, "doom key right\n")?;
+        send_serial_shell_command(stdin, "doom key right\n")?;
         wait_for_log(
             &log,
             "doom: injected key 0x64",
             Duration::from_secs(8),
             "doom right injection",
         )?;
-        send_serial_command(stdin, "doom keyup right\n")?;
+        send_serial_shell_command(stdin, "doom keyup right\n")?;
         wait_for_log(
             &log,
             "doom: injected keyup 0x64",
@@ -2561,7 +2575,7 @@ fn smoke_doom_impl(
             "doom right keyup injection",
         )?;
 
-        send_serial_command(stdin, "doom status\n")?;
+        send_serial_shell_command(stdin, "doom status\n")?;
         wait_for_log(
             &log,
             "last_key=0x64",
@@ -2620,7 +2634,7 @@ fn smoke_doom_impl(
             let max_drop_delta = 4u64;
 
             thread::sleep(long_wait);
-            send_serial_command(stdin, "doom status\n")?;
+            send_serial_shell_command(stdin, "doom status\n")?;
             let long_line = wait_for_status_with_frame_progress(
                 &log,
                 dg_frames_after_progress,
@@ -2693,7 +2707,7 @@ fn smoke_doom_impl(
             }
         }
 
-        send_serial_command(stdin, "ui\n")?;
+        send_serial_shell_command(stdin, "ui\n")?;
         wait_for_log(
             &log,
             "ui: backend=uefi-gop ready=true",
@@ -2709,7 +2723,7 @@ fn smoke_doom_impl(
             bail!("stdout mirror dropped bytes during smoke run (stdout_dropped={stdout_dropped})");
         }
 
-        send_serial_command(stdin, "doom stop\n")?;
+        send_serial_shell_command(stdin, "doom stop\n")?;
         wait_for_log(
             &log,
             "doom: runtime stopped",
@@ -2785,6 +2799,13 @@ fn send_serial_command(stdin: &mut ChildStdin, command: &str) -> Result<()> {
     Ok(())
 }
 
+fn send_serial_shell_command(stdin: &mut ChildStdin, command: &str) -> Result<()> {
+    // Prefix ESC so commands still execute when Doom capture is auto-rearmed by UI focus.
+    let mut prefixed = String::from("\u{1b}");
+    prefixed.push_str(command);
+    send_serial_command(stdin, &prefixed)
+}
+
 fn wait_for_log(
     log: &Arc<Mutex<Vec<u8>>>,
     needle: &str,
@@ -2833,7 +2854,7 @@ fn wait_for_music_pcm_activity(
 ) -> Result<u64> {
     let deadline = Instant::now() + timeout;
     loop {
-        send_serial_command(stdin, "doom audio status\n")?;
+        send_serial_shell_command(stdin, "doom audio status\n")?;
         wait_for_log(
             log,
             "doom: audio mode=",
