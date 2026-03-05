@@ -1,4 +1,9 @@
-// kernel/src/fs/mod.rs: M6.1 VFS facade with diskfs backend and ramfs fallback.
+// kernel/src/fs/mod.rs: VFS facade with diskfs backend and ramfs fallback.
+//
+// M1: introduces VfsOps inode-based trait alongside the legacy path-based Vfs
+// trait. The hierarchical RamFS implements both. DiskFs remains unchanged
+// (implements only the old Vfs trait, migrated in M2).
+
 mod diskfs;
 mod ramfs;
 
@@ -22,6 +27,102 @@ pub const BIN_EXEC_PATHS: [&str; 8] = [
     "/bin/terminal",
 ];
 
+// ═══════════════════════════════════════════════════════════════════════════
+// New VFS types (M1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Inode number.
+pub type InodeNum = u32;
+
+/// Root inode is always 1 (0 is the unused sentinel).
+pub const ROOT_INO: InodeNum = 1;
+
+/// Maximum name length for new VFS directory entries.
+pub const MAX_VNAME_LEN: usize = 58;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Regular,
+    Directory,
+    Symlink,
+}
+
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub ino: InodeNum,
+    pub file_type: FileType,
+    pub mode: u16,
+    pub nlink: u16,
+    pub uid: u16,
+    pub gid: u16,
+    pub size: u32,
+    pub created: u64,
+    pub modified: u64,
+    pub accessed: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct VfsDirEntry {
+    pub ino: InodeNum,
+    pub file_type: FileType,
+    pub name: [u8; MAX_VNAME_LEN],
+    pub name_len: u8,
+}
+
+impl VfsDirEntry {
+    pub const fn empty() -> Self {
+        Self {
+            ino: 0,
+            file_type: FileType::Regular,
+            name: [0; MAX_VNAME_LEN],
+            name_len: 0,
+        }
+    }
+
+    pub fn name_str(&self) -> &str {
+        let len = self.name_len as usize;
+        core::str::from_utf8(&self.name[..len]).unwrap_or("<invalid>")
+    }
+}
+
+/// New inode-based VFS trait. Filesystem backends implement this for
+/// hierarchical directory operations. The old `Vfs` trait is kept for
+/// backward compatibility with existing callers.
+pub trait VfsOps {
+    fn root_inode(&self) -> InodeNum;
+    fn lookup(&self, parent: InodeNum, name: &[u8]) -> Result<InodeNum, FsError>;
+    fn stat(&self, ino: InodeNum) -> Result<Stat, FsError>;
+    fn read_data(&self, ino: InodeNum, offset: u32, buf: &mut [u8]) -> Result<usize, FsError>;
+    fn write_data(&mut self, ino: InodeNum, offset: u32, data: &[u8]) -> Result<usize, FsError>;
+    fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError>;
+    fn create(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        mode: u16,
+    ) -> Result<InodeNum, FsError>;
+    fn mkdir(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        mode: u16,
+    ) -> Result<InodeNum, FsError>;
+    fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
+    fn rmdir(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
+    fn readdir(
+        &self,
+        ino: InodeNum,
+        offset: u32,
+        out: &mut [VfsDirEntry],
+    ) -> Result<usize, FsError>;
+    fn file_count(&self) -> usize;
+    fn used_bytes(&self) -> usize;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Legacy types (unchanged)
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[derive(Clone, Copy)]
 pub struct FsInitReport {
     pub backend: &'static str,
@@ -44,6 +145,11 @@ pub enum FsError {
     StorageUnavailable,
     StorageIo,
     StorageNoSpace,
+    // New variants (M1)
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    AlreadyExists,
 }
 
 impl FsError {
@@ -59,6 +165,10 @@ impl FsError {
             Self::StorageUnavailable => "storage_unavailable",
             Self::StorageIo => "storage_io",
             Self::StorageNoSpace => "storage_no_space",
+            Self::NotADirectory => "not_a_directory",
+            Self::IsADirectory => "is_a_directory",
+            Self::DirectoryNotEmpty => "directory_not_empty",
+            Self::AlreadyExists => "already_exists",
         }
     }
 }
@@ -99,6 +209,7 @@ impl DirEntry {
     }
 }
 
+/// Legacy path-based VFS trait. DiskFs and the new RamFs both implement this.
 pub trait Vfs {
     fn list(&self, out: &mut [DirEntry]) -> usize;
     fn read(&self, path: &str, out: &mut [u8]) -> Result<usize, FsError>;
@@ -107,6 +218,10 @@ pub trait Vfs {
     fn file_count(&self) -> usize;
     fn used_bytes(&self) -> usize;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Global state and locking
+// ═══════════════════════════════════════════════════════════════════════════
 
 struct FsStateCell(UnsafeCell<FsState>);
 
@@ -144,6 +259,9 @@ impl FsState {
             return self.report();
         }
 
+        // Ensure the hierarchical root directory exists in RamFS.
+        self.ramfs.ensure_root();
+
         if storage::is_ready() {
             match self.diskfs.init() {
                 Ok(()) => {
@@ -178,8 +296,8 @@ impl FsState {
             FsBackend::RamFs => FsInitReport {
                 backend: "ramfs",
                 storage_backed: false,
-                file_count: self.ramfs.file_count(),
-                used_bytes: self.ramfs.used_bytes(),
+                file_count: Vfs::file_count(&self.ramfs),
+                used_bytes: Vfs::used_bytes(&self.ramfs),
                 max_files: MAX_FILES,
                 max_file_bytes: MAX_FILE_BYTES,
             },
@@ -229,6 +347,10 @@ impl FsState {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public API (unchanged signatures)
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub fn init() -> FsInitReport {
     with_fs_mut(|state| state.init())
@@ -367,6 +489,10 @@ pub fn reload_from_disk() -> Result<(), FsError> {
         FsBackend::RamFs => Err(FsError::StorageUnavailable),
     })
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal dispatch and locking
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn with_vfs<R>(f: impl FnOnce(&dyn Vfs) -> R) -> R {
     let _guard = FS_LOCK.lock();
