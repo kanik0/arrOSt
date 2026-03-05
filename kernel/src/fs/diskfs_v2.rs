@@ -8,10 +8,11 @@
 //   Sectors 161+:   Data region  (one sector = one block)
 
 use super::bitmap::{self, Bitmap};
+use super::journal::Journal;
 use super::{
-    DirEntry, FileType, FsError, InodeNum, Stat, Vfs, VfsDirEntry, VfsOps, MAX_VNAME_LEN,
-    ROOT_INO,
+    DirEntry, FileType, FsError, InodeNum, MAX_VNAME_LEN, ROOT_INO, Stat, Vfs, VfsDirEntry, VfsOps,
 };
+use crate::serial;
 use crate::storage;
 
 // ── On-disk layout constants ────────────────────────────────────────────
@@ -101,9 +102,6 @@ const DIR_ENTRY_HEADER: usize = 8;
 /// We round entries to 4-byte alignment.
 const DIR_ENTRY_ALIGN: usize = 4;
 
-/// Maximum data reachable via direct blocks only (12 * 512 = 6144 bytes).
-const MAX_DIRECT_BYTES: u32 = DIRECT_BLOCKS as u32 * storage::SECTOR_SIZE as u32;
-
 // ── DiskFsV2 ────────────────────────────────────────────────────────────
 
 pub struct DiskFsV2 {
@@ -113,6 +111,8 @@ pub struct DiskFsV2 {
     inodes: [DiskInode; INODE_COUNT as usize],
     bitmap: Bitmap,
     free_inode_count: u32,
+    journal: Journal,
+    tx_bitmap_dirty: bool,
 }
 
 impl DiskFsV2 {
@@ -124,6 +124,8 @@ impl DiskFsV2 {
             inodes: [DiskInode::empty(); INODE_COUNT as usize],
             bitmap: Bitmap::new(),
             free_inode_count: INODE_COUNT,
+            journal: Journal::new(),
+            tx_bitmap_dirty: false,
         }
     }
 
@@ -136,9 +138,16 @@ impl DiskFsV2 {
         }
         self.total_sectors = total_sectors;
         self.data_blocks = (total_sectors.saturating_sub(DATA_REGION_START)) as u32;
+        let replayed = self.journal.replay(JOURNAL_START, JOURNAL_SECTORS)?;
+        if replayed == 0 {
+            serial::write_line("journal: clean");
+        } else {
+            serial::write_fmt(format_args!("journal: replayed {} entries\n", replayed));
+        }
         self.load_inodes()?;
         self.bitmap.load(BITMAP_START, self.data_blocks)?;
         self.recount_free_inodes();
+        self.tx_bitmap_dirty = false;
         self.mounted = true;
         Ok(())
     }
@@ -164,11 +173,15 @@ impl DiskFsV2 {
         // Zero journal area.
         self.zero_sectors(JOURNAL_START, JOURNAL_SECTORS)?;
 
+        self.journal = Journal::new();
+        self.tx_bitmap_dirty = false;
         self.mounted = true;
         Ok(())
     }
 
     pub fn remount(&mut self) -> Result<(), FsError> {
+        self.journal.abort();
+        self.tx_bitmap_dirty = false;
         self.mounted = false;
         self.mount(self.total_sectors)
     }
@@ -177,13 +190,88 @@ impl DiskFsV2 {
         if !self.mounted {
             return Err(FsError::StorageUnavailable);
         }
-        self.write_superblock()?;
-        self.flush_inodes()?;
-        self.bitmap.flush(BITMAP_START)
+        self.with_metadata_tx(|_| Ok(()))
     }
 
     pub fn is_mounted(&self) -> bool {
         self.mounted
+    }
+
+    fn with_metadata_tx<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, FsError>,
+    ) -> Result<R, FsError> {
+        if self.journal.is_active() {
+            return f(self);
+        }
+
+        self.journal.begin()?;
+        self.tx_bitmap_dirty = false;
+        match f(self) {
+            Ok(result) => {
+                self.commit_metadata_tx()?;
+                Ok(result)
+            }
+            Err(err) => {
+                self.journal.abort();
+                self.tx_bitmap_dirty = false;
+                Err(err)
+            }
+        }
+    }
+
+    fn commit_metadata_tx(&mut self) -> Result<(), FsError> {
+        let result = (|| {
+            if self.tx_bitmap_dirty {
+                self.flush_bitmap_metadata()?;
+            }
+            self.write_superblock()?;
+            self.journal.commit(JOURNAL_START, JOURNAL_SECTORS)?;
+            Ok(())
+        })();
+        if result.is_err() && self.journal.is_active() {
+            self.journal.abort();
+        }
+        self.tx_bitmap_dirty = false;
+        result
+    }
+
+    fn read_sector_overlay(
+        &self,
+        sector: u64,
+        out: &mut [u8; storage::SECTOR_SIZE],
+    ) -> Result<(), FsError> {
+        if self.journal.read_staged(sector as u32, out) {
+            return Ok(());
+        }
+        storage::read_sector(sector, out).map_err(|_| FsError::StorageIo)
+    }
+
+    fn write_metadata_sector(
+        &mut self,
+        sector: u64,
+        buf: &[u8; storage::SECTOR_SIZE],
+    ) -> Result<(), FsError> {
+        if self.journal.is_active() {
+            self.journal.stage(sector as u32, buf)
+        } else {
+            storage::write_sector(sector, buf).map_err(|_| FsError::StorageIo)
+        }
+    }
+
+    fn flush_bitmap_metadata(&mut self) -> Result<(), FsError> {
+        let mut sector_buf = [0u8; storage::SECTOR_SIZE];
+        for sector_idx in 0..BITMAP_SECTORS as usize {
+            self.bitmap.copy_sector(sector_idx, &mut sector_buf);
+            self.write_metadata_sector(BITMAP_START + sector_idx as u64, &sector_buf)?;
+        }
+        Ok(())
+    }
+
+    fn note_bitmap_dirty(&mut self) {
+        if self.journal.is_active() {
+            self.tx_bitmap_dirty = true;
+        }
     }
 
     // ── Superblock ──────────────────────────────────────────────────────
@@ -193,7 +281,7 @@ impl DiskFsV2 {
         &sector0[..8] == MAGIC
     }
 
-    fn write_superblock(&self) -> Result<(), FsError> {
+    fn write_superblock(&mut self) -> Result<(), FsError> {
         let mut sb = [0u8; storage::SECTOR_SIZE];
         sb[0..8].copy_from_slice(MAGIC);
         sb[8..10].copy_from_slice(&VERSION.to_le_bytes());
@@ -210,7 +298,7 @@ impl DiskFsV2 {
         sb[48..52].copy_from_slice(&(JOURNAL_START as u32).to_le_bytes());
         sb[52..56].copy_from_slice(&(JOURNAL_SECTORS as u32).to_le_bytes());
         sb[56..60].copy_from_slice(&ROOT_INO.to_le_bytes()); // root_inode
-        storage::write_sector(SUPERBLOCK_SECTOR, &sb).map_err(|_| FsError::StorageIo)
+        self.write_metadata_sector(SUPERBLOCK_SECTOR, &sb)
     }
 
     // ── Inode table I/O ─────────────────────────────────────────────────
@@ -232,7 +320,7 @@ impl DiskFsV2 {
         Ok(())
     }
 
-    fn flush_inodes(&self) -> Result<(), FsError> {
+    fn flush_inodes(&mut self) -> Result<(), FsError> {
         let mut sector_buf = [0u8; storage::SECTOR_SIZE];
         for sec in 0..INODE_TABLE_SECTORS {
             sector_buf.fill(0);
@@ -242,24 +330,31 @@ impl DiskFsV2 {
                     break;
                 }
                 let off = slot * INODE_BYTES;
-                encode_inode(&self.inodes[ino_idx], &mut sector_buf[off..off + INODE_BYTES]);
+                encode_inode(
+                    &self.inodes[ino_idx],
+                    &mut sector_buf[off..off + INODE_BYTES],
+                );
             }
-            storage::write_sector(INODE_TABLE_START + sec, &sector_buf)
-                .map_err(|_| FsError::StorageIo)?;
+            self.write_metadata_sector(INODE_TABLE_START + sec, &sector_buf)?;
         }
         Ok(())
     }
 
-    fn flush_one_inode(&self, ino: u32) -> Result<(), FsError> {
+    fn flush_one_inode(&mut self, ino: u32) -> Result<(), FsError> {
         let sec = ino as u64 / INODES_PER_SECTOR as u64;
         let mut sector_buf = [0u8; storage::SECTOR_SIZE];
-        storage::read_sector(INODE_TABLE_START + sec, &mut sector_buf)
-            .map_err(|_| FsError::StorageIo)?;
-        let slot = ino as usize % INODES_PER_SECTOR;
-        let off = slot * INODE_BYTES;
-        encode_inode(&self.inodes[ino as usize], &mut sector_buf[off..off + INODE_BYTES]);
-        storage::write_sector(INODE_TABLE_START + sec, &sector_buf)
-            .map_err(|_| FsError::StorageIo)
+        for slot in 0..INODES_PER_SECTOR {
+            let ino_idx = sec as usize * INODES_PER_SECTOR + slot;
+            if ino_idx >= INODE_COUNT as usize {
+                break;
+            }
+            let off = slot * INODE_BYTES;
+            encode_inode(
+                &self.inodes[ino_idx],
+                &mut sector_buf[off..off + INODE_BYTES],
+            );
+        }
+        self.write_metadata_sector(INODE_TABLE_START + sec, &sector_buf)
     }
 
     // ── Inode allocation ────────────────────────────────────────────────
@@ -279,12 +374,13 @@ impl DiskFsV2 {
         let idx = ino as usize;
         if idx < INODE_COUNT as usize {
             // Free all data blocks.
-            let inode = &self.inodes[idx];
+            let inode = self.inodes[idx];
             let bc = inode.block_count;
             for i in 0..bc.min(DIRECT_BLOCKS as u32) {
                 let blk = inode.direct[i as usize];
                 if blk != 0 {
                     self.bitmap.free(blk);
+                    self.note_bitmap_dirty();
                 }
             }
             // TODO: indirect block handling in future milestone
@@ -307,15 +403,33 @@ impl DiskFsV2 {
     // ── Data block I/O helpers ──────────────────────────────────────────
 
     /// Read data block `blk_idx` (index into data region).
-    fn read_block(&self, blk_idx: u32, buf: &mut [u8; storage::SECTOR_SIZE]) -> Result<(), FsError> {
+    fn read_block(
+        &self,
+        blk_idx: u32,
+        buf: &mut [u8; storage::SECTOR_SIZE],
+    ) -> Result<(), FsError> {
         let sector = DATA_REGION_START + blk_idx as u64;
-        storage::read_sector(sector, buf).map_err(|_| FsError::StorageIo)
+        self.read_sector_overlay(sector, buf)
     }
 
-    /// Write data block `blk_idx`.
-    fn write_block(&self, blk_idx: u32, buf: &[u8; storage::SECTOR_SIZE]) -> Result<(), FsError> {
+    /// Write data block payload (ordered mode, outside the journal).
+    fn write_block_data(
+        &self,
+        blk_idx: u32,
+        buf: &[u8; storage::SECTOR_SIZE],
+    ) -> Result<(), FsError> {
         let sector = DATA_REGION_START + blk_idx as u64;
         storage::write_sector(sector, buf).map_err(|_| FsError::StorageIo)
+    }
+
+    /// Write directory/indirect block metadata.
+    fn write_block_metadata(
+        &mut self,
+        blk_idx: u32,
+        buf: &[u8; storage::SECTOR_SIZE],
+    ) -> Result<(), FsError> {
+        let sector = DATA_REGION_START + blk_idx as u64;
+        self.write_metadata_sector(sector, buf)
     }
 
     /// Get the block index for logical block `logical` of inode `ino`.
@@ -362,15 +476,17 @@ impl DiskFsV2 {
         }
         for logical in current..needed {
             let new_blk = self.bitmap.alloc()?;
+            self.note_bitmap_dirty();
             if logical < DIRECT_BLOCKS as u32 {
                 self.inodes[ino as usize].direct[logical as usize] = new_blk;
             } else {
                 // Need indirect block.
                 if self.inodes[ino as usize].indirect == 0 {
                     let ind_blk = self.bitmap.alloc()?;
+                    self.note_bitmap_dirty();
                     // Zero indirect block.
                     let zero = [0u8; storage::SECTOR_SIZE];
-                    self.write_block(ind_blk, &zero)?;
+                    self.write_block_metadata(ind_blk, &zero)?;
                     self.inodes[ino as usize].indirect = ind_blk;
                 }
                 let ind_offset = logical - DIRECT_BLOCKS as u32;
@@ -378,7 +494,7 @@ impl DiskFsV2 {
                 self.read_block(self.inodes[ino as usize].indirect, &mut ind_buf)?;
                 let off = ind_offset as usize * 4;
                 ind_buf[off..off + 4].copy_from_slice(&new_blk.to_le_bytes());
-                self.write_block(self.inodes[ino as usize].indirect, &ind_buf)?;
+                self.write_block_metadata(self.inodes[ino as usize].indirect, &ind_buf)?;
             }
             self.inodes[ino as usize].block_count = logical + 1;
         }
@@ -415,7 +531,7 @@ impl DiskFsV2 {
         let mut off = 0usize;
         off = pack_dir_entry(&mut block, off, ROOT_INO, b".", FileType::Directory, false)?;
         let _ = pack_dir_entry(&mut block, off, ROOT_INO, b"..", FileType::Directory, true)?;
-        self.write_block(blk, &block)?;
+        self.write_block_metadata(blk, &block)?;
 
         // Size = amount of valid dir data in the block.
         // We set size to 512 for the full first block.
@@ -445,7 +561,8 @@ impl DiskFsV2 {
                     break;
                 }
                 if entry_ino != 0 && name_len as usize <= MAX_VNAME_LEN {
-                    let entry_name = &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
+                    let entry_name =
+                        &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
                     if entry_name == name {
                         return Ok((entry_ino, ftype));
                     }
@@ -474,7 +591,7 @@ impl DiskFsV2 {
             let blk = self.inode_block(parent, b)?;
             self.read_block(blk, &mut buf)?;
             if let Some(new_buf) = try_insert_entry(&mut buf, name, child_ino, ft, needed) {
-                self.write_block(blk, &new_buf)?;
+                self.write_block_metadata(blk, &new_buf)?;
                 return Ok(());
             }
         }
@@ -486,9 +603,8 @@ impl DiskFsV2 {
         let mut new_block = [0u8; storage::SECTOR_SIZE];
         // Pack entry spanning entire block.
         let _ = pack_dir_entry(&mut new_block, 0, child_ino, name, ft, true)?;
-        self.write_block(blk, &new_block)?;
-        self.inodes[parent as usize].size_bytes =
-            (new_logical + 1) * storage::SECTOR_SIZE as u32;
+        self.write_block_metadata(blk, &new_block)?;
+        self.inodes[parent as usize].size_bytes = (new_logical + 1) * storage::SECTOR_SIZE as u32;
         Ok(())
     }
 
@@ -508,7 +624,8 @@ impl DiskFsV2 {
                     break;
                 }
                 if entry_ino != 0 && name_len as usize <= MAX_VNAME_LEN {
-                    let entry_name = &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
+                    let entry_name =
+                        &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
                     if entry_name == name {
                         // Found it. Merge with previous entry or zero it.
                         if let Some(po) = prev_off {
@@ -520,7 +637,7 @@ impl DiskFsV2 {
                             // First entry in block -- just zero the inode field.
                             buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
                         }
-                        self.write_block(blk, &buf)?;
+                        self.write_block_metadata(blk, &buf)?;
                         return Ok(entry_ino);
                     }
                 }
@@ -546,7 +663,8 @@ impl DiskFsV2 {
                     break;
                 }
                 if entry_ino != 0 {
-                    let entry_name = &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
+                    let entry_name =
+                        &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
                     if entry_name != b"." && entry_name != b".." {
                         return Ok(false);
                     }
@@ -559,12 +677,7 @@ impl DiskFsV2 {
 
     // ── Reading/writing file data ───────────────────────────────────────
 
-    fn read_inode_data(
-        &self,
-        ino: u32,
-        offset: u32,
-        out: &mut [u8],
-    ) -> Result<usize, FsError> {
+    fn read_inode_data(&self, ino: u32, offset: u32, out: &mut [u8]) -> Result<usize, FsError> {
         let inode = &self.inodes[ino as usize];
         let size = inode.size_bytes;
         if offset >= size {
@@ -592,12 +705,7 @@ impl DiskFsV2 {
         Ok(read)
     }
 
-    fn write_inode_data(
-        &mut self,
-        ino: u32,
-        offset: u32,
-        data: &[u8],
-    ) -> Result<usize, FsError> {
+    fn write_inode_data(&mut self, ino: u32, offset: u32, data: &[u8]) -> Result<usize, FsError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -630,7 +738,7 @@ impl DiskFsV2 {
             let chunk = (storage::SECTOR_SIZE - off_in_block).min(data.len() - written);
             block_buf[off_in_block..off_in_block + chunk]
                 .copy_from_slice(&data[written..written + chunk]);
-            self.write_block(blk, &block_buf)?;
+            self.write_block_data(blk, &block_buf)?;
             written += chunk;
             pos += chunk as u32;
         }
@@ -741,12 +849,7 @@ impl VfsOps for DiskFsV2 {
         })
     }
 
-    fn read_data(
-        &self,
-        ino: InodeNum,
-        offset: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, FsError> {
+    fn read_data(&self, ino: InodeNum, offset: u32, buf: &mut [u8]) -> Result<usize, FsError> {
         let idx = ino as usize;
         if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
             return Err(FsError::NotFound);
@@ -754,17 +857,12 @@ impl VfsOps for DiskFsV2 {
         self.read_inode_data(ino, offset, buf)
     }
 
-    fn write_data(
-        &mut self,
-        ino: InodeNum,
-        offset: u32,
-        data: &[u8],
-    ) -> Result<usize, FsError> {
+    fn write_data(&mut self, ino: InodeNum, offset: u32, data: &[u8]) -> Result<usize, FsError> {
         let idx = ino as usize;
         if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
             return Err(FsError::NotFound);
         }
-        self.write_inode_data(ino, offset, data)
+        self.with_metadata_tx(|fs| fs.write_inode_data(ino, offset, data))
     }
 
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError> {
@@ -772,130 +870,125 @@ impl VfsOps for DiskFsV2 {
         if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
             return Err(FsError::NotFound);
         }
-        // Simple truncate: just update size. Block reclamation deferred.
-        self.inodes[idx].size_bytes = size;
-        self.flush_one_inode(ino)?;
-        Ok(())
+        self.with_metadata_tx(|fs| {
+            // Simple truncate: just update size. Block reclamation deferred.
+            fs.inodes[idx].size_bytes = size;
+            fs.flush_one_inode(ino)
+        })
     }
 
-    fn create(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        mode: u16,
-    ) -> Result<InodeNum, FsError> {
-        if name.len() > MAX_VNAME_LEN || name.is_empty() {
-            return Err(FsError::NameTooLong);
-        }
-        // Check for duplicates.
-        if self.dir_lookup(parent, name).is_ok() {
-            return Err(FsError::AlreadyExists);
-        }
-        let ino = self.alloc_inode()?;
-        self.inodes[ino as usize] = DiskInode {
-            mode: MODE_TYPE_REG | (mode & MODE_PERM_MASK),
-            uid: 0,
-            gid: 0,
-            link_count: 1,
-            size_bytes: 0,
-            block_count: 0,
-            created: 0,
-            modified: 0,
-            accessed: 0,
-            direct: [0; DIRECT_BLOCKS],
-            indirect: 0,
-            flags: 0,
-        };
-        self.dir_add_entry(parent, name, ino, FileType::Regular)?;
-        self.flush_one_inode(ino)?;
-        self.flush_one_inode(parent)?;
-        Ok(ino)
+    fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
+        self.with_metadata_tx(|fs| {
+            if name.len() > MAX_VNAME_LEN || name.is_empty() {
+                return Err(FsError::NameTooLong);
+            }
+            if fs.dir_lookup(parent, name).is_ok() {
+                return Err(FsError::AlreadyExists);
+            }
+            let ino = fs.alloc_inode()?;
+            fs.inodes[ino as usize] = DiskInode {
+                mode: MODE_TYPE_REG | (mode & MODE_PERM_MASK),
+                uid: 0,
+                gid: 0,
+                link_count: 1,
+                size_bytes: 0,
+                block_count: 0,
+                created: 0,
+                modified: 0,
+                accessed: 0,
+                direct: [0; DIRECT_BLOCKS],
+                indirect: 0,
+                flags: 0,
+            };
+            fs.dir_add_entry(parent, name, ino, FileType::Regular)?;
+            fs.flush_one_inode(ino)?;
+            fs.flush_one_inode(parent)?;
+            Ok(ino)
+        })
     }
 
-    fn mkdir(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        mode: u16,
-    ) -> Result<InodeNum, FsError> {
-        if name.len() > MAX_VNAME_LEN || name.is_empty() {
-            return Err(FsError::NameTooLong);
-        }
-        if self.dir_lookup(parent, name).is_ok() {
-            return Err(FsError::AlreadyExists);
-        }
-        let ino = self.alloc_inode()?;
-        self.inodes[ino as usize] = DiskInode {
-            mode: MODE_TYPE_DIR | (mode & MODE_PERM_MASK),
-            uid: 0,
-            gid: 0,
-            link_count: 2,
-            size_bytes: 0,
-            block_count: 0,
-            created: 0,
-            modified: 0,
-            accessed: 0,
-            direct: [0; DIRECT_BLOCKS],
-            indirect: 0,
-            flags: 0,
-        };
+    fn mkdir(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
+        self.with_metadata_tx(|fs| {
+            if name.len() > MAX_VNAME_LEN || name.is_empty() {
+                return Err(FsError::NameTooLong);
+            }
+            if fs.dir_lookup(parent, name).is_ok() {
+                return Err(FsError::AlreadyExists);
+            }
+            let ino = fs.alloc_inode()?;
+            fs.inodes[ino as usize] = DiskInode {
+                mode: MODE_TYPE_DIR | (mode & MODE_PERM_MASK),
+                uid: 0,
+                gid: 0,
+                link_count: 2,
+                size_bytes: 0,
+                block_count: 0,
+                created: 0,
+                modified: 0,
+                accessed: 0,
+                direct: [0; DIRECT_BLOCKS],
+                indirect: 0,
+                flags: 0,
+            };
 
-        // Allocate data block for . and .. entries.
-        let blk = self.bitmap.alloc()?;
-        self.inodes[ino as usize].direct[0] = blk;
-        self.inodes[ino as usize].block_count = 1;
-        self.inodes[ino as usize].size_bytes = storage::SECTOR_SIZE as u32;
+            let blk = fs.bitmap.alloc()?;
+            fs.note_bitmap_dirty();
+            fs.inodes[ino as usize].direct[0] = blk;
+            fs.inodes[ino as usize].block_count = 1;
+            fs.inodes[ino as usize].size_bytes = storage::SECTOR_SIZE as u32;
 
-        let mut block = [0u8; storage::SECTOR_SIZE];
-        let mut off = 0usize;
-        off = pack_dir_entry(&mut block, off, ino, b".", FileType::Directory, false)?;
-        let _ = pack_dir_entry(&mut block, off, parent, b"..", FileType::Directory, true)?;
-        self.write_block(blk, &block)?;
+            let mut block = [0u8; storage::SECTOR_SIZE];
+            let mut off = 0usize;
+            off = pack_dir_entry(&mut block, off, ino, b".", FileType::Directory, false)?;
+            let _ = pack_dir_entry(&mut block, off, parent, b"..", FileType::Directory, true)?;
+            fs.write_block_metadata(blk, &block)?;
 
-        // Add entry in parent.
-        self.dir_add_entry(parent, name, ino, FileType::Directory)?;
-        self.inodes[parent as usize].link_count =
-            self.inodes[parent as usize].link_count.saturating_add(1);
+            fs.dir_add_entry(parent, name, ino, FileType::Directory)?;
+            fs.inodes[parent as usize].link_count =
+                fs.inodes[parent as usize].link_count.saturating_add(1);
 
-        self.flush_one_inode(ino)?;
-        self.flush_one_inode(parent)?;
-        Ok(ino)
+            fs.flush_one_inode(ino)?;
+            fs.flush_one_inode(parent)?;
+            Ok(ino)
+        })
     }
 
     fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError> {
-        let (child_ino, ft) = self.dir_lookup(parent, name)?;
-        if ft == FileType::Directory {
-            return Err(FsError::IsADirectory);
-        }
-        self.dir_remove_entry(parent, name)?;
-        let inode = &mut self.inodes[child_ino as usize];
-        inode.link_count = inode.link_count.saturating_sub(1);
-        if inode.link_count == 0 {
-            self.free_inode(child_ino);
-        }
-        self.flush_one_inode(parent)?;
-        if child_ino < INODE_COUNT {
-            self.flush_one_inode(child_ino)?;
-        }
-        self.bitmap.flush(BITMAP_START)?;
-        Ok(())
+        self.with_metadata_tx(|fs| {
+            let (child_ino, ft) = fs.dir_lookup(parent, name)?;
+            if ft == FileType::Directory {
+                return Err(FsError::IsADirectory);
+            }
+            fs.dir_remove_entry(parent, name)?;
+            let inode = &mut fs.inodes[child_ino as usize];
+            inode.link_count = inode.link_count.saturating_sub(1);
+            if inode.link_count == 0 {
+                fs.free_inode(child_ino);
+            }
+            fs.flush_one_inode(parent)?;
+            if child_ino < INODE_COUNT {
+                fs.flush_one_inode(child_ino)?;
+            }
+            Ok(())
+        })
     }
 
     fn rmdir(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError> {
-        let (child_ino, ft) = self.dir_lookup(parent, name)?;
-        if ft != FileType::Directory {
-            return Err(FsError::NotADirectory);
-        }
-        if !self.dir_is_empty(child_ino)? {
-            return Err(FsError::DirectoryNotEmpty);
-        }
-        self.dir_remove_entry(parent, name)?;
-        self.inodes[parent as usize].link_count =
-            self.inodes[parent as usize].link_count.saturating_sub(1);
-        self.free_inode(child_ino);
-        self.flush_one_inode(parent)?;
-        self.bitmap.flush(BITMAP_START)?;
-        Ok(())
+        self.with_metadata_tx(|fs| {
+            let (child_ino, ft) = fs.dir_lookup(parent, name)?;
+            if ft != FileType::Directory {
+                return Err(FsError::NotADirectory);
+            }
+            if !fs.dir_is_empty(child_ino)? {
+                return Err(FsError::DirectoryNotEmpty);
+            }
+            fs.dir_remove_entry(parent, name)?;
+            fs.inodes[parent as usize].link_count =
+                fs.inodes[parent as usize].link_count.saturating_sub(1);
+            fs.free_inode(child_ino);
+            fs.flush_one_inode(parent)?;
+            Ok(())
+        })
     }
 
     fn readdir(
@@ -1052,10 +1145,8 @@ impl Vfs for DiskFsV2 {
                     }
                     FileType::Regular | FileType::Symlink => {
                         if written < out.len() {
-                            let flat_name = core::str::from_utf8(
-                                &prefix_buf[..full_len],
-                            )
-                            .unwrap_or("<invalid>");
+                            let flat_name = core::str::from_utf8(&prefix_buf[..full_len])
+                                .unwrap_or("<invalid>");
                             let mut de = DirEntry::empty();
                             de.set_name(flat_name);
                             let stat = self.stat(entry.ino);
@@ -1083,35 +1174,40 @@ impl Vfs for DiskFsV2 {
     }
 
     fn write(&mut self, path: &str, data: &[u8]) -> Result<usize, FsError> {
-        let p = Self::normalize_path(path);
-        if p.is_empty() {
-            return Err(FsError::InvalidPath);
-        }
-
-        // Resolve or create parent directories as needed.
-        let (parent_ino, file_name) = self.resolve_or_create_parents(p)?;
-
-        // Look up or create the file.
-        let ino = match self.dir_lookup(parent_ino, file_name) {
-            Ok((ino, _)) => {
-                // Truncate existing file.
-                self.inodes[ino as usize].size_bytes = 0;
-                ino
+        self.with_metadata_tx(|fs| {
+            let p = Self::normalize_path(path);
+            if p.is_empty() {
+                return Err(FsError::InvalidPath);
             }
-            Err(FsError::NotFound) => self.create(parent_ino, file_name, 0o644)?,
-            Err(e) => return Err(e),
-        };
 
-        self.write_inode_data(ino, 0, data)
+            let (parent_ino, file_name) = fs.resolve_or_create_parents(p)?;
+            let ino = match fs.dir_lookup(parent_ino, file_name) {
+                Ok((ino, _)) => {
+                    fs.inodes[ino as usize].size_bytes = 0;
+                    ino
+                }
+                Err(FsError::NotFound) => fs.create(parent_ino, file_name, 0o644)?,
+                Err(e) => return Err(e),
+            };
+
+            if data.is_empty() {
+                fs.flush_one_inode(ino)?;
+                return Ok(0);
+            }
+
+            fs.write_inode_data(ino, 0, data)
+        })
     }
 
     fn delete(&mut self, path: &str) -> Result<(), FsError> {
-        let p = Self::normalize_path(path);
-        if p.is_empty() {
-            return Err(FsError::InvalidPath);
-        }
-        let (parent_ino, file_name) = self.resolve_parent(p)?;
-        self.unlink(parent_ino, file_name)
+        self.with_metadata_tx(|fs| {
+            let p = Self::normalize_path(path);
+            if p.is_empty() {
+                return Err(FsError::InvalidPath);
+            }
+            let (parent_ino, file_name) = fs.resolve_parent(p)?;
+            fs.unlink(parent_ino, file_name)
+        })
     }
 
     fn file_count(&self) -> usize {
@@ -1125,7 +1221,10 @@ impl Vfs for DiskFsV2 {
 
 impl DiskFsV2 {
     /// Auto-create intermediate directories for compat `write()`.
-    fn resolve_or_create_parents<'a>(&mut self, path: &'a [u8]) -> Result<(u32, &'a [u8]), FsError> {
+    fn resolve_or_create_parents<'a>(
+        &mut self,
+        path: &'a [u8],
+    ) -> Result<(u32, &'a [u8]), FsError> {
         let components: [&[u8]; 8] = {
             let mut arr: [&[u8]; 8] = [&[]; 8];
             let mut idx = 0;

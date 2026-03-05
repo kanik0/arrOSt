@@ -4,25 +4,27 @@ ArrOSt exposes a small VFS facade with disk-backed and RAM-backed implementation
 
 ## Backends
 
-- `diskfs-v0`: preferred when storage backend is ready.
+- `diskfs-v2`: preferred when storage backend is ready.
 - `ramfs`: automatic fallback when storage is unavailable.
 
 ## Capabilities
 
-- Flat file listing (`ls`)
+- Hierarchical path resolution with real directories
+- `.` / `..` handling in path walks
 - Read file (`cat`)
 - Write/overwrite file (`echo <text> > <file>`)
 - Delete file
+- Directory creation through the inode-based VFS layer
 - Copy file
-- Sync/reload operations through shell commands
+- Metadata sync/reload operations through shell commands
+- Metadata-only journal replay on mount for `diskfs-v2`
 
 ## Limits
 
-- Flat namespace (no hierarchical directories).
-- Fixed file/table limits defined by backend constants.
+- Fixed-size `diskfs-v2` metadata layout: 256 inodes, 16 MiB virtio disk image, 512-byte blocks.
+- Metadata journaling is redo-only; file data uses ordered writes and is not journaled.
 - Intended for deterministic kernel bring-up and tooling support, not full POSIX compatibility.
-- Slash-separated names are stored as flat keys (no real directory metadata).
-- Built-in `/bin/*` command entries are persisted as regular filesystem records (`bin/<name>`).
+- No file-descriptor syscalls or permission enforcement yet.
 
 ## User-visible shell commands
 
@@ -49,6 +51,7 @@ ArrOSt exposes a small VFS facade with disk-backed and RAM-backed implementation
 ## Relevant files
 
 - `kernel/src/fs/mod.rs`
-- `kernel/src/fs/diskfs.rs`
+- `kernel/src/fs/diskfs_v2.rs`
+- `kernel/src/fs/journal.rs`
 - `kernel/src/fs/ramfs.rs`
 - `kernel/src/shell.rs`

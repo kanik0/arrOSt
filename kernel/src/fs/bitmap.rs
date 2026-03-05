@@ -4,8 +4,8 @@
 // It is stored on disk as a contiguous range of sectors; in memory we
 // keep a fixed-size array large enough for our 16 MiB disk.
 
-use crate::storage;
 use super::FsError;
+use crate::storage;
 
 /// Maximum bitmap size in bytes.  32 sectors x 512 = 16384 bytes = 131072 bits.
 /// That covers up to 131072 data blocks (64 MiB at 512 bytes/block), more than
@@ -63,6 +63,11 @@ impl Bitmap {
                 .map_err(|_| FsError::StorageIo)?;
         }
         Ok(())
+    }
+
+    pub fn copy_sector(&self, sector_index: usize, out: &mut [u8; storage::SECTOR_SIZE]) {
+        let off = sector_index * storage::SECTOR_SIZE;
+        out.copy_from_slice(&self.data[off..off + storage::SECTOR_SIZE]);
     }
 
     /// Allocate a single free block. Returns its index.

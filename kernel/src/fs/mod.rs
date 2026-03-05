@@ -6,6 +6,7 @@
 mod bitmap;
 mod diskfs_v1;
 mod diskfs_v2;
+mod journal;
 mod migrate;
 mod ramfs;
 
@@ -98,18 +99,8 @@ pub trait VfsOps {
     fn read_data(&self, ino: InodeNum, offset: u32, buf: &mut [u8]) -> Result<usize, FsError>;
     fn write_data(&mut self, ino: InodeNum, offset: u32, data: &[u8]) -> Result<usize, FsError>;
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError>;
-    fn create(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        mode: u16,
-    ) -> Result<InodeNum, FsError>;
-    fn mkdir(
-        &mut self,
-        parent: InodeNum,
-        name: &[u8],
-        mode: u16,
-    ) -> Result<InodeNum, FsError>;
+    fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError>;
+    fn mkdir(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError>;
     fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
     fn rmdir(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
     fn readdir(
@@ -318,11 +309,8 @@ impl FsState {
             serial::write_line("FS: diskfs-v1 detected, starting migration");
             // Mount v1 read-only to extract data.
             self.diskfs_v1.init()?;
-            match migrate::migrate_v1_to_v2(
-                &mut self.diskfs_v1,
-                &mut self.diskfs_v2,
-                total_sectors,
-            ) {
+            match migrate::migrate_v1_to_v2(&mut self.diskfs_v1, &mut self.diskfs_v2, total_sectors)
+            {
                 Ok(()) => {
                     serial::write_line("FS: diskfs-v2 ready after migration");
                     return Ok(());

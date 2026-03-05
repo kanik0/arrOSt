@@ -30,7 +30,8 @@ Storage initialization report includes:
 ## Limits
 
 - QEMU/virtio focused implementation.
-- No advanced caching/journaling layer.
+- No storage-device cache or journal below the filesystem layer.
+- `diskfs-v2` now provides its own metadata-only redo journal above sector I/O.
 - No multi-device scheduling yet.
 
 ## Relevant files
