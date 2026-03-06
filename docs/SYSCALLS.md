@@ -114,22 +114,25 @@ Filesystem syscall behavior is mediated by the mount-aware VFS:
 - `dup`/`dup2` alias an existing open file description and preserve the shared offset/flags model of the per-process fd table.
 - Path walks now follow symlinks up to 8 hops and return `ELOOP` on loops or excessive depth.
 - Permission enforcement uses inode `uid`/`gid`/`mode`; current ring-3 runtime is treated as `uid=1000 gid=1000`.
+- Ring-3 user pointers are copied through the owning process address-space token; kernel syscall handlers do not dereference user virtual addresses directly.
+- Invalid or unmapped user pointers return `EFAULT`; a hardware user-mode fault during runtime marks the process `faulted` and resumes the kernel scheduler.
 
 ## Status
 
-The ABI is active for cooperative and ring-3 runtime paths. Full userspace isolation and broader syscall coverage are planned but not yet implemented.
+The ABI is active for cooperative and ring-3 runtime paths.
+Ring-3 ELF processes now run with per-process address-space ownership, dedicated user virtual mappings for ELF segments/stack, and explicit kernel copy boundaries.
 On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DPL=3) wired to a register-based kernel entry path.
+`x86_64` also traps CPL3 page faults back into the kernel runtime, marks the active ring-3 task faulted, and resumes scheduling instead of halting the kernel.
 On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to process-layer ring-3 syscall dispatch.
 On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, syscall args in `x0..x5`, return value in `x0`.
 When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an optional architecture-specific user->kernel smoke sequence (`getpid/time_ms/exit`) before entering the main loop (`int 0x80` on `x86_64`, `SVC` on `aarch64`).
 When `ARROST_RING3_BOOT_SMOKE_FAULT=true` is also set (aarch64 only), boot smoke intentionally triggers a controlled EL0 sync fault to validate fallback/resume diagnostics.
 Those smoke sequences are dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contribute to shared syscall statistics.
 A cross-platform shell command (`ring3 smoke`) also exercises ring-3 policy dispatch through that same process-layer context (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) without requiring hardware ring transition support.
-With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into user ranges and validates process-model metadata (`trapframe`, kernel stack top), range-checked pointer dispatch (`copy_from_user`/`copy_to_user`), and the filesystem descriptor syscall path (`open/fread/fwrite/seek/fstat/dup/dup2`).
+With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into a private user virtual range, validates process-model metadata (`trapframe`, kernel stack top), page-table based pointer dispatch (`copy_from_user`/`copy_to_user`), and the filesystem descriptor syscall path (`open/fread/fwrite/seek/fstat/dup/dup2`).
 With `ARROST_RING3_ELF_GROUNDWORK=true`, shell command `ring3 run <init|doom>` enqueues embedded native ELF artifacts (`ring3_init`/`ring3_doom`) into the ring-3 multiprocess scheduler through the architecture gate (`int 0x80`/`SVC`).
 Ring-3 runtime dispatch handles `yield` and `sleep` as scheduler preemption points, and `xtask smoke-ring3-run` validates multiprocess runtime (`init` + `doom`) plus `yield/sleep/exit` flow on both architectures.
-Runtime launch stores process address-space token metadata and performs switch/restore around user execution (current groundwork is partial: x86 clones active P4 root; aarch64 currently reuses TTBR0 token).
-Current aarch64 groundwork runtime path uses per-process trapframe stack metadata for launch entry; user-page permission tagging is best-effort when page-table layout is block-mapped/firmware-constrained.
+Runtime launch stores process address-space token metadata and performs switch/restore around user execution on both architectures.
 
 ## Userland shim
 

@@ -231,6 +231,30 @@ pub fn dispatch_int80(
     Some(result)
 }
 
+pub fn handle_page_fault(
+    fault_addr: u64,
+    user_rip: u64,
+    user_rsp: u64,
+    error_code: u64,
+    from_ring3: bool,
+) -> bool {
+    if RING3_SMOKE_STATE.load(Ordering::Acquire) != STATE_ARMED || !from_ring3 {
+        return false;
+    }
+
+    serial::write_fmt(format_args!(
+        "ring3 run: page fault addr={:#018x} rip={:#018x} rsp={:#018x} err={:#x} -> kernel resume\n",
+        fault_addr, user_rip, user_rsp, error_code
+    ));
+    RING3_SMOKE_STATE.store(STATE_FAILED, Ordering::Release);
+    proc::mark_active_ring3_fault();
+    RING3_SMOKE_TRAP_RIP.store(user_rip, Ordering::Release);
+    RING3_SMOKE_TRAP_RSP.store(user_rsp, Ordering::Release);
+    RING3_SMOKE_TRAP_RET.store(errno::EFAULT as u64, Ordering::Release);
+    RING3_SMOKE_TRAP_VALID.store(1, Ordering::Release);
+    resume_boot_smoke_to_kernel();
+}
+
 fn boot_smoke_enabled() -> bool {
     matches!(
         RING3_BOOT_SMOKE_ENV,

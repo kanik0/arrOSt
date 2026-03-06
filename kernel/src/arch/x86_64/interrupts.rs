@@ -1,12 +1,13 @@
 // kernel/src/arch/x86_64/interrupts.rs: IDT and interrupt handlers for M3.
-use crate::arch::x86_64::{gdt, pic, pit, port, syscall};
+use crate::arch::x86_64::{gdt, pic, pit, port, ring3, syscall};
 use crate::{input, keyboard, mouse, serial, time};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 static IDT_READY: AtomicBool = AtomicBool::new(false);
 static USER_CODE_SELECTOR: AtomicU16 = AtomicU16::new(0);
@@ -66,6 +67,7 @@ pub fn init() -> InterruptInitReport {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            idt.page_fault.set_handler_fn(page_fault_handler);
             // SAFETY: entry address points to a dedicated naked int80 handler with iretq return.
             idt[SYSCALL_VECTOR]
                 .set_handler_addr(VirtAddr::new(syscall::int80_entry_addr()))
@@ -152,6 +154,35 @@ extern "x86-interrupt" fn double_fault_handler(
     loop {
         hlt();
     }
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    let fault_addr = match Cr2::read() {
+        Ok(addr) => addr.as_u64(),
+        Err(_) => 0,
+    };
+    let from_ring3 = error_code.contains(PageFaultErrorCode::USER_MODE)
+        || (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_page_fault(
+        fault_addr,
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        error_code.bits(),
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: PAGE FAULT addr={:#018x} err={:#x}\n",
+        fault_addr,
+        error_code.bits()
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {

@@ -49,12 +49,15 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 
 - Cooperative path remains available for legacy worker flow (`spawn`, `waitpid`) in shared kernel address space.
 - With `ARROST_RING3_ELF_GROUNDWORK=true`, `ring3 run <init|doom>` enqueues embedded native ELFs (`ring3_init`, `ring3_doom`) into the ring-3 process table.
+- Ring-3 ELFs are linked into a dedicated user virtual range (`0x0000_2000_...`) and loaded into per-process page tables instead of running from kernel heap virtual addresses.
 - Ring-3 scheduler is round-robin with multiprocess state tracking (`ready`, `running`, `sleep`, `exited`, `faulted`) and explicit reap.
 - Ring-3 shell controls:
   - `ring3 ps`
   - `ring3 wait <pid|any|all>`
 - Ring-3 preemption points are enforced at syscall/trap boundaries (`yield`, `sleep`, `exit`, plus syscall-timeslice return to kernel).
 - `x86_64` uses CPL3 `int 0x80`; `aarch64` uses EL0 `SVC`; both route through shared process-layer capability policy and accounting.
+- Ring-3 syscalls copy user buffers through the owning process address space; the kernel never blindly dereferences user virtual pointers.
+- User-mode CPU faults transition the active ring-3 task to `faulted` and return to the kernel runtime.
 - `xtask smoke-ring3-run` validates cross-platform multiprocess runtime (`init` + `doom`) with `yield/sleep/exit` flow.
 - Optional boot smoke remains available:
   - `ARROST_RING3_BOOT_SMOKE=true`
@@ -62,15 +65,19 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 
 ## Current limits
 
-- Process isolation groundwork is partial (shared kernel mappings, architecture-specific address-space limitations).
+- Kernel mappings are still present in each ring-3 page table, but remain supervisor-only.
+- User apps are still embedded build artifacts; there is no filesystem-backed `execve` path yet.
 - Preemption is not yet hard timer-driven at arbitrary instruction boundaries.
 - Syscall surface remains intentionally small.
 
 ## Relevant files
 
 - `crates/arrostd/src/lib.rs`
+- `user/user_x86_64.ld`
+- `user/user_aarch64.ld`
 - `user/init/src/lib.rs`
 - `user/doom/src/lib.rs`
 - `kernel/src/proc/mod.rs`
+- `kernel/src/proc/ring3_groundwork.rs`
 - `kernel/src/arch/x86_64/ring3.rs`
 - `kernel/src/arch/aarch64/syscall.rs`

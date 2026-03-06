@@ -15,6 +15,7 @@ It also serves the active ring-3 runtime path (`int 0x80`) used by the multiproc
 - Program PIT timer frequency.
 - Dispatch keyboard and mouse IRQ handlers.
 - Install a user-callable software interrupt gate (`int 0x80`, DPL=3) with register-based syscall entry.
+- Contain CPL3 page faults by marking the active ring-3 task `faulted` and resuming the kernel scheduler.
 - Keep interrupt-driven time and input queues updated.
 - Provide PIT-based polling fallback ticks when interrupts are disabled.
 - Support an optional boot-time ring-3 smoke (`ARROST_RING3_BOOT_SMOKE=true`) that enters CPL3, executes `int 0x80` syscalls (`getpid/time_ms/exit`), and resumes kernel runtime.
@@ -25,6 +26,7 @@ It also serves the active ring-3 runtime path (`int 0x80`) used by the multiproc
 
 - Breakpoint exception handler
 - Double-fault handler (halt loop)
+- Page-fault handler with ring-3 fault containment path
 - `int 0x80` syscall entry/dispatcher (x86_64, DPL=3 gate)
 - Timer IRQ handler
 - Keyboard IRQ handler
@@ -69,6 +71,7 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 - No IRQ-driven keyboard/mouse/audio/storage/network path is active yet.
 - Optional boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) attempts EL0 `SVC` (`getpid/time_ms/exit`) and resumes kernel runtime on success/fault with serial diagnostics.
 - Runtime scheduling (`ring3 run <init|doom>`, gated by `ARROST_RING3_ELF_GROUNDWORK=true`) enters EL0 via `SVC`-capable context and resumes EL1 runtime at scheduler preemption points (`yield/sleep/exit`, syscall-timeslice return, or fault).
+- Unexpected lower-EL sync faults during runtime mark the active ring-3 task `faulted` and return control to the kernel runtime instead of halting the whole system.
 - Optional fault variant (`ARROST_RING3_BOOT_SMOKE=true` + `ARROST_RING3_BOOT_SMOKE_FAULT=true`) injects EL0 `BRK` and verifies controlled lower-EL fault fallback/resume behavior.
 
 ## Runtime loop timer model

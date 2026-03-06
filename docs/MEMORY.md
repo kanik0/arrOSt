@@ -7,6 +7,8 @@ ArrOSt memory initialization sets up early allocator state and memory diagnostic
 - Collect and report memory map statistics for the active architecture.
 - Initialize a fixed kernel heap allocator for early runtime needs.
 - Provide virtual/physical translation helpers used by virtio drivers.
+- Provide the translation primitives used by ring-3 copy boundaries (`copy_from_user` / `copy_to_user`).
+- Support per-process ring-3 page-table ownership and user-page mapping.
 
 ## Current implementation
 
@@ -22,6 +24,13 @@ Architecture notes:
 - `x86_64`: uses bootloader-provided memory regions (`BootInfo`) for stats and mapping metadata.
 - `aarch64`: receives optional UEFI memory-map handoff from the UEFI loader after `ExitBootServices`; if present it is used for stats and translation hints, otherwise a conservative heap-only fallback report is emitted.
 
+Ring-3 runtime notes:
+
+- Ring-3 ELF processes now own a dedicated address-space root per process.
+- User ELF segments and stacks are mapped into a dedicated user virtual range (current linker scripts place user code/data near `0x0000_2000_0000_0000`).
+- Kernel/user copies translate user virtual addresses through the owning process page tables and then access the backing memory via kernel-visible physical aliases.
+- Kernel mappings remain shared into each process page table as supervisor-only entries.
+
 Heap allocator:
 
 - Bump-style global allocator for current kernel scope.
@@ -35,11 +44,12 @@ Heap allocator:
 
 ## Limits
 
-- No per-process address spaces yet.
 - No advanced allocator strategy (fragmentation-aware allocator is not implemented yet).
 - No demand paging or swap.
+- No copy-on-write, lazy allocation, or demand-faulted user-page population.
 
 ## Relevant files
 
 - `kernel/src/mem/mod.rs`
+- `kernel/src/proc/ring3_groundwork.rs`
 - `kernel/src/main.rs`

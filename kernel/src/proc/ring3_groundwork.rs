@@ -9,16 +9,61 @@ use x86_64::PhysAddr;
 #[cfg(target_arch = "x86_64")]
 use x86_64::registers::control::Cr3;
 #[cfg(target_arch = "x86_64")]
-use x86_64::structures::paging::{PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 pub const MAX_USER_RANGES: usize = 8;
 
+const USER_PAGE_BYTES: usize = 4096;
 const USER_STACK_BYTES: usize = 16 * 1024;
+const USER_STACK_GAP_BYTES: u64 = 64 * 1024;
 const KERNEL_STACK_BYTES: usize = 8 * 1024;
 const MAX_LOADABLE_SEGMENT_BYTES: usize = 128 * 1024;
 const SMOKE_SEGMENT_SCRATCH_BYTES: usize = 512;
 const SMOKE_ELF_SEGMENT_OFFSET: usize = 0x100;
-const SMOKE_ELF_BASE_VADDR: u64 = 0x0040_0000;
+const SMOKE_ELF_BASE_VADDR: u64 = 0x0000_2000_0000_0000;
+
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_VALID: u64 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_TABLE_OR_PAGE: u64 = 1 << 1;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_AP_MASK: u64 = 0b11 << 6;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_AP_EL1_RW_EL0_RW: u64 = 0b01 << 6;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_AP_EL1_RO_EL0_RO: u64 = 0b11 << 6;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_AF: u64 = 1 << 10;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_TABLE_UXN: u64 = 1 << 54;
+
+#[repr(C, align(4096))]
+struct UserPage {
+    bytes: [u8; USER_PAGE_BYTES],
+}
+
+impl UserPage {
+    fn zeroed() -> Self {
+        Self {
+            bytes: [0; USER_PAGE_BYTES],
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(4096))]
+struct Aarch64PageTable {
+    entries: [u64; 512],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64PageTable {
+    fn new() -> Self {
+        Self { entries: [0; 512] }
+    }
+}
 
 const ELF_HEADER_SIZE: usize = 64;
 const ELF_IDENT_SIZE: usize = 16;
@@ -139,7 +184,7 @@ pub enum Ring3ElfLoadError {
     TooManyUserRanges,
     EntryOutsideLoadableSegments { entry: u64 },
     AddressSpaceCreate(&'static str),
-    UserPageMap(mem::UserPageError),
+    AddressSpaceMap(&'static str),
 }
 
 impl fmt::Display for Ring3ElfLoadError {
@@ -160,8 +205,10 @@ impl fmt::Display for Ring3ElfLoadError {
             Self::EntryOutsideLoadableSegments { entry } => {
                 write!(f, "ELF entry not mapped by PT_LOAD segments: {entry:#018x}")
             }
-            Self::AddressSpaceCreate(error) => write!(f, "failed to create address space: {error}"),
-            Self::UserPageMap(error) => write!(f, "failed to mark user pages: {error}"),
+            Self::AddressSpaceCreate(error) => {
+                write!(f, "failed to create address space: {error}")
+            }
+            Self::AddressSpaceMap(error) => write!(f, "failed to map process pages: {error}"),
         }
     }
 }
@@ -174,7 +221,8 @@ pub struct Ring3ProcessImage {
     pub mapped_pages: usize,
     pub address_space: AddressSpaceToken,
     _address_space_owner: AddressSpaceOwner,
-    _owned_buffers: Vec<Box<[u8]>>,
+    _owned_kernel_buffers: Vec<Box<[u8]>>,
+    _owned_user_pages: Vec<Box<UserPage>>,
 }
 
 #[derive(Clone, Copy)]
@@ -190,12 +238,18 @@ impl AddressSpaceToken {
 
 #[cfg(target_arch = "x86_64")]
 enum AddressSpaceOwner {
-    X86Root { _root: Box<PageTable> },
+    X86Root {
+        _root: Box<PageTable>,
+        _tables: Vec<Box<PageTable>>,
+    },
 }
 
 #[cfg(target_arch = "aarch64")]
 enum AddressSpaceOwner {
-    None,
+    Aarch64Root {
+        _root: Box<Aarch64PageTable>,
+        _tables: Vec<Box<Aarch64PageTable>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,6 +258,7 @@ pub enum UserCopyError {
     AddressOverflow,
     OutOfRange,
     NotWritable,
+    PageNotMapped,
 }
 
 impl fmt::Display for UserCopyError {
@@ -213,6 +268,7 @@ impl fmt::Display for UserCopyError {
             Self::AddressOverflow => write!(f, "address overflow"),
             Self::OutOfRange => write!(f, "address outside user ranges"),
             Self::NotWritable => write!(f, "address not writable"),
+            Self::PageNotMapped => write!(f, "user page not mapped"),
         }
     }
 }
@@ -280,7 +336,7 @@ pub fn switch_to_address_space(
                 options(nostack)
             );
         }
-        return Ok(current);
+        Ok(current)
     }
 }
 
@@ -343,6 +399,7 @@ pub fn validate_user_access(
 pub fn copy_from_user_bytes(
     user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
     user_range_count: usize,
+    address_space: AddressSpaceToken,
     src_ptr: u64,
     dst: &mut [u8],
 ) -> Result<(), UserCopyError> {
@@ -350,17 +407,13 @@ pub fn copy_from_user_bytes(
         return Ok(());
     }
     validate_user_access(user_ranges, user_range_count, src_ptr, dst.len(), false)?;
-
-    // SAFETY: range validation above ensures src_ptr..src_ptr+len stays inside declared user ranges.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src_ptr as *const u8, dst.as_mut_ptr(), dst.len());
-    }
-    Ok(())
+    copy_user_bytes_from_process(address_space, src_ptr, dst)
 }
 
 pub fn copy_to_user_bytes(
     user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
     user_range_count: usize,
+    address_space: AddressSpaceToken,
     dst_ptr: u64,
     src: &[u8],
 ) -> Result<(), UserCopyError> {
@@ -368,17 +421,13 @@ pub fn copy_to_user_bytes(
         return Ok(());
     }
     validate_user_access(user_ranges, user_range_count, dst_ptr, src.len(), true)?;
-
-    // SAFETY: range validation above ensures dst_ptr..dst_ptr+len stays inside writable user ranges.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr as *mut u8, src.len());
-    }
-    Ok(())
+    copy_user_bytes_to_process(address_space, dst_ptr, src)
 }
 
 pub fn copy_from_user<T: Copy>(
     user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
     user_range_count: usize,
+    address_space: AddressSpaceToken,
     src_ptr: u64,
 ) -> Result<T, UserCopyError> {
     if size_of::<T>() == 0 {
@@ -389,7 +438,7 @@ pub fn copy_from_user<T: Copy>(
     // SAFETY: we only reinterpret initialized bytes as T after a full byte copy.
     let dst =
         unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
-    copy_from_user_bytes(user_ranges, user_range_count, src_ptr, dst)?;
+    copy_from_user_bytes(user_ranges, user_range_count, address_space, src_ptr, dst)?;
     // SAFETY: `dst` was fully initialized by copy_from_user_bytes.
     Ok(unsafe { value.assume_init() })
 }
@@ -397,6 +446,7 @@ pub fn copy_from_user<T: Copy>(
 pub fn copy_to_user<T: Copy>(
     user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
     user_range_count: usize,
+    address_space: AddressSpaceToken,
     dst_ptr: u64,
     value: &T,
 ) -> Result<(), UserCopyError> {
@@ -406,7 +456,7 @@ pub fn copy_to_user<T: Copy>(
     // SAFETY: reinterpretation to bytes preserves layout for plain copy.
     let src =
         unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
-    copy_to_user_bytes(user_ranges, user_range_count, dst_ptr, src)
+    copy_to_user_bytes(user_ranges, user_range_count, address_space, dst_ptr, src)
 }
 
 fn load_process_image(
@@ -417,8 +467,12 @@ fn load_process_image(
     let mut user_ranges = empty_user_ranges();
     let mut user_range_count = 0usize;
     let mut mapped_pages = 0usize;
-    let mut entry_runtime = None;
-    let mut owned_buffers = Vec::<Box<[u8]>>::new();
+    let mut entry_mapped = false;
+    let mut highest_user_end = header.entry;
+    let mut owned_kernel_buffers = Vec::<Box<[u8]>>::new();
+    let mut owned_user_pages = Vec::<Box<UserPage>>::new();
+    let (address_space, mut address_space_owner) =
+        create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
 
     for index in 0..header.program_header_count {
         let ph = parse_program_header(elf_bytes, &header, index)?;
@@ -449,56 +503,102 @@ fn load_process_image(
             return Err(Ring3ElfLoadError::SegmentBounds);
         }
 
-        let mut segment = vec![0u8; mem_size].into_boxed_slice();
-        segment[..file_size].copy_from_slice(&elf_bytes[file_offset..file_end]);
-        let segment_start = segment.as_ptr() as u64;
-        let pages = if (ph.flags & ELF_PF_X) != 0 {
-            mem::make_user_code_accessible(segment_start as usize, segment.len())
-        } else {
-            mem::make_user_accessible(segment_start as usize, segment.len())
-        }
-        .map_err(Ring3ElfLoadError::UserPageMap)?;
-        mapped_pages = mapped_pages.saturating_add(pages);
-
         let writable = (ph.flags & ELF_PF_W) != 0;
+        let executable = (ph.flags & ELF_PF_X) != 0;
+        let segment_start = ph.virtual_addr;
+        let segment_end = segment_start
+            .checked_add(ph.mem_size)
+            .ok_or(Ring3ElfLoadError::SegmentBounds)?;
         append_user_range(
             &mut user_ranges,
             &mut user_range_count,
-            UserMemoryRange::new(segment_start, segment.len() as u64, writable),
+            UserMemoryRange::new(segment_start, ph.mem_size, writable),
         )?;
-
-        if let Some(offset) = entry_offset_in_segment(header.entry, ph.virtual_addr, ph.mem_size) {
-            entry_runtime = Some(segment_start.saturating_add(offset));
+        highest_user_end = highest_user_end.max(segment_end);
+        if entry_offset_in_segment(header.entry, segment_start, ph.mem_size).is_some() {
+            entry_mapped = true;
         }
 
-        owned_buffers.push(segment);
+        let page_base = align_down(segment_start, USER_PAGE_BYTES as u64);
+        let page_offset = usize::try_from(segment_start.saturating_sub(page_base))
+            .map_err(|_| Ring3ElfLoadError::SegmentBounds)?;
+        let page_count = page_count_for_span(page_offset, mem_size)?;
+
+        for page_index in 0..page_count {
+            let page_index_u64 =
+                u64::try_from(page_index).map_err(|_| Ring3ElfLoadError::SegmentBounds)?;
+            let page_vaddr = page_base
+                .checked_add(page_index_u64.saturating_mul(USER_PAGE_BYTES as u64))
+                .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+            let mut page = Box::new(UserPage::zeroed());
+            populate_segment_page(
+                &mut page,
+                page_index,
+                page_offset,
+                file_offset,
+                file_size,
+                elf_bytes,
+            )?;
+            map_user_page(
+                &mut address_space_owner,
+                address_space,
+                page_vaddr,
+                &page,
+                writable,
+                executable,
+            )
+            .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
+            mapped_pages = mapped_pages.saturating_add(1);
+            owned_user_pages.push(page);
+        }
     }
 
-    let entry_ip = entry_runtime.ok_or(Ring3ElfLoadError::EntryOutsideLoadableSegments {
-        entry: header.entry,
-    })?;
+    let entry_ip = entry_mapped.then_some(header.entry).ok_or(
+        Ring3ElfLoadError::EntryOutsideLoadableSegments {
+            entry: header.entry,
+        },
+    )?;
 
-    let user_stack = vec![0u8; USER_STACK_BYTES].into_boxed_slice();
-    let user_stack_start = user_stack.as_ptr() as u64;
-    let pages = mem::make_user_accessible(user_stack_start as usize, user_stack.len())
-        .map_err(Ring3ElfLoadError::UserPageMap)?;
-    mapped_pages = mapped_pages.saturating_add(pages);
+    let stack_start = align_up(
+        highest_user_end
+            .checked_add(USER_STACK_GAP_BYTES)
+            .ok_or(Ring3ElfLoadError::SegmentBounds)?,
+        USER_PAGE_BYTES as u64,
+    )
+    .ok_or(Ring3ElfLoadError::SegmentBounds)?;
     append_user_range(
         &mut user_ranges,
         &mut user_range_count,
-        UserMemoryRange::new(user_stack_start, user_stack.len() as u64, true),
+        UserMemoryRange::new(stack_start, USER_STACK_BYTES as u64, true),
     )?;
-    let user_sp = align_down(user_stack_start.saturating_add(user_stack.len() as u64), 16);
-    owned_buffers.push(user_stack);
+    let stack_pages = USER_STACK_BYTES.div_ceil(USER_PAGE_BYTES);
+    for page_index in 0..stack_pages {
+        let page_index_u64 =
+            u64::try_from(page_index).map_err(|_| Ring3ElfLoadError::SegmentBounds)?;
+        let page_vaddr = stack_start
+            .checked_add(page_index_u64.saturating_mul(USER_PAGE_BYTES as u64))
+            .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+        let page = Box::new(UserPage::zeroed());
+        map_user_page(
+            &mut address_space_owner,
+            address_space,
+            page_vaddr,
+            &page,
+            true,
+            false,
+        )
+        .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
+        mapped_pages = mapped_pages.saturating_add(1);
+        owned_user_pages.push(page);
+    }
+    let user_sp = align_down(stack_start.saturating_add(USER_STACK_BYTES as u64), 16);
 
     let kernel_stack = vec![0u8; KERNEL_STACK_BYTES].into_boxed_slice();
     let kernel_stack_top = align_down(
         (kernel_stack.as_ptr() as u64).saturating_add(kernel_stack.len() as u64),
         16,
     );
-    owned_buffers.push(kernel_stack);
-    let (address_space, address_space_owner) =
-        create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
+    owned_kernel_buffers.push(kernel_stack);
 
     Ok(Ring3ProcessImage {
         trap_frame: Ring3TrapFrame::new(entry_ip, user_sp),
@@ -508,7 +608,8 @@ fn load_process_image(
         mapped_pages,
         address_space,
         _address_space_owner: address_space_owner,
-        _owned_buffers: owned_buffers,
+        _owned_kernel_buffers: owned_kernel_buffers,
+        _owned_user_pages: owned_user_pages,
     })
 }
 
@@ -538,13 +639,490 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
         },
         AddressSpaceOwner::X86Root {
             _root: process_root,
+            _tables: Vec::new(),
         },
     ))
 }
 
 #[cfg(target_arch = "aarch64")]
 fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwner), &'static str> {
-    Ok((current_address_space_token(), AddressSpaceOwner::None))
+    let current = current_address_space_token();
+    if current.root_table == 0 {
+        return Err("empty TTBR0 root table");
+    }
+    let Some(current_virt) = mem::phys_to_virt(current.root_table) else {
+        return Err("failed to resolve current TTBR0 virtual address");
+    };
+    let current_table = current_virt as *const Aarch64PageTable;
+
+    let mut process_root = Box::new(Aarch64PageTable::new());
+    // SAFETY: current TTBR0 root is mapped in the kernel address space and remains valid.
+    let current_table_ref = unsafe { &*current_table };
+    process_root
+        .entries
+        .copy_from_slice(&current_table_ref.entries);
+
+    let process_root_virt = (&*process_root as *const Aarch64PageTable) as usize;
+    let Some(process_root_phys) = mem::virt_to_phys(process_root_virt) else {
+        return Err("failed to translate process TTBR0 physical address");
+    };
+    Ok((
+        AddressSpaceToken {
+            root_table: process_root_phys,
+        },
+        AddressSpaceOwner::Aarch64Root {
+            _root: process_root,
+            _tables: Vec::new(),
+        },
+    ))
+}
+
+fn copy_user_bytes_from_process(
+    address_space: AddressSpaceToken,
+    src_ptr: u64,
+    dst: &mut [u8],
+) -> Result<(), UserCopyError> {
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let current_src = src_ptr
+            .checked_add(u64::try_from(copied).map_err(|_| UserCopyError::AddressOverflow)?)
+            .ok_or(UserCopyError::AddressOverflow)?;
+        let translated = translate_user_pointer(address_space, current_src)?;
+        let page_offset = (current_src as usize) & (USER_PAGE_BYTES - 1);
+        let chunk = dst
+            .len()
+            .saturating_sub(copied)
+            .min(USER_PAGE_BYTES - page_offset);
+        // SAFETY: translated points into a kernel alias of a mapped user page and `dst` is in-bounds.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                translated as *const u8,
+                dst.as_mut_ptr().add(copied),
+                chunk,
+            );
+        }
+        copied = copied.saturating_add(chunk);
+    }
+    Ok(())
+}
+
+fn copy_user_bytes_to_process(
+    address_space: AddressSpaceToken,
+    dst_ptr: u64,
+    src: &[u8],
+) -> Result<(), UserCopyError> {
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let current_dst = dst_ptr
+            .checked_add(u64::try_from(copied).map_err(|_| UserCopyError::AddressOverflow)?)
+            .ok_or(UserCopyError::AddressOverflow)?;
+        let translated = translate_user_pointer(address_space, current_dst)?;
+        let page_offset = (current_dst as usize) & (USER_PAGE_BYTES - 1);
+        let chunk = src
+            .len()
+            .saturating_sub(copied)
+            .min(USER_PAGE_BYTES - page_offset);
+        // SAFETY: translated points into a kernel alias of a mapped user page and `src` is in-bounds.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), translated as *mut u8, chunk);
+        }
+        copied = copied.saturating_add(chunk);
+    }
+    Ok(())
+}
+
+fn translate_user_pointer(
+    address_space: AddressSpaceToken,
+    user_ptr: u64,
+) -> Result<usize, UserCopyError> {
+    let phys = translate_user_phys(address_space, user_ptr)?;
+    mem::phys_to_virt(phys).ok_or(UserCopyError::PageNotMapped)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn translate_user_phys(
+    address_space: AddressSpaceToken,
+    user_ptr: u64,
+) -> Result<u64, UserCopyError> {
+    if address_space.root_table == 0 {
+        return Err(UserCopyError::PageNotMapped);
+    }
+    let Some(root_virt) = mem::phys_to_virt(address_space.root_table) else {
+        return Err(UserCopyError::PageNotMapped);
+    };
+    let root = root_virt as *const PageTable;
+    let p4_index = page_table_index(user_ptr, 39);
+    let p3_index = page_table_index(user_ptr, 30);
+    let p2_index = page_table_index(user_ptr, 21);
+    let p1_index = page_table_index(user_ptr, 12);
+
+    // SAFETY: root_table is an owned page-table root tracked by the process image.
+    let p4 = unsafe { &*root };
+    let p4e = &p4[p4_index];
+    if !p4e.flags().contains(PageTableFlags::PRESENT) {
+        return Err(UserCopyError::PageNotMapped);
+    }
+
+    let Some(p3_virt) = mem::phys_to_virt(p4e.addr().as_u64()) else {
+        return Err(UserCopyError::PageNotMapped);
+    };
+    // SAFETY: present non-huge P4 entry points to a valid P3 table.
+    let p3 = unsafe { &*(p3_virt as *const PageTable) };
+    let p3e = &p3[p3_index];
+    if !p3e.flags().contains(PageTableFlags::PRESENT)
+        || p3e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(UserCopyError::PageNotMapped);
+    }
+
+    let Some(p2_virt) = mem::phys_to_virt(p3e.addr().as_u64()) else {
+        return Err(UserCopyError::PageNotMapped);
+    };
+    // SAFETY: present non-huge P3 entry points to a valid P2 table.
+    let p2 = unsafe { &*(p2_virt as *const PageTable) };
+    let p2e = &p2[p2_index];
+    if !p2e.flags().contains(PageTableFlags::PRESENT)
+        || p2e.flags().contains(PageTableFlags::HUGE_PAGE)
+    {
+        return Err(UserCopyError::PageNotMapped);
+    }
+
+    let Some(p1_virt) = mem::phys_to_virt(p2e.addr().as_u64()) else {
+        return Err(UserCopyError::PageNotMapped);
+    };
+    // SAFETY: present non-huge P2 entry points to a valid P1 table.
+    let p1 = unsafe { &*(p1_virt as *const PageTable) };
+    let p1e = &p1[p1_index];
+    if !p1e.flags().contains(PageTableFlags::PRESENT) {
+        return Err(UserCopyError::PageNotMapped);
+    }
+
+    let page_offset = user_ptr & (USER_PAGE_BYTES as u64 - 1);
+    p1e.addr()
+        .as_u64()
+        .checked_add(page_offset)
+        .ok_or(UserCopyError::AddressOverflow)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn translate_user_phys(
+    address_space: AddressSpaceToken,
+    user_ptr: u64,
+) -> Result<u64, UserCopyError> {
+    let (descriptor, level) = aarch64_resolve_descriptor(address_space.root_table, user_ptr)
+        .map_err(|_| UserCopyError::PageNotMapped)?;
+    let block_size = aarch64_block_size(level);
+    let offset_mask = block_size.saturating_sub(1);
+    let base_mask = AARCH64_TABLE_ADDR_MASK & !(offset_mask as u64);
+    let base = descriptor & base_mask;
+    base.checked_add(user_ptr & offset_mask as u64)
+        .ok_or(UserCopyError::AddressOverflow)
+}
+
+fn map_user_page(
+    owner: &mut AddressSpaceOwner,
+    address_space: AddressSpaceToken,
+    user_vaddr: u64,
+    backing_page: &UserPage,
+    writable: bool,
+    executable: bool,
+) -> Result<(), &'static str> {
+    if !user_vaddr.is_multiple_of(USER_PAGE_BYTES as u64) {
+        return Err("user mapping address is not page aligned");
+    }
+    let Some(backing_phys) = mem::virt_to_phys(backing_page.bytes.as_ptr() as usize) else {
+        return Err("failed to translate user backing page");
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        map_user_page_x86(
+            owner,
+            address_space,
+            user_vaddr,
+            backing_phys,
+            writable,
+            executable,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        map_user_page_aarch64(
+            owner,
+            address_space,
+            user_vaddr,
+            backing_page,
+            backing_phys,
+            writable,
+            executable,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn map_user_page_x86(
+    owner: &mut AddressSpaceOwner,
+    address_space: AddressSpaceToken,
+    user_vaddr: u64,
+    backing_phys: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), &'static str> {
+    let (root, tables) = match owner {
+        AddressSpaceOwner::X86Root { _root, _tables } => (&mut **_root, _tables),
+    };
+    if address_space.root_table == 0 {
+        return Err("empty process root table");
+    }
+
+    let p4_ptr = root as *mut PageTable;
+    let p3_ptr = x86_ensure_child_table(p4_ptr, page_table_index(user_vaddr, 39), tables, true)?;
+    let p2_ptr = x86_ensure_child_table(p3_ptr, page_table_index(user_vaddr, 30), tables, true)?;
+    let p1_ptr = x86_ensure_child_table(p2_ptr, page_table_index(user_vaddr, 21), tables, true)?;
+    let entry_index = page_table_index(user_vaddr, 12);
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        flags |= PageTableFlags::WRITABLE;
+    }
+    if !executable {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+
+    // SAFETY: all intermediate tables are owned by this process root and mapped in kernel space.
+    let p1 = unsafe { &mut *p1_ptr };
+    let entry = &mut p1[entry_index];
+    if entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err("user virtual page already mapped");
+    }
+    entry.set_addr(PhysAddr::new(backing_phys), flags);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_ensure_child_table(
+    parent_ptr: *mut PageTable,
+    index: usize,
+    tables: &mut Vec<Box<PageTable>>,
+    user: bool,
+) -> Result<*mut PageTable, &'static str> {
+    // SAFETY: caller provides a valid page-table pointer from the process-owned hierarchy.
+    let parent = unsafe { &mut *parent_ptr };
+    let entry = &mut parent[index];
+    if entry.flags().contains(PageTableFlags::PRESENT) {
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err("encountered huge-page mapping in user address-space walk");
+        }
+        let Some(child_virt) = mem::phys_to_virt(entry.addr().as_u64()) else {
+            return Err("failed to resolve child x86 page-table virtual address");
+        };
+        return Ok(child_virt as *mut PageTable);
+    }
+
+    let new_table = Box::new(PageTable::new());
+    let new_table_ptr = (&*new_table as *const PageTable) as *mut PageTable;
+    let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
+        return Err("failed to translate new x86 page-table physical address");
+    };
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    if user {
+        flags |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    entry.set_addr(PhysAddr::new(new_table_phys), flags);
+    tables.push(new_table);
+    Ok(new_table_ptr)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn map_user_page_aarch64(
+    owner: &mut AddressSpaceOwner,
+    address_space: AddressSpaceToken,
+    user_vaddr: u64,
+    backing_page: &UserPage,
+    backing_phys: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), &'static str> {
+    let (root, tables) = match owner {
+        AddressSpaceOwner::Aarch64Root { _root, _tables } => (&mut **_root, _tables),
+    };
+    if address_space.root_table == 0 {
+        return Err("empty process TTBR0 root table");
+    }
+
+    let l0_ptr = root as *mut Aarch64PageTable;
+    let l1_ptr = aarch64_ensure_child_table(l0_ptr, aarch64_table_index(user_vaddr, 0), tables)?;
+    let l2_ptr = aarch64_ensure_child_table(l1_ptr, aarch64_table_index(user_vaddr, 1), tables)?;
+    let l3_ptr = aarch64_ensure_child_table(l2_ptr, aarch64_table_index(user_vaddr, 2), tables)?;
+    let entry_index = aarch64_table_index(user_vaddr, 3);
+    let template =
+        aarch64_descriptor_template_from_kernel_alias(backing_page.bytes.as_ptr() as u64)?;
+    let ap = if writable {
+        AARCH64_TABLE_AP_EL1_RW_EL0_RW
+    } else {
+        AARCH64_TABLE_AP_EL1_RO_EL0_RO
+    };
+    let mut descriptor =
+        (template & !AARCH64_TABLE_ADDR_MASK) | (backing_phys & AARCH64_TABLE_ADDR_MASK);
+    descriptor |= AARCH64_TABLE_VALID | AARCH64_TABLE_TABLE_OR_PAGE | AARCH64_TABLE_AF;
+    descriptor = (descriptor & !AARCH64_TABLE_AP_MASK) | ap;
+    if executable {
+        descriptor &= !AARCH64_TABLE_UXN;
+    } else {
+        descriptor |= AARCH64_TABLE_UXN;
+    }
+
+    // SAFETY: all intermediate tables are owned by this process root and mapped in kernel space.
+    let l3 = unsafe { &mut *l3_ptr };
+    if (l3.entries[entry_index] & AARCH64_TABLE_VALID) != 0 {
+        return Err("user virtual page already mapped");
+    }
+    l3.entries[entry_index] = descriptor;
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_ensure_child_table(
+    parent_ptr: *mut Aarch64PageTable,
+    index: usize,
+    tables: &mut Vec<Box<Aarch64PageTable>>,
+) -> Result<*mut Aarch64PageTable, &'static str> {
+    // SAFETY: caller provides a valid page-table pointer from the process-owned hierarchy.
+    let parent = unsafe { &mut *parent_ptr };
+    let descriptor = parent.entries[index];
+    if (descriptor & AARCH64_TABLE_VALID) != 0 {
+        if (descriptor & AARCH64_TABLE_TABLE_OR_PAGE) == 0 {
+            return Err("encountered block mapping in user address-space walk");
+        }
+        let child_phys = descriptor & AARCH64_TABLE_ADDR_MASK;
+        let Some(child_virt) = mem::phys_to_virt(child_phys) else {
+            return Err("failed to resolve child aarch64 page-table virtual address");
+        };
+        return Ok(child_virt as *mut Aarch64PageTable);
+    }
+
+    let new_table = Box::new(Aarch64PageTable::new());
+    let new_table_ptr = (&*new_table as *const Aarch64PageTable) as *mut Aarch64PageTable;
+    let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
+        return Err("failed to translate new aarch64 page-table physical address");
+    };
+    parent.entries[index] = (new_table_phys & AARCH64_TABLE_ADDR_MASK)
+        | AARCH64_TABLE_VALID
+        | AARCH64_TABLE_TABLE_OR_PAGE;
+    tables.push(new_table);
+    Ok(new_table_ptr)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_descriptor_template_from_kernel_alias(kernel_virt: u64) -> Result<u64, &'static str> {
+    let current = current_address_space_token();
+    let (descriptor, _) = aarch64_resolve_descriptor(current.root_table, kernel_virt)
+        .map_err(|_| "failed to resolve kernel alias descriptor")?;
+    Ok(descriptor)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_resolve_descriptor(
+    root_table: u64,
+    virt_addr: u64,
+) -> Result<(u64, usize), &'static str> {
+    aarch64_resolve_descriptor_from_level(root_table, virt_addr, 0)
+        .or_else(|_| aarch64_resolve_descriptor_from_level(root_table, virt_addr, 1))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_resolve_descriptor_from_level(
+    root_table: u64,
+    virt_addr: u64,
+    start_level: usize,
+) -> Result<(u64, usize), &'static str> {
+    if root_table == 0 {
+        return Err("empty TTBR0 root table");
+    }
+    let mut table_phys = root_table & AARCH64_TABLE_ADDR_MASK;
+    for level in start_level..=3 {
+        let Some(table_virt) = mem::phys_to_virt(table_phys) else {
+            return Err("failed to resolve aarch64 page-table virtual address");
+        };
+        let table_ptr = table_virt as *const u64;
+        let index = aarch64_table_index(virt_addr, level);
+        // SAFETY: index is bounded to the 512-entry page-table width.
+        let descriptor_ptr = unsafe { table_ptr.add(index) };
+        // SAFETY: descriptor pointer was derived from a mapped page-table page.
+        let descriptor = unsafe { core::ptr::read_volatile(descriptor_ptr) };
+        if (descriptor & AARCH64_TABLE_VALID) == 0 {
+            return Err("address not mapped");
+        }
+        if level == 3 || (descriptor & AARCH64_TABLE_TABLE_OR_PAGE) == 0 {
+            return Ok((descriptor, level));
+        }
+        table_phys = descriptor & AARCH64_TABLE_ADDR_MASK;
+    }
+    Err("address not mapped")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_table_index(virt_addr: u64, level: usize) -> usize {
+    let shift = match level {
+        0 => 39,
+        1 => 30,
+        2 => 21,
+        _ => 12,
+    };
+    ((virt_addr >> shift) & 0x1ff) as usize
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_block_size(level: usize) -> usize {
+    match level {
+        1 => 1 << 30,
+        2 => 1 << 21,
+        _ => USER_PAGE_BYTES,
+    }
+}
+
+fn populate_segment_page(
+    page: &mut UserPage,
+    page_index: usize,
+    page_offset: usize,
+    file_offset: usize,
+    file_size: usize,
+    elf_bytes: &[u8],
+) -> Result<(), Ring3ElfLoadError> {
+    let page_start = page_index.saturating_mul(USER_PAGE_BYTES);
+    let page_end = page_start.saturating_add(USER_PAGE_BYTES);
+    let file_mapped_start = page_offset;
+    let file_mapped_end = page_offset
+        .checked_add(file_size)
+        .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+    let copy_start = page_start.max(file_mapped_start);
+    let copy_end = page_end.min(file_mapped_end);
+    if copy_start >= copy_end {
+        return Ok(());
+    }
+
+    let dst_start = copy_start.saturating_sub(page_start);
+    let src_start = file_offset
+        .checked_add(copy_start.saturating_sub(page_offset))
+        .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+    let count = copy_end.saturating_sub(copy_start);
+    let src_end = src_start
+        .checked_add(count)
+        .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+    page.bytes[dst_start..dst_start + count].copy_from_slice(&elf_bytes[src_start..src_end]);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn page_table_index(virt_addr: u64, shift: u8) -> usize {
+    ((virt_addr >> shift) & 0x1ff) as usize
+}
+
+fn page_count_for_span(offset: usize, len: usize) -> Result<usize, Ring3ElfLoadError> {
+    let span = offset
+        .checked_add(len)
+        .ok_or(Ring3ElfLoadError::SegmentBounds)?;
+    Ok(span.div_ceil(USER_PAGE_BYTES))
 }
 
 fn build_single_segment_elf(code: &[u8], machine: u16) -> Vec<u8> {
@@ -735,6 +1313,18 @@ fn align_down(value: u64, align: u64) -> u64 {
         return value;
     }
     value & !(align - 1)
+}
+
+fn align_up(value: u64, align: u64) -> Option<u64> {
+    if align == 0 {
+        return Some(value);
+    }
+    let remainder = value % align;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(align - remainder)
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {

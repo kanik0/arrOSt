@@ -1627,6 +1627,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_to_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             readme_ptr,
             readme_path,
         ) {
@@ -1635,6 +1636,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_to_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             tmp_ptr,
             tmp_path,
         ) {
@@ -1643,6 +1645,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_to_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             payload_ptr,
             payload,
         ) {
@@ -1672,11 +1675,11 @@ impl Scheduler {
             ok: false,
         };
 
-        if open_readme_rc < 0 || open_tmp_rc < 0 {
+        if open_tmp_rc < 0 {
             return Ok(result);
         }
-        let readme_fd = open_readme_rc as u64;
         let tmp_fd = open_tmp_rc as u64;
+        let readme_fd = (open_readme_rc >= 0).then_some(open_readme_rc as u64);
 
         let dup_rc = self.dispatch_ring3_syscall(SYS_DUP, tmp_fd, 0, 0);
         result.dup_rc = dup_rc;
@@ -1693,7 +1696,11 @@ impl Scheduler {
             self.dispatch_ring3_syscall(SYS_FREAD, tmp_fd, readback_ptr, payload.len() as u64);
         let fstat_rc =
             self.dispatch_ring3_syscall(SYS_FSTAT, tmp_fd, stat_ptr, size_of::<FileStat>() as u64);
-        let close_readme_rc = self.dispatch_ring3_syscall(SYS_CLOSE, readme_fd, 0, 0);
+        let close_readme_rc = if let Some(readme_fd) = readme_fd {
+            self.dispatch_ring3_syscall(SYS_CLOSE, readme_fd, 0, 0)
+        } else {
+            0
+        };
         let close_dup_rc = self.dispatch_ring3_syscall(SYS_CLOSE, dup_fd, 0, 0);
         let close_tmp_rc = self.dispatch_ring3_syscall(SYS_CLOSE, tmp_fd, 0, 0);
         result.badfd_rc = self.dispatch_ring3_syscall(SYS_CLOSE, 99, 0, 0);
@@ -1701,9 +1708,9 @@ impl Scheduler {
         for _ in 0..=MAX_FDS {
             let rc = self.dispatch_ring3_syscall(
                 SYS_OPEN,
-                readme_ptr,
+                tmp_ptr,
                 O_RDONLY as u64,
-                readme_path.len() as u64,
+                tmp_path.len() as u64,
             );
             if rc < 0 {
                 result.emfile_rc = rc;
@@ -1715,6 +1722,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_from_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             readback_ptr,
             &mut readback[..payload.len()],
         ) {
@@ -1723,6 +1731,7 @@ impl Scheduler {
         let stat = match ring3_groundwork::copy_from_user::<FileStat>(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             stat_ptr,
         ) {
             Ok(stat) => stat,
@@ -1730,6 +1739,7 @@ impl Scheduler {
         };
 
         result.ok = dup2_rc == 1
+            && open_readme_rc == errno::EPERM
             && write_rc == payload.len() as isize
             && seek_rc == 0
             && fread_rc == payload.len() as isize
@@ -1881,7 +1891,6 @@ impl Scheduler {
         self.complete_ring3_resume();
     }
 
-    #[cfg(target_arch = "aarch64")]
     fn mark_active_ring3_fault(&mut self) {
         if self.ring3_context.active {
             self.ring3_context.process.state = Ring3ProcessState::Faulted;
@@ -1971,6 +1980,7 @@ impl Scheduler {
         ring3_groundwork::copy_to_user(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             dst_ptr,
             value,
         )
@@ -2451,6 +2461,7 @@ impl Scheduler {
         } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             path_ptr,
             &mut path[..path_len],
         ) {
@@ -2524,6 +2535,7 @@ impl Scheduler {
         } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             ptr,
             &mut bytes[..len],
         ) {
@@ -2589,6 +2601,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_to_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             ptr,
             &bytes[..used],
         ) {
@@ -2672,6 +2685,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_to_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             ptr,
             &bytes[..used],
         ) {
@@ -2745,6 +2759,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_from_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             ptr,
             bytes.as_mut_slice(),
         ) {
@@ -2830,6 +2845,7 @@ impl Scheduler {
         match ring3_groundwork::copy_to_user::<FileStat>(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             ptr,
             &stat,
         ) {
@@ -3161,6 +3177,7 @@ impl Scheduler {
         let request = match ring3_groundwork::copy_from_user::<UdpSendReq>(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             req_ptr,
         ) {
             Ok(value) => value,
@@ -3185,6 +3202,7 @@ impl Scheduler {
         if let Err(error) = ring3_groundwork::copy_from_user_bytes(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             request.payload_ptr,
             payload.as_mut_slice(),
         ) {
@@ -3227,6 +3245,7 @@ impl Scheduler {
         let mut request = match ring3_groundwork::copy_from_user::<UdpRecvReq>(
             &process.user_ranges,
             process.user_range_count,
+            process.address_space,
             req_ptr,
         ) {
             Ok(value) => value,
@@ -3258,6 +3277,7 @@ impl Scheduler {
                 if let Err(error) = ring3_groundwork::copy_to_user_bytes(
                     &process.user_ranges,
                     process.user_range_count,
+                    process.address_space,
                     request.payload_ptr,
                     &output[..used],
                 ) {
@@ -3269,6 +3289,7 @@ impl Scheduler {
                 if let Err(error) = ring3_groundwork::copy_to_user::<UdpRecvReq>(
                     &process.user_ranges,
                     process.user_range_count,
+                    process.address_space,
                     req_ptr,
                     &request,
                 ) {
@@ -4343,7 +4364,6 @@ pub fn on_ring3_kernel_resume_with_trap(ip: u64, sp: u64, ret0: u64) {
     with_scheduler(|scheduler| scheduler.on_ring3_trap_resume(ip, sp, ret0));
 }
 
-#[cfg(target_arch = "aarch64")]
 pub fn mark_active_ring3_fault() {
     with_scheduler(|scheduler| scheduler.mark_active_ring3_fault());
 }

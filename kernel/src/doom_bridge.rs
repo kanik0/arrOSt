@@ -501,7 +501,7 @@ pub extern "C" fn arr_dg_set_title(title: *const c_char) {
             if ch == 0 {
                 break;
             }
-            state.title[index] = ch as u8;
+            state.title[index] = ch.to_ne_bytes()[0];
             state.title_len = index + 1;
         }
     });

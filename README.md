@@ -16,6 +16,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Windowed framebuffer desktop UI with taskbar, terminal windows, file manager, and Doom viewport.
 - QEMU/virtio-first device stack for block, net, input, and audio.
 - Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external `/bin/*` helpers.
+- Ring-3 ELF isolation with per-process page-table ownership, dedicated user virtual mappings, and kernel-resume fault containment.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
 - Syscall ABI revision `4`, including filesystem syscalls and per-process fd tables.
 - Cross-target build orchestration and smoke automation through `cargo xtask`.
@@ -74,8 +75,11 @@ Representative commands:
 - Ring-3 multiprocess runtime for embedded ELF apps (`init`, `doom`).
 - Additional external process table for compositor-launched terminals, Doom runtime sessions, and `/bin/*` helper execution.
 - Ring-3 scheduling is round-robin with syscall-timeslice preemption.
+- Ring-3 ELF segments and stacks are mapped into a dedicated user virtual range (`0x0000_2000_...`) owned by each process.
+- Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
 - `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
 - `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
+- User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
 - ABI revision is `4`.
 
@@ -110,7 +114,9 @@ Useful runtime commands:
 
 ## Known limitations
 
-- Ring-3 isolation is still partial: hardware transition exists, but user/kernel separation is not yet production-grade.
+- Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
+- There is no filesystem-backed `execve` path yet; ring-3 apps are still embedded artifacts (`ring3_init`, `ring3_doom`).
+- No `fork`, copy-on-write, demand paging, or swap.
 - Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
 - The syscall surface is intentionally small and not POSIX-complete.
 - `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
@@ -226,7 +232,7 @@ user/doom/wad/doom1.wad
 cargo fmt --all
 cargo clippy -p xtask --all-targets -- -D warnings
 cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
-cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+cargo clippy -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
 ```
 
 ### ABI and unit checks

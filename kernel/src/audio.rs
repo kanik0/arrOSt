@@ -295,9 +295,7 @@ pub fn poll(_now_ticks: u64) {
 
 fn disable_speaker() {
     #[cfg(not(target_arch = "x86_64"))]
-    {
-        return;
-    }
+    {}
 
     #[cfg(target_arch = "x86_64")]
     // SAFETY: port 0x61 controls the legacy PC speaker gate/data bits.

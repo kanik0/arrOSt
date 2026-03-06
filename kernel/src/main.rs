@@ -416,6 +416,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
+/// # Safety
+///
+/// Entered directly by firmware/bootloader with the architecture handoff ABI for aarch64.
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
         "mov x2, x0",
@@ -882,11 +885,10 @@ fn build_aarch64_kernel_boot_handoff(boot_context: Aarch64BootContext) -> Kernel
     let (memory_region_count, memory_desc_size, memory_desc_version) =
         if let Some(memory_map) = boot_context.memory_map {
             flags |= KERNEL_BOOT_FLAG_MEMORY_MAP;
-            let region_count = if memory_map.desc_size == 0 {
-                0
-            } else {
-                memory_map.len / memory_map.desc_size
-            };
+            let region_count = memory_map
+                .len
+                .checked_div(memory_map.desc_size)
+                .unwrap_or(0);
             (
                 saturating_u32_from_usize(region_count),
                 saturating_u32_from_usize(memory_map.desc_size),

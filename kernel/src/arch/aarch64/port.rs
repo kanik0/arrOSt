@@ -466,7 +466,7 @@ fn legacy_write(mmio_base: usize, offset: u16, width: u8, value: u32) {
                 } else {
                     // SAFETY: modern transport uses explicit queue descriptor addresses.
                     let queue_size = unsafe { mmio_read_u32(mmio_base + MMIO_QUEUE_NUM) as u16 };
-                    let queue_size = queue_size.min(LEGACY_MAX_QUEUE_SIZE).max(1);
+                    let queue_size = queue_size.clamp(1, LEGACY_MAX_QUEUE_SIZE);
                     let desc_bytes = u64::from(queue_size) * 16;
                     let avail_bytes = 6 + (u64::from(queue_size) * 2);
                     let avail_phys = phys.saturating_add(desc_bytes);

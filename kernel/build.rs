@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(arrost_doomgeneric_bridge)");
+    emit_kernel_linker_script();
 
     let manifest_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo"),
@@ -142,6 +143,17 @@ fn main() {
         "cargo:rerun-if-changed={}",
         include_dir.join("doomkeys.h").display()
     );
+}
+
+fn emit_kernel_linker_script() {
+    let target = env::var("TARGET").unwrap_or_else(|_| String::new());
+    let script = match target.as_str() {
+        "x86_64-unknown-none" => "kernel/kernel.ld",
+        "aarch64-unknown-none" => "kernel/kernel_aarch64.ld",
+        _ => return,
+    };
+    println!("cargo:rustc-link-arg=-T{script}");
+    println!("cargo:rerun-if-changed={script}");
 }
 
 fn parse_makefile_sources(makefile: &Path, source_root: &Path) -> Vec<PathBuf> {
