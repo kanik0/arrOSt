@@ -11,6 +11,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Ring-3 runtime state machine: `ready`, `running`, `sleep`, `exited`, `faulted`.
 - Round-robin ring-3 scheduling with syscall-timeslice preemption (`yield/sleep/exit` force kernel return; other syscalls can be timesliced).
 - Per-task syscall capability masks (coarse-grained isolation step).
+- Per-process file-descriptor tables for cooperative and ring-3 execution contexts (`fd 0-2` = serial).
 - Runtime capability introspection/drop syscalls (`cap_get`, `cap_drop`) remain shared across cooperative and ring-3 paths.
 - Cooperative lifecycle syscalls (`spawn`, `waitpid`) remain available for kernel-simulated workers.
 - `x86_64` ring-3 gate (`int 0x80`, DPL3 + TSS `RSP0`) and `aarch64` EL0 `SVC` gate are both wired into process-layer dispatch.
@@ -19,6 +20,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Ring-3 dispatch reuses process-layer capability policy/counters through `Ring3ProcessContext`.
 - Cross-platform shell smoke `ring3 smoke` validates ring-3 policy dispatch (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the same process-layer context checks on both `x86_64` and `aarch64`.
 - Optional groundwork flag (`ARROST_RING3_ELF_GROUNDWORK=true`) enables native ELF loader + process metadata + user-pointer checked syscalls.
+- `ring3 groundwork` now also validates the fd-table syscall path (`open/close/fread/fwrite/seek/fstat/dup/dup2`) including `EBADF` and `EMFILE` behavior.
 - Shell command `ring3 run <init|doom>` now enqueues ring-3 processes into the multiprocess scheduler (non-blocking).
 - Shell commands `ring3 ps` and `ring3 wait <pid|any|all>` expose ring-3 process table and reap flow.
 - Cross-platform `xtask` smoke `smoke-ring3-run` now validates multiprocess runtime (`init` + `doom`) and ring-3 preemption points (`yield/sleep/exit`).
@@ -51,6 +53,8 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `/bin/fm [list|open|copy|delete]`
 - `/bin/doom [status|play|run|stop]`
 - `/bin/terminal`
+- `cat /proc/self/pid`
+- `cat /proc/mounts`
 - `syscalls`
 - `spawn <init|doom>`
 - `wait <pid|any|all>`
@@ -64,6 +68,8 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).
 - Capability masks are policy checks in shared address space, not hardware isolation.
 - External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.
+- `procfs` currently exposes only a minimal synthetic view (`self/pid`, `mounts`, `uptime`) and is not a full `/proc` implementation.
+- External GUI/runtime entries carry an fd table for model consistency, but they do not issue filesystem syscalls yet.
 
 ## Relevant files
 

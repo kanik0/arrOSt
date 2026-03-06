@@ -6,19 +6,31 @@
 mod bitmap;
 mod diskfs_v1;
 mod diskfs_v2;
+mod fd;
 mod journal;
 mod migrate;
+mod mount;
+mod procfs;
 mod ramfs;
+mod tmpfs;
 
+use crate::proc;
 use crate::serial;
 use crate::storage;
+use arrostd::syscall::{O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC};
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
 use diskfs_v1::DiskFs as DiskFsV1;
 use diskfs_v2::DiskFsV2;
+pub(crate) use fd::FdTarget;
+pub use fd::{FdTable, MAX_FDS};
+pub use mount::MAX_PATH_BYTES as MAX_OPEN_PATH_BYTES;
+use mount::{MOUNTS, MountKind, canonicalize, resolve_mount};
+use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
+pub use tmpfs::TmpFs;
 
 pub const BIN_EXEC_PATHS: [&str; 8] = [
     "/bin/ls",
@@ -63,6 +75,12 @@ pub struct Stat {
     pub created: u64,
     pub modified: u64,
     pub accessed: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OpenFile {
+    File { mount: MountKind, ino: InodeNum },
+    Proc(ProcOpenFile),
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +162,7 @@ pub enum FsError {
     IsADirectory,
     DirectoryNotEmpty,
     AlreadyExists,
+    ReadOnly,
 }
 
 impl FsError {
@@ -163,6 +182,7 @@ impl FsError {
             Self::IsADirectory => "is_a_directory",
             Self::DirectoryNotEmpty => "directory_not_empty",
             Self::AlreadyExists => "already_exists",
+            Self::ReadOnly => "read_only",
         }
     }
 }
@@ -237,6 +257,8 @@ struct FsState {
     ramfs: RamFs,
     diskfs_v1: DiskFsV1,
     diskfs_v2: DiskFsV2,
+    procfs: ProcFs,
+    tmpfs: TmpFs,
 }
 
 impl FsState {
@@ -247,6 +269,8 @@ impl FsState {
             ramfs: RamFs::new(),
             diskfs_v1: DiskFsV1::new(),
             diskfs_v2: DiskFsV2::new(),
+            procfs: ProcFs::new(),
+            tmpfs: TmpFs::new(),
         }
     }
 
@@ -257,6 +281,7 @@ impl FsState {
 
         // Ensure the hierarchical root directory exists in RamFS.
         self.ramfs.ensure_root();
+        self.tmpfs.ensure_root();
 
         if storage::is_ready() {
             match self.try_mount_disk() {
@@ -284,6 +309,7 @@ impl FsState {
         }
 
         self.initialized = true;
+        self.log_mount_table();
         self.report()
     }
 
@@ -351,6 +377,215 @@ impl FsState {
         }
     }
 
+    fn root_backend_name(&self) -> &'static str {
+        match self.backend {
+            FsBackend::RamFs => "ramfs",
+            FsBackend::DiskFsV2 => "diskfs-v2",
+        }
+    }
+
+    fn log_mount_table(&self) {
+        for mount in MOUNTS {
+            let fs_name = match mount.kind {
+                MountKind::Root => self.root_backend_name(),
+                MountKind::Proc => "procfs",
+                MountKind::Tmp => "tmpfs",
+            };
+            let mode = if mount.kind.writable() { "rw" } else { "ro" };
+            serial::write_fmt(format_args!(
+                "mount: {} type={} {}\n",
+                mount.path, fs_name, mode
+            ));
+        }
+    }
+
+    fn procfs_context(&self, current_pid: Option<u32>) -> ProcFsContext<'_> {
+        ProcFsContext {
+            current_pid,
+            root_backend: self.root_backend_name(),
+        }
+    }
+
+    fn stat_path(&self, path: &str, current_pid: Option<u32>) -> Result<Stat, FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => stat_local_path(&self.ramfs, resolved.local_path()),
+                FsBackend::DiskFsV2 => stat_local_path(&self.diskfs_v2, resolved.local_path()),
+            },
+            MountKind::Proc => self
+                .procfs
+                .stat_path(resolved.local_path(), self.procfs_context(current_pid)),
+            MountKind::Tmp => stat_local_path(&self.tmpfs, resolved.local_path()),
+        }
+    }
+
+    fn list_dir(
+        &self,
+        path: &str,
+        out: &mut [VfsDirEntry],
+        current_pid: Option<u32>,
+    ) -> Result<usize, FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => list_local_dir(&self.ramfs, resolved.local_path(), out),
+                FsBackend::DiskFsV2 => list_local_dir(&self.diskfs_v2, resolved.local_path(), out),
+            },
+            MountKind::Proc => {
+                self.procfs
+                    .readdir(resolved.local_path(), self.procfs_context(current_pid), out)
+            }
+            MountKind::Tmp => list_local_dir(&self.tmpfs, resolved.local_path(), out),
+        }
+    }
+
+    fn read_path(
+        &self,
+        path: &str,
+        out: &mut [u8],
+        current_pid: Option<u32>,
+    ) -> Result<usize, FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => {
+                    read_backend_path(&self.ramfs, &self.ramfs, resolved.local_path(), out)
+                }
+                FsBackend::DiskFsV2 => {
+                    read_backend_path(&self.diskfs_v2, &self.diskfs_v2, resolved.local_path(), out)
+                }
+            },
+            MountKind::Proc => {
+                self.procfs
+                    .read_file(resolved.local_path(), self.procfs_context(current_pid), out)
+            }
+            MountKind::Tmp => {
+                read_backend_path(&self.tmpfs, &self.tmpfs, resolved.local_path(), out)
+            }
+        }
+    }
+
+    fn write_path(&mut self, path: &str, data: &[u8]) -> Result<usize, FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => self.ramfs.write(resolved.local_path(), data),
+                FsBackend::DiskFsV2 => self.diskfs_v2.write(resolved.local_path(), data),
+            },
+            MountKind::Proc => Err(FsError::ReadOnly),
+            MountKind::Tmp => self.tmpfs.write(resolved.local_path(), data),
+        }
+    }
+
+    fn delete_path(&mut self, path: &str) -> Result<(), FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => self.ramfs.delete(resolved.local_path()),
+                FsBackend::DiskFsV2 => self.diskfs_v2.delete(resolved.local_path()),
+            },
+            MountKind::Proc => Err(FsError::ReadOnly),
+            MountKind::Tmp => self.tmpfs.delete(resolved.local_path()),
+        }
+    }
+
+    fn open_path(
+        &mut self,
+        path: &str,
+        current_pid: Option<u32>,
+        flags: u32,
+    ) -> Result<OpenFile, FsError> {
+        let canonical = canonicalize(path)?;
+        let resolved = resolve_mount(&canonical);
+        match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => open_local_file(
+                    &mut self.ramfs,
+                    resolved.local_path(),
+                    flags,
+                    MountKind::Root,
+                ),
+                FsBackend::DiskFsV2 => open_local_file(
+                    &mut self.diskfs_v2,
+                    resolved.local_path(),
+                    flags,
+                    MountKind::Root,
+                ),
+            },
+            MountKind::Proc => self
+                .procfs
+                .open_file(resolved.local_path(), self.procfs_context(current_pid))
+                .map(OpenFile::Proc),
+            MountKind::Tmp => open_local_file(
+                &mut self.tmpfs,
+                resolved.local_path(),
+                flags,
+                MountKind::Tmp,
+            ),
+        }
+    }
+
+    fn read_open_file(
+        &self,
+        file: OpenFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize, FsError> {
+        match file {
+            OpenFile::File { mount, ino } => match mount {
+                MountKind::Root => match self.backend {
+                    FsBackend::RamFs => read_inode_file(&self.ramfs, ino, offset, out),
+                    FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, ino, offset, out),
+                },
+                MountKind::Tmp => read_inode_file(&self.tmpfs, ino, offset, out),
+                MountKind::Proc => Err(FsError::InvalidPath),
+            },
+            OpenFile::Proc(file) => {
+                self.procfs
+                    .read_open_file(file, self.root_backend_name(), offset, out)
+            }
+        }
+    }
+
+    fn write_open_file(
+        &mut self,
+        file: OpenFile,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, FsError> {
+        match file {
+            OpenFile::File { mount, ino } => match mount {
+                MountKind::Root => match self.backend {
+                    FsBackend::RamFs => write_inode_file(&mut self.ramfs, ino, offset, data),
+                    FsBackend::DiskFsV2 => write_inode_file(&mut self.diskfs_v2, ino, offset, data),
+                },
+                MountKind::Tmp => write_inode_file(&mut self.tmpfs, ino, offset, data),
+                MountKind::Proc => Err(FsError::ReadOnly),
+            },
+            OpenFile::Proc(_) => Err(FsError::ReadOnly),
+        }
+    }
+
+    fn stat_open_file(&self, file: OpenFile) -> Result<Stat, FsError> {
+        match file {
+            OpenFile::File { mount, ino } => match mount {
+                MountKind::Root => match self.backend {
+                    FsBackend::RamFs => self.ramfs.stat(ino),
+                    FsBackend::DiskFsV2 => self.diskfs_v2.stat(ino),
+                },
+                MountKind::Tmp => self.tmpfs.stat(ino),
+                MountKind::Proc => Err(FsError::InvalidPath),
+            },
+            OpenFile::Proc(file) => self.procfs.stat_file(file, self.root_backend_name()),
+        }
+    }
+
     fn seed_defaults_ramfs(&mut self) {
         let _ = self.ramfs.write(
             "/README.TXT",
@@ -412,25 +647,16 @@ pub fn list_entries(out: &mut [DirEntry]) -> usize {
 }
 
 pub fn file_exists(path: &str) -> bool {
-    let trimmed = path.trim();
-    let normalized = trimmed
-        .strip_prefix('/')
-        .unwrap_or(trimmed)
-        .trim_matches('/');
-    if normalized.is_empty() {
-        return false;
-    }
-    let mut entries = [DirEntry::empty(); MAX_FILES];
-    let count = list_entries(&mut entries);
-    entries
-        .iter()
-        .take(count)
-        .any(|entry| entry.name() == normalized)
+    stat_path(path, proc::shell_pid()).is_ok()
 }
 
 pub fn cat_to_serial(path: &str) {
+    cat_to_serial_for_pid(path, proc::shell_pid());
+}
+
+pub fn cat_to_serial_for_pid(path: &str, current_pid: Option<u32>) {
     let mut data = [0u8; MAX_FILE_BYTES];
-    match read_file(path, &mut data) {
+    match read_file_for_pid(path, &mut data, current_pid) {
         Ok(len) => {
             serial::write_fmt(format_args!("cat: {} bytes from {}\n", len, path.trim()));
             for byte in data.iter().take(len) {
@@ -448,7 +674,15 @@ pub fn cat_to_serial(path: &str) {
 }
 
 pub fn read_file(path: &str, out: &mut [u8]) -> Result<usize, FsError> {
-    with_vfs(|vfs| vfs.read(path, out))
+    read_file_for_pid(path, out, proc::shell_pid())
+}
+
+pub fn read_file_for_pid(
+    path: &str,
+    out: &mut [u8],
+    current_pid: Option<u32>,
+) -> Result<usize, FsError> {
+    with_fs(|state| state.read_path(path, out, current_pid))
 }
 
 pub fn write_from_echo(path: &str, text: &str) {
@@ -463,7 +697,7 @@ pub fn write_from_echo(path: &str, text: &str) {
 }
 
 pub fn write_file(path: &str, data: &[u8]) -> Result<usize, FsError> {
-    with_vfs_mut(|vfs| vfs.write(path, data))
+    with_fs_mut(|state| state.write_path(path, data))
 }
 
 pub fn copy_file(source: &str, destination: &str) -> Result<usize, FsError> {
@@ -490,7 +724,33 @@ pub fn copy_file_to_serial(source: &str, destination: &str) {
 }
 
 pub fn delete_file(path: &str) -> Result<(), FsError> {
-    with_vfs_mut(|vfs| vfs.delete(path))
+    with_fs_mut(|state| state.delete_path(path))
+}
+
+pub(crate) fn open_file(
+    path: &str,
+    current_pid: Option<u32>,
+    flags: u32,
+) -> Result<OpenFile, FsError> {
+    with_fs_mut(|state| state.open_path(path, current_pid, flags))
+}
+
+pub(crate) fn close_file(_file: OpenFile) {}
+
+pub(crate) fn read_open_file(
+    file: OpenFile,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, FsError> {
+    with_fs(|state| state.read_open_file(file, offset, out))
+}
+
+pub(crate) fn write_open_file(file: OpenFile, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+    with_fs_mut(|state| state.write_open_file(file, offset, data))
+}
+
+pub(crate) fn stat_open_file(file: OpenFile) -> Result<Stat, FsError> {
+    with_fs(|state| state.stat_open_file(file))
 }
 
 pub fn delete_file_to_serial(path: &str) {
@@ -532,6 +792,54 @@ pub fn reload_from_disk() -> Result<(), FsError> {
     })
 }
 
+pub fn stat_path(path: &str, current_pid: Option<u32>) -> Result<Stat, FsError> {
+    with_fs(|state| state.stat_path(path, current_pid))
+}
+
+pub fn list_dir(
+    path: &str,
+    out: &mut [VfsDirEntry],
+    current_pid: Option<u32>,
+) -> Result<usize, FsError> {
+    with_fs(|state| state.list_dir(path, out, current_pid))
+}
+
+pub fn list_dir_to_serial(path: &str, current_pid: Option<u32>) {
+    let display = match canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(err) => {
+            serial::write_fmt(format_args!("ls: {} ({})\n", path.trim(), err.as_str()));
+            return;
+        }
+    };
+
+    let mut entries = [VfsDirEntry::empty(); 16];
+    match list_dir(display.as_str(), &mut entries, current_pid) {
+        Ok(count) => {
+            serial::write_fmt(format_args!(
+                "ls: entries={} path={}\n",
+                count,
+                display.as_str()
+            ));
+            for entry in entries.iter().take(count) {
+                match entry.file_type {
+                    FileType::Directory => {
+                        serial::write_fmt(format_args!("{}/\n", entry.name_str()));
+                    }
+                    _ => {
+                        serial::write_fmt(format_args!("{}\n", entry.name_str()));
+                    }
+                }
+            }
+        }
+        Err(err) => serial::write_fmt(format_args!(
+            "ls: {} ({})\n",
+            display.as_str(),
+            err.as_str()
+        )),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Internal dispatch and locking
 // ═══════════════════════════════════════════════════════════════════════════
@@ -548,22 +856,181 @@ fn with_vfs<R>(f: impl FnOnce(&dyn Vfs) -> R) -> R {
     }
 }
 
-fn with_vfs_mut<R>(f: impl FnOnce(&mut dyn Vfs) -> R) -> R {
+fn with_fs<R>(f: impl FnOnce(&FsState) -> R) -> R {
     let _guard = FS_LOCK.lock();
-    // SAFETY: `FS_LOCK` serializes mutable access to global filesystem state.
-    unsafe {
-        let state = &mut *FS_STATE.0.get();
-        match state.backend {
-            FsBackend::RamFs => f(&mut state.ramfs),
-            FsBackend::DiskFsV2 => f(&mut state.diskfs_v2),
-        }
-    }
+    // SAFETY: `FS_LOCK` serializes access to global filesystem state.
+    unsafe { f(&*FS_STATE.0.get()) }
 }
 
 fn with_fs_mut<R>(f: impl FnOnce(&mut FsState) -> R) -> R {
     let _guard = FS_LOCK.lock();
     // SAFETY: `FS_LOCK` serializes mutable access to global filesystem state.
     unsafe { f(&mut *FS_STATE.0.get()) }
+}
+
+fn resolve_local_path(vfs: &dyn VfsOps, local_path: &str) -> Result<InodeNum, FsError> {
+    let trimmed = local_path.trim_matches('/');
+    let mut current = vfs.root_inode();
+    if trimmed.is_empty() {
+        return Ok(current);
+    }
+
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            current = vfs.lookup(current, b"..")?;
+            continue;
+        }
+        current = vfs.lookup(current, component.as_bytes())?;
+    }
+
+    Ok(current)
+}
+
+fn stat_local_path(vfs: &dyn VfsOps, local_path: &str) -> Result<Stat, FsError> {
+    let ino = resolve_local_path(vfs, local_path)?;
+    vfs.stat(ino)
+}
+
+fn list_local_dir(
+    vfs: &dyn VfsOps,
+    local_path: &str,
+    out: &mut [VfsDirEntry],
+) -> Result<usize, FsError> {
+    let ino = resolve_local_path(vfs, local_path)?;
+    if vfs.stat(ino)?.file_type != FileType::Directory {
+        return Err(FsError::NotADirectory);
+    }
+
+    let mut written = 0usize;
+    let mut offset = 0u32;
+    let mut chunk = [VfsDirEntry::empty(); 8];
+    while written < out.len() {
+        let read = vfs.readdir(ino, offset, &mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        offset = offset.saturating_add(read as u32);
+        for entry in chunk.iter().take(read) {
+            let name = entry.name_str();
+            if name == "." || name == ".." {
+                continue;
+            }
+            if written >= out.len() {
+                return Ok(written);
+            }
+            out[written] = *entry;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+fn read_backend_path(
+    vfs: &dyn Vfs,
+    vfs_ops: &dyn VfsOps,
+    local_path: &str,
+    out: &mut [u8],
+) -> Result<usize, FsError> {
+    if local_path.trim_matches('/').is_empty() {
+        return Err(FsError::IsADirectory);
+    }
+    if stat_local_path(vfs_ops, local_path)?.file_type == FileType::Directory {
+        return Err(FsError::IsADirectory);
+    }
+    vfs.read(local_path, out)
+}
+
+fn open_local_file(
+    vfs: &mut dyn VfsOps,
+    local_path: &str,
+    flags: u32,
+    mount: MountKind,
+) -> Result<OpenFile, FsError> {
+    let access = flags & O_ACCMODE;
+    if access > arrostd::syscall::O_RDWR {
+        return Err(FsError::InvalidPath);
+    }
+    if (flags & O_TRUNC) != 0 && access == O_RDONLY {
+        return Err(FsError::InvalidPath);
+    }
+
+    match resolve_local_path(vfs, local_path) {
+        Ok(ino) => {
+            let stat = vfs.stat(ino)?;
+            if stat.file_type == FileType::Directory {
+                return Err(FsError::IsADirectory);
+            }
+            if (flags & O_TRUNC) != 0 {
+                vfs.truncate(ino, 0)?;
+            }
+            Ok(OpenFile::File { mount, ino })
+        }
+        Err(FsError::NotFound) if (flags & O_CREAT) != 0 => {
+            let (parent, name) = resolve_parent_local_path(vfs, local_path)?;
+            let ino = vfs.create(parent, name.as_bytes(), 0o644)?;
+            Ok(OpenFile::File { mount, ino })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_parent_local_path<'a>(
+    vfs: &dyn VfsOps,
+    local_path: &'a str,
+) -> Result<(InodeNum, &'a str), FsError> {
+    let trimmed = local_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(FsError::IsADirectory);
+    }
+
+    let (parent_path, name) = match trimmed.rfind('/') {
+        Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
+        None => ("", trimmed),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(FsError::InvalidPath);
+    }
+
+    let parent = resolve_local_path(vfs, parent_path)?;
+    if vfs.stat(parent)?.file_type != FileType::Directory {
+        return Err(FsError::NotADirectory);
+    }
+    Ok((parent, name))
+}
+
+fn read_inode_file(
+    vfs: &dyn VfsOps,
+    ino: InodeNum,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, FsError> {
+    let stat = vfs.stat(ino)?;
+    if stat.file_type == FileType::Directory {
+        return Err(FsError::IsADirectory);
+    }
+    let Ok(offset) = u32::try_from(offset) else {
+        return Ok(0);
+    };
+    vfs.read_data(ino, offset, out)
+}
+
+fn write_inode_file(
+    vfs: &mut dyn VfsOps,
+    ino: InodeNum,
+    offset: u64,
+    data: &[u8],
+) -> Result<usize, FsError> {
+    let stat = vfs.stat(ino)?;
+    if stat.file_type == FileType::Directory {
+        return Err(FsError::IsADirectory);
+    }
+    let Ok(offset) = u32::try_from(offset) else {
+        return Err(FsError::FileTooLarge);
+    };
+    vfs.write_data(ino, offset, data)
 }
 
 struct SpinLock {

@@ -16,7 +16,7 @@ pub const fn abi_revision() -> u16 {
 }
 
 pub fn boot_message() -> &'static str {
-    "init: ready (syscall ABI v3, caps core+proc+time)"
+    "init: ready (syscall ABI v4, caps core+proc+time)"
 }
 
 pub fn handle_command(command: &str) -> &'static str {
@@ -29,7 +29,7 @@ pub fn handle_command(command: &str) -> &'static str {
         "caps" => "init: syscall cap_get/cap_drop available",
         "spawn" => "init: syscall spawn available (init|doom)",
         "wait" => "init: syscall waitpid available",
-        "version" => "init: abi v3 + getpid/time_ms/cap_get/cap_drop/spawn/waitpid",
+        "version" => "init: abi v4 + getpid/time_ms/cap_get/cap_drop/spawn/waitpid/fd",
         _ => "init: unknown command",
     }
 }
@@ -38,7 +38,7 @@ pub const fn control_syscalls() -> [u64; 6] {
     shim::cooperative_proc_numbers()
 }
 
-pub const fn supported_syscalls() -> [u64; 14] {
+pub const fn supported_syscalls() -> [u64; 22] {
     let control = control_syscalls();
     [
         SYS_WRITE,
@@ -55,6 +55,14 @@ pub const fn supported_syscalls() -> [u64; 14] {
         SYS_SOCKET,
         SYS_SENDTO,
         SYS_RECVFROM,
+        arrostd::syscall::SYS_OPEN,
+        arrostd::syscall::SYS_CLOSE,
+        arrostd::syscall::SYS_FREAD,
+        arrostd::syscall::SYS_FWRITE,
+        arrostd::syscall::SYS_SEEK,
+        arrostd::syscall::SYS_FSTAT,
+        arrostd::syscall::SYS_DUP,
+        arrostd::syscall::SYS_DUP2,
     ]
 }
 
@@ -77,7 +85,7 @@ mod tests {
     #[test]
     fn metadata_is_stable() {
         assert_eq!(app_name(), "init");
-        assert_eq!(abi_revision(), 3);
+        assert_eq!(abi_revision(), 4);
     }
 
     #[test]
@@ -98,6 +106,10 @@ mod tests {
         assert_eq!(
             handle_command("help"),
             "init: commands = help, ping, net, pid, time, caps, spawn, wait, version"
+        );
+        assert_eq!(
+            handle_command("version"),
+            "init: abi v4 + getpid/time_ms/cap_get/cap_drop/spawn/waitpid/fd"
         );
         assert_eq!(handle_command("bad"), "init: unknown command");
     }
@@ -121,6 +133,14 @@ mod tests {
                 SYS_SOCKET,
                 SYS_SENDTO,
                 SYS_RECVFROM,
+                arrostd::syscall::SYS_OPEN,
+                arrostd::syscall::SYS_CLOSE,
+                arrostd::syscall::SYS_FREAD,
+                arrostd::syscall::SYS_FWRITE,
+                arrostd::syscall::SYS_SEEK,
+                arrostd::syscall::SYS_FSTAT,
+                arrostd::syscall::SYS_DUP,
+                arrostd::syscall::SYS_DUP2,
             ]
         );
     }
@@ -150,7 +170,9 @@ mod tests {
     fn syscall_numbering_matches_golden_contract() {
         assert_eq!(
             supported_syscalls(),
-            [1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 6, 7, 8]
+            [
+                1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 6, 7, 8, 15, 16, 17, 18, 19, 20, 21, 22,
+            ]
         );
     }
 

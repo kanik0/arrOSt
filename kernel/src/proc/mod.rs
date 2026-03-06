@@ -4,15 +4,19 @@ mod user_elf_embed {
     include!(concat!(env!("OUT_DIR"), "/user_elf_embed.rs"));
 }
 
+use crate::fs::{self, FdTable, FdTarget, MAX_FDS, MAX_OPEN_PATH_BYTES};
 use crate::{net, serial, time};
 use alloc::{boxed::Box, vec::Vec};
 use arrost_user_doom as user_doom;
 use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
-    AF_INET, IPPROTO_UDP, SOCK_DGRAM, SYS_CAP_DROP, SYS_CAP_GET, SYS_EXIT, SYS_GETPID, SYS_READ,
-    SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_TIME_MS, SYS_WAITPID,
-    SYS_WRITE, SYS_YIELD, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
+    AF_INET, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FileStat,
+    IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, SEEK_CUR, SEEK_END, SEEK_SET,
+    SOCK_DGRAM, SYS_CAP_DROP, SYS_CAP_GET, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FREAD,
+    SYS_FSTAT, SYS_FWRITE, SYS_GETPID, SYS_OPEN, SYS_READ, SYS_RECVFROM, SYS_SEEK, SYS_SENDTO,
+    SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_TIME_MS, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
+    UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -184,7 +188,25 @@ pub struct Ring3GroundworkSmokeReport {
     pub cap_get_rc: isize,
     pub sendto_user_req_rc: isize,
     pub recvfrom_user_req_rc: isize,
+    pub fd_open_readme_rc: isize,
+    pub fd_open_tmp_rc: isize,
+    pub fd_dup_rc: isize,
+    pub fd_dup2_rc: isize,
+    pub fd_badfd_rc: isize,
+    pub fd_emfile_rc: isize,
+    pub fd_ok: bool,
     pub exit_rc: isize,
+}
+
+#[derive(Clone, Copy)]
+struct Ring3FdSmokeResult {
+    open_readme_rc: isize,
+    open_tmp_rc: isize,
+    dup_rc: isize,
+    dup2_rc: isize,
+    badfd_rc: isize,
+    emfile_rc: isize,
+    ok: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -204,6 +226,7 @@ pub struct Ring3ProcessContext {
     pub pid: u32,
     pub name: &'static str,
     pub syscall_caps: u32,
+    pub fd_table: FdTable,
     pub address_space: AddressSpaceToken,
     pub trap_frame: Ring3TrapFrame,
     pub kernel_stack_top: u64,
@@ -258,6 +281,7 @@ impl Ring3ProcessContext {
             pid,
             name,
             syscall_caps,
+            fd_table: FdTable::new(),
             address_space: AddressSpaceToken::empty(),
             trap_frame: Ring3TrapFrame::empty(),
             kernel_stack_top: 0,
@@ -273,6 +297,7 @@ impl Ring3ProcessContext {
             pid: self.pid,
             name: self.name,
             syscall_caps: self.syscall_caps,
+            fd_table: self.fd_table,
             address_space: image.address_space,
             trap_frame: image.trap_frame,
             kernel_stack_top: image.kernel_stack_top,
@@ -312,6 +337,9 @@ impl Ring3GroundworkSmokeReport {
             && self.cap_get_rc >= 0
             && self.sendto_user_req_rc == errno::EINVAL
             && self.recvfrom_user_req_rc == errno::EINVAL
+            && self.fd_badfd_rc == errno::EBADF
+            && self.fd_emfile_rc == errno::EMFILE
+            && self.fd_ok
             && self.exit_rc == 0
     }
 }
@@ -320,6 +348,14 @@ impl Ring3GroundworkSmokeReport {
 pub struct SyscallStats {
     pub write: u64,
     pub read: u64,
+    pub open: u64,
+    pub close: u64,
+    pub fread: u64,
+    pub fwrite: u64,
+    pub seek: u64,
+    pub fstat: u64,
+    pub dup: u64,
+    pub dup2: u64,
     pub exit: u64,
     pub yield_now: u64,
     pub sleep: u64,
@@ -340,6 +376,14 @@ impl SyscallStats {
         Self {
             write: 0,
             read: 0,
+            open: 0,
+            close: 0,
+            fread: 0,
+            fwrite: 0,
+            seek: 0,
+            fstat: 0,
+            dup: 0,
+            dup2: 0,
             exit: 0,
             yield_now: 0,
             sleep: 0,
@@ -431,6 +475,7 @@ struct Task {
     child_pid: u32,
     line: [u8; MAX_LINE_LEN],
     line_len: usize,
+    fd_table: FdTable,
 }
 
 impl Task {
@@ -453,6 +498,7 @@ impl Task {
             child_pid: 0,
             line: [0; MAX_LINE_LEN],
             line_len: 0,
+            fd_table: FdTable::new(),
         }
     }
 }
@@ -466,6 +512,8 @@ struct ExternalTask {
     state: ExternalTaskState,
     syscall_caps: u32,
     tty: Option<u32>,
+    #[allow(dead_code)]
+    fd_table: FdTable,
 }
 
 impl ExternalTask {
@@ -485,6 +533,7 @@ impl ExternalTask {
             state: ExternalTaskState::Running,
             syscall_caps,
             tty,
+            fd_table: FdTable::new(),
         }
     }
 }
@@ -1099,7 +1148,7 @@ impl Scheduler {
             }
             SYS_READ => {
                 self.stats.read = self.stats.read.saturating_add(1);
-                self.syscall_read(arg0, arg1)
+                self.syscall_read(task, arg0, arg1)
             }
             SYS_EXIT => {
                 self.stats.exit = self.stats.exit.saturating_add(1);
@@ -1141,6 +1190,38 @@ impl Scheduler {
             SYS_WAITPID => {
                 self.stats.waitpid = self.stats.waitpid.saturating_add(1);
                 self.syscall_waitpid(task, arg0)
+            }
+            SYS_OPEN => {
+                self.stats.open = self.stats.open.saturating_add(1);
+                self.syscall_open(task, arg0, arg1, arg2)
+            }
+            SYS_CLOSE => {
+                self.stats.close = self.stats.close.saturating_add(1);
+                self.syscall_close(task, arg0)
+            }
+            SYS_FREAD => {
+                self.stats.fread = self.stats.fread.saturating_add(1);
+                self.syscall_fread(task, arg0, arg1, arg2)
+            }
+            SYS_FWRITE => {
+                self.stats.fwrite = self.stats.fwrite.saturating_add(1);
+                self.syscall_fwrite(task, arg0, arg1, arg2)
+            }
+            SYS_SEEK => {
+                self.stats.seek = self.stats.seek.saturating_add(1);
+                self.syscall_seek(task, arg0, arg1, arg2)
+            }
+            SYS_FSTAT => {
+                self.stats.fstat = self.stats.fstat.saturating_add(1);
+                self.syscall_fstat(task, arg0, arg1, arg2)
+            }
+            SYS_DUP => {
+                self.stats.dup = self.stats.dup.saturating_add(1);
+                self.syscall_dup(task, arg0)
+            }
+            SYS_DUP2 => {
+                self.stats.dup2 = self.stats.dup2.saturating_add(1);
+                self.syscall_dup2(task, arg0, arg1)
             }
             SYS_SOCKET => {
                 self.stats.socket = self.stats.socket.saturating_add(1);
@@ -1254,6 +1335,14 @@ impl Scheduler {
 
         let mut action = Ring3SyscallAction::ContinueUser;
         let result = match number {
+            SYS_WRITE => {
+                self.stats.write = self.stats.write.saturating_add(1);
+                self.syscall_write_ring3(ctx, arg0, arg1)
+            }
+            SYS_READ => {
+                self.stats.read = self.stats.read.saturating_add(1);
+                self.syscall_read_ring3(ctx, arg0, arg1)
+            }
             SYS_EXIT => {
                 self.stats.exit = self.stats.exit.saturating_add(1);
                 self.ring3_context.process.state = Ring3ProcessState::Exited;
@@ -1295,6 +1384,38 @@ impl Scheduler {
             SYS_CAP_DROP => {
                 self.stats.cap_drop = self.stats.cap_drop.saturating_add(1);
                 self.syscall_cap_drop_ring3(arg0)
+            }
+            SYS_OPEN => {
+                self.stats.open = self.stats.open.saturating_add(1);
+                self.syscall_open_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_CLOSE => {
+                self.stats.close = self.stats.close.saturating_add(1);
+                self.syscall_close_ring3(arg0)
+            }
+            SYS_FREAD => {
+                self.stats.fread = self.stats.fread.saturating_add(1);
+                self.syscall_fread_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_FWRITE => {
+                self.stats.fwrite = self.stats.fwrite.saturating_add(1);
+                self.syscall_fwrite_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_SEEK => {
+                self.stats.seek = self.stats.seek.saturating_add(1);
+                self.syscall_seek_ring3(arg0, arg1, arg2)
+            }
+            SYS_FSTAT => {
+                self.stats.fstat = self.stats.fstat.saturating_add(1);
+                self.syscall_fstat_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_DUP => {
+                self.stats.dup = self.stats.dup.saturating_add(1);
+                self.syscall_dup_ring3(arg0)
+            }
+            SYS_DUP2 => {
+                self.stats.dup2 = self.stats.dup2.saturating_add(1);
+                self.syscall_dup2_ring3(arg0, arg1)
             }
             SYS_SOCKET => {
                 self.stats.socket = self.stats.socket.saturating_add(1);
@@ -1345,6 +1466,13 @@ impl Scheduler {
                 cap_get_rc: errno::ENODEV,
                 sendto_user_req_rc: errno::ENODEV,
                 recvfrom_user_req_rc: errno::ENODEV,
+                fd_open_readme_rc: errno::ENODEV,
+                fd_open_tmp_rc: errno::ENODEV,
+                fd_dup_rc: errno::ENODEV,
+                fd_dup2_rc: errno::ENODEV,
+                fd_badfd_rc: errno::ENODEV,
+                fd_emfile_rc: errno::ENODEV,
+                fd_ok: false,
                 exit_rc: errno::ENODEV,
             });
         }
@@ -1395,6 +1523,13 @@ impl Scheduler {
             recv_req_ptr,
             size_of::<UdpRecvReq>() as u64,
         );
+        let fd_smoke = match self.run_ring3_fd_groundwork_smoke(current) {
+            Ok(result) => result,
+            Err(error) => {
+                self.disarm_ring3_context();
+                return Err(error);
+            }
+        };
         let exit_rc = self.dispatch_ring3_syscall(SYS_EXIT, 0, 0, 0);
         self.disarm_ring3_context();
 
@@ -1411,8 +1546,160 @@ impl Scheduler {
             cap_get_rc,
             sendto_user_req_rc,
             recvfrom_user_req_rc,
+            fd_open_readme_rc: fd_smoke.open_readme_rc,
+            fd_open_tmp_rc: fd_smoke.open_tmp_rc,
+            fd_dup_rc: fd_smoke.dup_rc,
+            fd_dup2_rc: fd_smoke.dup2_rc,
+            fd_badfd_rc: fd_smoke.badfd_rc,
+            fd_emfile_rc: fd_smoke.emfile_rc,
+            fd_ok: fd_smoke.ok,
             exit_rc,
         })
+    }
+
+    fn run_ring3_fd_groundwork_smoke(
+        &mut self,
+        process: Ring3ProcessContext,
+    ) -> Result<Ring3FdSmokeResult, isize> {
+        let readme_path = b"/README.TXT";
+        let tmp_path = b"/tmp/FD_SMOKE.TXT";
+        let payload = b"fd smoke\n";
+
+        let Some(readme_ptr) = self.first_writable_ring3_pointer(320, readme_path.len()) else {
+            return Err(errno::ENODEV);
+        };
+        let Some(tmp_ptr) = self.first_writable_ring3_pointer(352, tmp_path.len()) else {
+            return Err(errno::ENODEV);
+        };
+        let Some(payload_ptr) = self.first_writable_ring3_pointer(416, payload.len()) else {
+            return Err(errno::ENODEV);
+        };
+        let Some(readback_ptr) = self.first_writable_ring3_pointer(480, payload.len()) else {
+            return Err(errno::ENODEV);
+        };
+        let Some(stat_ptr) = self.first_writable_ring3_pointer(544, size_of::<FileStat>()) else {
+            return Err(errno::ENODEV);
+        };
+
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            readme_ptr,
+            readme_path,
+        ) {
+            return Err(self.map_ring3_copy_error(error));
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            tmp_ptr,
+            tmp_path,
+        ) {
+            return Err(self.map_ring3_copy_error(error));
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            payload_ptr,
+            payload,
+        ) {
+            return Err(self.map_ring3_copy_error(error));
+        }
+
+        let open_readme_rc = self.dispatch_ring3_syscall(
+            SYS_OPEN,
+            readme_ptr,
+            O_RDONLY as u64,
+            readme_path.len() as u64,
+        );
+        let open_tmp_rc = self.dispatch_ring3_syscall(
+            SYS_OPEN,
+            tmp_ptr,
+            (O_CREAT | O_TRUNC | O_RDWR) as u64,
+            tmp_path.len() as u64,
+        );
+
+        let mut result = Ring3FdSmokeResult {
+            open_readme_rc,
+            open_tmp_rc,
+            dup_rc: errno::ENODEV,
+            dup2_rc: errno::ENODEV,
+            badfd_rc: errno::ENODEV,
+            emfile_rc: errno::ENODEV,
+            ok: false,
+        };
+
+        if open_readme_rc < 0 || open_tmp_rc < 0 {
+            return Ok(result);
+        }
+        let readme_fd = open_readme_rc as u64;
+        let tmp_fd = open_tmp_rc as u64;
+
+        let dup_rc = self.dispatch_ring3_syscall(SYS_DUP, tmp_fd, 0, 0);
+        result.dup_rc = dup_rc;
+        if dup_rc < 0 {
+            return Ok(result);
+        }
+        let dup_fd = dup_rc as u64;
+
+        let dup2_rc = self.dispatch_ring3_syscall(SYS_DUP2, tmp_fd, 1, 0);
+        result.dup2_rc = dup2_rc;
+        let write_rc = self.dispatch_ring3_syscall(SYS_WRITE, payload_ptr, payload.len() as u64, 0);
+        let seek_rc = self.dispatch_ring3_syscall(SYS_SEEK, dup_fd, 0, SEEK_SET);
+        let fread_rc =
+            self.dispatch_ring3_syscall(SYS_FREAD, tmp_fd, readback_ptr, payload.len() as u64);
+        let fstat_rc =
+            self.dispatch_ring3_syscall(SYS_FSTAT, tmp_fd, stat_ptr, size_of::<FileStat>() as u64);
+        let close_readme_rc = self.dispatch_ring3_syscall(SYS_CLOSE, readme_fd, 0, 0);
+        let close_dup_rc = self.dispatch_ring3_syscall(SYS_CLOSE, dup_fd, 0, 0);
+        let close_tmp_rc = self.dispatch_ring3_syscall(SYS_CLOSE, tmp_fd, 0, 0);
+        result.badfd_rc = self.dispatch_ring3_syscall(SYS_CLOSE, 99, 0, 0);
+
+        for _ in 0..=MAX_FDS {
+            let rc = self.dispatch_ring3_syscall(
+                SYS_OPEN,
+                readme_ptr,
+                O_RDONLY as u64,
+                readme_path.len() as u64,
+            );
+            if rc < 0 {
+                result.emfile_rc = rc;
+                break;
+            }
+        }
+
+        let mut readback = [0u8; 16];
+        if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            readback_ptr,
+            &mut readback[..payload.len()],
+        ) {
+            return Err(self.map_ring3_copy_error(error));
+        }
+        let stat = match ring3_groundwork::copy_from_user::<FileStat>(
+            &process.user_ranges,
+            process.user_range_count,
+            stat_ptr,
+        ) {
+            Ok(stat) => stat,
+            Err(error) => return Err(self.map_ring3_copy_error(error)),
+        };
+
+        result.ok = dup2_rc == 1
+            && write_rc == payload.len() as isize
+            && seek_rc == 0
+            && fread_rc == payload.len() as isize
+            && fstat_rc == 0
+            && close_readme_rc == 0
+            && close_dup_rc == 0
+            && close_tmp_rc == 0
+            && result.badfd_rc == errno::EBADF
+            && result.emfile_rc == errno::EMFILE
+            && readback[..payload.len()] == payload[..]
+            && stat.size == payload.len() as u64;
+
+        Ok(result)
     }
 
     fn enqueue_ring3_user_app(&mut self, parent_pid: u32, app_id: u64) -> Result<u32, isize> {
@@ -1868,39 +2155,695 @@ impl Scheduler {
         })
     }
 
-    fn syscall_write(&mut self, _task: &Task, ptr: u64, len: u64) -> isize {
-        let len = len as usize;
+    fn with_ring3_fd_table<R>(&mut self, f: impl FnOnce(&mut Self, &mut FdTable) -> R) -> R {
+        let mut fd_table = self.ring3_context.process.fd_table;
+        let result = f(self, &mut fd_table);
+        self.ring3_context.process.fd_table = fd_table;
+        result
+    }
+
+    fn validate_open_flags(&mut self, flags: u64) -> Result<u32, isize> {
+        let Ok(flags) = u32::try_from(flags) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return Err(errno::EINVAL);
+        };
+        let known = O_ACCMODE | O_CREAT | O_TRUNC;
+        if (flags & !known) != 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return Err(errno::EINVAL);
+        }
+        let access = flags & O_ACCMODE;
+        if access > O_RDWR || ((flags & O_TRUNC) != 0 && access == O_RDONLY) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return Err(errno::EINVAL);
+        }
+        Ok(flags)
+    }
+
+    fn open_with_bytes(
+        &mut self,
+        fd_table: &mut FdTable,
+        pid: u32,
+        path_bytes: &[u8],
+        flags: u64,
+    ) -> isize {
+        let flags = match self.validate_open_flags(flags) {
+            Ok(flags) => flags,
+            Err(error) => return error,
+        };
+        if path_bytes.is_empty() || path_bytes.iter().any(|byte| *byte == 0) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+
+        let file = match fs::open_file(path, Some(pid), flags) {
+            Ok(file) => file,
+            Err(error) => {
+                let rc = map_fs_error(error);
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return rc;
+            }
+        };
+
+        match fd_table.open_file(file, flags) {
+            Ok(fd) => fd as isize,
+            Err(error) => {
+                fs::close_file(file);
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    fn fd_read_into(&mut self, fd_table: &mut FdTable, fd: u32, out: &mut [u8]) -> isize {
+        if out.is_empty() {
+            return 0;
+        }
+        let desc = match fd_table.description(fd) {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return error.as_errno();
+            }
+        };
+        if !desc.can_read() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        }
+
+        match desc.target {
+            FdTarget::SerialStdin => {
+                let Some(byte) = self.input_script.next_byte() else {
+                    return 0;
+                };
+                out[0] = byte;
+                1
+            }
+            FdTarget::SerialStdout | FdTarget::SerialStderr => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
+            FdTarget::File(file) => match fs::read_open_file(file, desc.offset, out) {
+                Ok(read) => {
+                    let _ = fd_table.advance_offset(fd, read as u64);
+                    read as isize
+                }
+                Err(error) => {
+                    let rc = map_fs_error(error);
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    rc
+                }
+            },
+        }
+    }
+
+    fn fd_write_from(&mut self, fd_table: &mut FdTable, fd: u32, data: &[u8]) -> isize {
+        if data.is_empty() {
+            return 0;
+        }
+        let desc = match fd_table.description(fd) {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return error.as_errno();
+            }
+        };
+        if !desc.can_write() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        }
+
+        match desc.target {
+            FdTarget::SerialStdin => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
+            FdTarget::SerialStdout | FdTarget::SerialStderr => {
+                for byte in data {
+                    if *byte == b'\n' {
+                        serial::write_byte(b'\r');
+                    }
+                    serial::write_byte(*byte);
+                }
+                data.len() as isize
+            }
+            FdTarget::File(file) => match fs::write_open_file(file, desc.offset, data) {
+                Ok(written) => {
+                    let _ = fd_table.advance_offset(fd, written as u64);
+                    written as isize
+                }
+                Err(error) => {
+                    let rc = map_fs_error(error);
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    rc
+                }
+            },
+        }
+    }
+
+    fn fd_seek(&mut self, fd_table: &mut FdTable, fd: u32, offset: i64, whence: u64) -> isize {
+        let desc = match fd_table.description(fd) {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return error.as_errno();
+            }
+        };
+
+        let FdTarget::File(file) = desc.target else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+
+        let size = match fs::stat_open_file(file) {
+            Ok(stat) => stat.size as u64,
+            Err(error) => {
+                let rc = map_fs_error(error);
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return rc;
+            }
+        };
+
+        let base = match whence {
+            SEEK_SET => 0i128,
+            SEEK_CUR => desc.offset as i128,
+            SEEK_END => size as i128,
+            _ => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return errno::EINVAL;
+            }
+        };
+        let next = base + (offset as i128);
+        if next < 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        let next = next as u64;
+        match fd_table.set_offset(fd, next) {
+            Ok(()) => next as isize,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    fn fd_stat(&mut self, fd_table: &FdTable, fd: u32) -> Result<FileStat, isize> {
+        let desc = match fd_table.description(fd) {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return Err(error.as_errno());
+            }
+        };
+        match desc.target {
+            FdTarget::SerialStdin => Ok(serial_fd_stat(true)),
+            FdTarget::SerialStdout | FdTarget::SerialStderr => Ok(serial_fd_stat(false)),
+            FdTarget::File(file) => match fs::stat_open_file(file) {
+                Ok(stat) => Ok(stat_to_file_stat(stat)),
+                Err(error) => {
+                    let rc = map_fs_error(error);
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    Err(rc)
+                }
+            },
+        }
+    }
+
+    fn syscall_open(&mut self, task: &mut Task, path_ptr: u64, flags: u64, path_len: u64) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        // SAFETY: cooperative tasks pass in-kernel pointers in the shared address space.
+        let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+        self.open_with_bytes(&mut task.fd_table, task.pid, path_bytes, flags)
+    }
+
+    fn syscall_open_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        flags: u64,
+        path_len: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            path_ptr,
+            &mut path[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.open_with_bytes(fd_table, process.pid, &path[..path_len], flags)
+        })
+    }
+
+    fn syscall_close(&mut self, task: &mut Task, fd: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        match task.fd_table.close(fd) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    fn syscall_close_ring3(&mut self, fd: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        self.with_ring3_fd_table(|scheduler, fd_table| match fd_table.close(fd) {
+            Ok(()) => 0,
+            Err(error) => {
+                scheduler.stats.errors = scheduler.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        })
+    }
+
+    fn syscall_write(&mut self, task: &mut Task, ptr: u64, len: u64) -> isize {
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
         if ptr == 0 || len > MAX_WRITE_BYTES {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
         }
 
-        // SAFETY: M4 tasks run in the same address space and pass in-kernel pointers.
+        // SAFETY: cooperative tasks pass in-kernel pointers in the shared address space.
         let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-        for byte in bytes {
-            if *byte == b'\n' {
-                serial::write_byte(b'\r');
-            }
-            serial::write_byte(*byte);
-        }
-        len as isize
+        self.fd_write_from(&mut task.fd_table, 1, bytes)
     }
 
-    fn syscall_read(&mut self, ptr: u64, len: u64) -> isize {
+    fn syscall_write_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 || len > MAX_WRITE_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut bytes = [0u8; MAX_WRITE_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            let input = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            bytes[..len].copy_from_slice(input);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            ptr,
+            &mut bytes[..len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.fd_write_from(fd_table, 1, &bytes[..len])
+        })
+    }
+
+    fn syscall_read(&mut self, task: &mut Task, ptr: u64, len: u64) -> isize {
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
         if ptr == 0 || len == 0 {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
         }
 
-        let Some(byte) = self.input_script.next_byte() else {
-            return 0;
-        };
+        // SAFETY: `ptr` points to writable in-kernel memory in the shared address space.
+        let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        self.fd_read_into(&mut task.fd_table, 0, out)
+    }
 
-        // SAFETY: `ptr` is provided by in-kernel task and points to writable memory.
-        unsafe {
-            (ptr as *mut u8).write(byte);
+    fn syscall_read_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 || len == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
         }
-        1
+
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+            return self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_read_into(fd_table, 0, out)
+            });
+        }
+
+        let mut bytes = Vec::<u8>::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        bytes.resize(len, 0);
+
+        let read = self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.fd_read_into(fd_table, 0, bytes.as_mut_slice())
+        });
+        if read <= 0 {
+            return read;
+        }
+        let used = read as usize;
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            ptr,
+            &bytes[..used],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        read
+    }
+
+    fn syscall_fread(&mut self, task: &mut Task, fd: u64, ptr: u64, len: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 && len != 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        if len > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        // SAFETY: `ptr` points to writable in-kernel memory in the shared address space.
+        let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        self.fd_read_into(&mut task.fd_table, fd, out)
+    }
+
+    fn syscall_fread_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        ptr: u64,
+        len: u64,
+    ) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 && len != 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        if len > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+            return self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_read_into(fd_table, fd, out)
+            });
+        }
+
+        let mut bytes = Vec::<u8>::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        bytes.resize(len, 0);
+
+        let read = self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.fd_read_into(fd_table, fd, bytes.as_mut_slice())
+        });
+        if read <= 0 {
+            return read;
+        }
+        let used = read as usize;
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            ptr,
+            &bytes[..used],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        read
+    }
+
+    fn syscall_fwrite(&mut self, task: &mut Task, fd: u64, ptr: u64, len: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 && len != 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        if len > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        // SAFETY: cooperative tasks pass in-kernel pointers in the shared address space.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        self.fd_write_from(&mut task.fd_table, fd, bytes)
+    }
+
+    fn syscall_fwrite_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        ptr: u64,
+        len: u64,
+    ) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if ptr == 0 && len != 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        if len > MAX_RING3_IO_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            return self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_write_from(fd_table, fd, bytes)
+            });
+        }
+
+        let mut bytes = Vec::<u8>::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        bytes.resize(len, 0);
+        if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            ptr,
+            bytes.as_mut_slice(),
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.fd_write_from(fd_table, fd, bytes.as_slice())
+        })
+    }
+
+    fn syscall_seek(&mut self, task: &mut Task, fd: u64, offset: u64, whence: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        self.fd_seek(&mut task.fd_table, fd, offset as i64, whence)
+    }
+
+    fn syscall_seek_ring3(&mut self, fd: u64, offset: u64, whence: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        self.with_ring3_fd_table(|scheduler, fd_table| {
+            scheduler.fd_seek(fd_table, fd, offset as i64, whence)
+        })
+    }
+
+    fn syscall_fstat(&mut self, task: &mut Task, fd: u64, ptr: u64, len: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        if ptr == 0 || len != size_of::<FileStat>() as u64 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let stat = match self.fd_stat(&task.fd_table, fd) {
+            Ok(stat) => stat,
+            Err(error) => return error,
+        };
+        // SAFETY: `ptr` points to writable in-kernel memory in the shared address space.
+        unsafe {
+            (ptr as *mut FileStat).write(stat);
+        }
+        0
+    }
+
+    fn syscall_fstat_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        ptr: u64,
+        len: u64,
+    ) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        if ptr == 0 || len != size_of::<FileStat>() as u64 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let stat = self.with_ring3_fd_table(|scheduler, fd_table| scheduler.fd_stat(fd_table, fd));
+        let stat = match stat {
+            Ok(stat) => stat,
+            Err(error) => return error,
+        };
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke passes shared-address-space pointers.
+            unsafe {
+                (ptr as *mut FileStat).write(stat);
+            }
+            return 0;
+        }
+        match ring3_groundwork::copy_to_user::<FileStat>(
+            &process.user_ranges,
+            process.user_range_count,
+            ptr,
+            &stat,
+        ) {
+            Ok(()) => 0,
+            Err(error) => self.map_ring3_copy_error(error),
+        }
+    }
+
+    fn syscall_dup(&mut self, task: &mut Task, fd: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        match task.fd_table.dup(fd) {
+            Ok(new_fd) => new_fd as isize,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    fn syscall_dup_ring3(&mut self, fd: u64) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        self.with_ring3_fd_table(|scheduler, fd_table| match fd_table.dup(fd) {
+            Ok(new_fd) => new_fd as isize,
+            Err(error) => {
+                scheduler.stats.errors = scheduler.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        })
+    }
+
+    fn syscall_dup2(&mut self, task: &mut Task, src_fd: u64, dst_fd: u64) -> isize {
+        let Ok(src_fd) = u32::try_from(src_fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(dst_fd) = u32::try_from(dst_fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        match task.fd_table.dup2(src_fd, dst_fd) {
+            Ok(fd) => fd as isize,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    fn syscall_dup2_ring3(&mut self, src_fd: u64, dst_fd: u64) -> isize {
+        let Ok(src_fd) = u32::try_from(src_fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let Ok(dst_fd) = u32::try_from(dst_fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        self.with_ring3_fd_table(|scheduler, fd_table| match fd_table.dup2(src_fd, dst_fd) {
+            Ok(fd) => fd as isize,
+            Err(error) => {
+                scheduler.stats.errors = scheduler.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        })
     }
 
     fn syscall_socket(&mut self, domain: u64, socket_type: u64, protocol: u64) -> isize {
@@ -2755,9 +3698,17 @@ impl Scheduler {
 
     fn log_syscall_stats(&self) {
         serial::write_fmt(format_args!(
-            "syscalls: write={} read={} yield={} sleep={} exit={} getpid={} time_ms={} cap_get={} cap_drop={} spawn={} waitpid={} socket={} sendto={} recvfrom={} errors={}\n",
+            "syscalls: write={} read={} open={} close={} fread={} fwrite={} seek={} fstat={} dup={} dup2={} yield={} sleep={} exit={} getpid={} time_ms={} cap_get={} cap_drop={} spawn={} waitpid={} socket={} sendto={} recvfrom={} errors={}\n",
             self.stats.write,
             self.stats.read,
+            self.stats.open,
+            self.stats.close,
+            self.stats.fread,
+            self.stats.fwrite,
+            self.stats.seek,
+            self.stats.fstat,
+            self.stats.dup,
+            self.stats.dup2,
             self.stats.yield_now,
             self.stats.sleep,
             self.stats.exit,
@@ -2785,6 +3736,58 @@ fn map_net_error(error: net::NetError) -> isize {
         net::NetError::IoTimeout => errno::ETIMEDOUT,
         net::NetError::ArpTimeout => errno::EHOSTUNREACH,
         net::NetError::UdpPayloadTooLarge => errno::EMSGSIZE,
+    }
+}
+
+fn map_fs_error(error: fs::FsError) -> isize {
+    match error {
+        fs::FsError::NotFound => errno::ENOENT,
+        fs::FsError::NoSpace | fs::FsError::StorageNoSpace => errno::ENOSPC,
+        fs::FsError::StorageUnavailable | fs::FsError::StorageIo | fs::FsError::DiskCorrupt => {
+            errno::ENODEV
+        }
+        fs::FsError::ReadOnly => errno::EPERM,
+        _ => errno::EINVAL,
+    }
+}
+
+fn file_type_to_abi(file_type: fs::FileType) -> u16 {
+    match file_type {
+        fs::FileType::Regular => FILE_TYPE_REGULAR,
+        fs::FileType::Directory => FILE_TYPE_DIRECTORY,
+        fs::FileType::Symlink => FILE_TYPE_SYMLINK,
+    }
+}
+
+fn stat_to_file_stat(stat: fs::Stat) -> FileStat {
+    FileStat {
+        ino: stat.ino,
+        file_type: file_type_to_abi(stat.file_type),
+        mode: stat.mode,
+        nlink: stat.nlink,
+        uid: stat.uid,
+        gid: stat.gid,
+        reserved: 0,
+        size: stat.size as u64,
+        created: stat.created,
+        modified: stat.modified,
+        accessed: stat.accessed,
+    }
+}
+
+fn serial_fd_stat(readable: bool) -> FileStat {
+    FileStat {
+        ino: 0,
+        file_type: FILE_TYPE_CHAR,
+        mode: if readable { 0o400 } else { 0o200 },
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        reserved: 0,
+        size: 0,
+        created: 0,
+        modified: 0,
+        accessed: 0,
     }
 }
 
@@ -2831,7 +3834,8 @@ fn apply_cap_drop_mask(caps_mask: &mut u32, drop_mask: u64) -> Result<u32, isize
 
 fn syscall_required_caps(number: u64) -> u32 {
     match number {
-        SYS_WRITE | SYS_READ | SYS_EXIT | SYS_YIELD | SYS_SLEEP => caps::CORE,
+        SYS_WRITE | SYS_READ | SYS_EXIT | SYS_YIELD | SYS_SLEEP | SYS_OPEN | SYS_CLOSE
+        | SYS_FREAD | SYS_FWRITE | SYS_SEEK | SYS_FSTAT | SYS_DUP | SYS_DUP2 => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
         SYS_TIME_MS => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM => caps::NET,
@@ -3161,6 +4165,10 @@ pub fn exit_external_process_with_code(pid: u32, code: i32) -> bool {
 
 pub fn snapshot_processes(out: &mut [ProcessSnapshot]) -> usize {
     with_scheduler(|scheduler| scheduler.snapshot_processes(out))
+}
+
+pub fn shell_pid() -> Option<u32> {
+    with_scheduler(|scheduler| scheduler.find_pid("sh"))
 }
 
 pub fn kill_process(pid: u32) -> isize {

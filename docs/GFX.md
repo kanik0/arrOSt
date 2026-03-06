@@ -14,6 +14,8 @@ ArrOSt uses a framebuffer compositor that keeps serial diagnostics as the primar
 ## UI model
 
 - Top-anchored taskbar with `Apps` launcher menu.
+- OS-wide grayscale monospace UI font for taskbar, menu, window chrome, file manager, Doom status, and terminal text.
+- Chrome text keeps the default cell metrics, while window content/terminal rows use slightly roomier line spacing for readability.
 - `Apps` menu currently exposes:
   - `doom` (same runtime effect as `doom play`)
   - `terminal` (opens a new terminal emulator instance)
@@ -58,7 +60,8 @@ When Doom runtime is active, a dedicated Doom window is opened for viewport + st
 ## Limits
 
 - No hardware acceleration.
-- Minimal text renderer and desktop model.
+- Text rendering is still bitmap-based ASCII, but now uses a larger grayscale monospace raster instead of the earlier 5x7 uppercase-only glyph set.
+- Glyph sampling is vertically corrected in the compositor, so the generated raster font is rendered upright on screen.
 - UI is optimized for kernel bring-up and debugging, not full desktop UX.
 - Terminal emulator sessions are compositor-managed and intentionally minimal (not yet full VT/ANSI emulation).
 - GUI terminal command set is intentionally smaller than the serial shell command surface.

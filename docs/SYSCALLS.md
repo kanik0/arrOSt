@@ -4,7 +4,7 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 
 ## ABI revision
 
-- Current revision: `3`
+- Current revision: `4`
 - Shared constants live in `crates/arrostd/src/lib.rs`
 
 ## Syscall numbers
@@ -23,6 +23,24 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 - `12`: `cap_drop`
 - `13`: `spawn`
 - `14`: `waitpid`
+- `15`: `open`
+- `16`: `close`
+- `17`: `fread`
+- `18`: `fwrite`
+- `19`: `seek`
+- `20`: `fstat`
+- `21`: `dup`
+- `22`: `dup2`
+
+`read`/`write` remain available as stdio shims over the per-process descriptor table (`fd 0` / `fd 1`).
+Fresh processes start with:
+
+- `fd 0`: serial stdin
+- `fd 1`: serial stdout
+- `fd 2`: serial stderr
+
+Filesystem descriptors use the shared table above those slots.
+Current UDP socket syscalls still use their existing separate socket-fd namespace (`UDP_SOCKET_FD = 1`) and are not yet unified with filesystem descriptors.
 
 ## Networking constants
 
@@ -53,12 +71,15 @@ Kernel syscall handlers return negative values (`-errno`) and diagnostics report
 
 Current mapped set used by runtime paths:
 
+- `ENOENT = -2`
 - `EPERM = -1`
 - `EAGAIN = -11`
 - `EBADF = -9`
 - `EFAULT = -14`
 - `ENODEV = -19`
 - `EINVAL = -22`
+- `EMFILE = -24`
+- `ENOSPC = -28`
 - `ENOSYS = -38`
 - `EMSGSIZE = -90`
 - `EPROTONOSUPPORT = -93`
@@ -74,6 +95,16 @@ Current mapped set used by runtime paths:
 
 Both are `#[repr(C)]` and designed for stable kernel/user data exchange.
 
+Additional shared request/metadata contract for filesystem syscalls:
+
+- `FileStat`
+
+## Filesystem constants
+
+- Open flags: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`
+- Seek constants: `SEEK_SET`, `SEEK_CUR`, `SEEK_END`
+- File types: `FILE_TYPE_REGULAR`, `FILE_TYPE_DIRECTORY`, `FILE_TYPE_SYMLINK`, `FILE_TYPE_CHAR`
+
 ## Status
 
 The ABI is active for cooperative and ring-3 runtime paths. Full userspace isolation and broader syscall coverage are planned but not yet implemented.
@@ -84,7 +115,7 @@ When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an 
 When `ARROST_RING3_BOOT_SMOKE_FAULT=true` is also set (aarch64 only), boot smoke intentionally triggers a controlled EL0 sync fault to validate fallback/resume diagnostics.
 Those smoke sequences are dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contribute to shared syscall statistics.
 A cross-platform shell command (`ring3 smoke`) also exercises ring-3 policy dispatch through that same process-layer context (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) without requiring hardware ring transition support.
-With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into user ranges and validates process-model metadata (`trapframe`, kernel stack top) plus range-checked pointer dispatch (`copy_from_user`/`copy_to_user`) for ring-3 `sendto`/`recvfrom` request structs.
+With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into user ranges and validates process-model metadata (`trapframe`, kernel stack top), range-checked pointer dispatch (`copy_from_user`/`copy_to_user`), and the filesystem descriptor syscall path (`open/fread/fwrite/seek/fstat/dup/dup2`).
 With `ARROST_RING3_ELF_GROUNDWORK=true`, shell command `ring3 run <init|doom>` enqueues embedded native ELF artifacts (`ring3_init`/`ring3_doom`) into the ring-3 multiprocess scheduler through the architecture gate (`int 0x80`/`SVC`).
 Ring-3 runtime dispatch handles `yield` and `sleep` as scheduler preemption points, and `xtask smoke-ring3-run` validates multiprocess runtime (`init` + `doom`) plus `yield/sleep/exit` flow on both architectures.
 Runtime launch stores process address-space token metadata and performs switch/restore around user execution (current groundwork is partial: x86 clones active P4 root; aarch64 currently reuses TTBR0 token).

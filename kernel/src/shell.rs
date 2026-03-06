@@ -164,7 +164,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, ls [ /bin ], cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, ls [<path>], cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -317,7 +317,19 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
     if input == "ls" || input == SERIAL_BIN_LS {
-        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command());
+        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command("/"));
+        return;
+    }
+    if let Some(path) = input
+        .strip_prefix("ls ")
+        .or_else(|| input.strip_prefix("/bin/ls "))
+    {
+        let path = path.trim();
+        if path.is_empty() {
+            serial::write_line("usage: ls [<path>]");
+            return;
+        }
+        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command(path));
         return;
     }
 
@@ -334,7 +346,7 @@ fn run_command(shell: &mut ShellState) {
             serial::write_line("usage: cat <file>");
             return;
         }
-        with_shell_bin_process(SERIAL_BIN_CAT, |_pid| fs::cat_to_serial(path));
+        with_shell_bin_process(SERIAL_BIN_CAT, |pid| fs::cat_to_serial_for_pid(path, pid));
         return;
     }
 
@@ -591,7 +603,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid> | syscalls | terminal | ls [ /bin ] | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid> | syscalls | terminal | ls [<path>] | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal",
             );
         }
         "version" => {
@@ -1035,7 +1047,7 @@ fn run_ring3_groundwork_smoke() {
             }
 
             serial::write_fmt(format_args!(
-                "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} exit={} result={}\n",
+                "ring3(groundwork): pid={} entry={:#018x} sp={:#018x} ksp={:#018x} ranges={} pages={} getpid={} time={} cap_get={} sendto={} recvfrom={} fd_open_readme={} fd_open_tmp={} fd_dup={} fd_dup2={} fd_badfd={} fd_emfile={} fd={} exit={} result={}\n",
                 report.pid,
                 report.entry_ip,
                 report.entry_sp,
@@ -1047,6 +1059,13 @@ fn run_ring3_groundwork_smoke() {
                 report.cap_get_rc,
                 report.sendto_user_req_rc,
                 report.recvfrom_user_req_rc,
+                report.fd_open_readme_rc,
+                report.fd_open_tmp_rc,
+                report.fd_dup_rc,
+                report.fd_dup2_rc,
+                report.fd_badfd_rc,
+                report.fd_emfile_rc,
+                if report.fd_ok { "ok" } else { "fail" },
                 report.exit_rc,
                 if report.passed() { "ok" } else { "fail" },
             ));
@@ -1086,8 +1105,8 @@ fn run_shell_ps_command() {
     proc::log_process_table();
 }
 
-fn run_shell_ls_command() {
-    fs::list_to_serial();
+fn run_shell_ls_command(path: &str) {
+    fs::list_dir_to_serial(path, None);
     refresh_file_manager_list_view();
 }
 
@@ -1305,11 +1324,22 @@ fn handle_file_manager_command(input: &str) -> bool {
                 if path.is_empty() {
                     serial::write_line("usage: fm open <file>");
                 } else {
-                    with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
+                    with_shell_bin_process(SERIAL_BIN_FM, |pid| {
                         let mut buffer = [0u8; fs::MAX_FILE_BYTES];
-                        match fs::read_file(path, &mut buffer) {
+                        let result = match pid {
+                            Some(wrapper_pid) => {
+                                fs::read_file_for_pid(path, &mut buffer, Some(wrapper_pid))
+                            }
+                            None => fs::read_file(path, &mut buffer),
+                        };
+                        match result {
                             Ok(len) => {
-                                fs::cat_to_serial(path);
+                                match pid {
+                                    Some(wrapper_pid) => {
+                                        fs::cat_to_serial_for_pid(path, Some(wrapper_pid));
+                                    }
+                                    None => fs::cat_to_serial(path),
+                                }
                                 refresh_file_manager_preview_view(path, &buffer[..len]);
                             }
                             Err(err) => serial::write_fmt(format_args!(

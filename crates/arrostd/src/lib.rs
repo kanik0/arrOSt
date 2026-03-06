@@ -2,7 +2,7 @@
 
 // crates/arrostd/src/lib.rs: shared no_std helpers for ArrOSt crates.
 pub mod abi {
-    pub const USERLAND_ABI_REVISION: u16 = 3;
+    pub const USERLAND_ABI_REVISION: u16 = 4;
     pub const USERLAND_INIT_APP: &str = "init";
     pub const USERLAND_DOOM_APP: &str = "doom";
 
@@ -12,7 +12,7 @@ pub mod abi {
 }
 
 pub mod syscall {
-    pub const ABI_REVISION: u16 = 3;
+    pub const ABI_REVISION: u16 = 4;
 
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_READ: u64 = 2;
@@ -28,6 +28,14 @@ pub mod syscall {
     pub const SYS_CAP_DROP: u64 = 12;
     pub const SYS_SPAWN: u64 = 13;
     pub const SYS_WAITPID: u64 = 14;
+    pub const SYS_OPEN: u64 = 15;
+    pub const SYS_CLOSE: u64 = 16;
+    pub const SYS_FREAD: u64 = 17;
+    pub const SYS_FWRITE: u64 = 18;
+    pub const SYS_SEEK: u64 = 19;
+    pub const SYS_FSTAT: u64 = 20;
+    pub const SYS_DUP: u64 = 21;
+    pub const SYS_DUP2: u64 = 22;
 
     pub mod app {
         pub const INIT: u64 = 1;
@@ -46,6 +54,57 @@ pub mod syscall {
     pub const SOCK_DGRAM: u64 = 2;
     pub const IPPROTO_UDP: u64 = 17;
     pub const UDP_SOCKET_FD: u64 = 1;
+
+    pub const O_RDONLY: u32 = 0;
+    pub const O_WRONLY: u32 = 1;
+    pub const O_RDWR: u32 = 2;
+    pub const O_ACCMODE: u32 = 0x3;
+    pub const O_CREAT: u32 = 1 << 8;
+    pub const O_TRUNC: u32 = 1 << 9;
+
+    pub const SEEK_SET: u64 = 0;
+    pub const SEEK_CUR: u64 = 1;
+    pub const SEEK_END: u64 = 2;
+
+    pub const FILE_TYPE_UNKNOWN: u16 = 0;
+    pub const FILE_TYPE_REGULAR: u16 = 1;
+    pub const FILE_TYPE_DIRECTORY: u16 = 2;
+    pub const FILE_TYPE_SYMLINK: u16 = 3;
+    pub const FILE_TYPE_CHAR: u16 = 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileStat {
+        pub ino: u32,
+        pub file_type: u16,
+        pub mode: u16,
+        pub nlink: u16,
+        pub uid: u16,
+        pub gid: u16,
+        pub reserved: u16,
+        pub size: u64,
+        pub created: u64,
+        pub modified: u64,
+        pub accessed: u64,
+    }
+
+    impl FileStat {
+        pub const fn zero() -> Self {
+            Self {
+                ino: 0,
+                file_type: FILE_TYPE_UNKNOWN,
+                mode: 0,
+                nlink: 0,
+                uid: 0,
+                gid: 0,
+                reserved: 0,
+                size: 0,
+                created: 0,
+                modified: 0,
+                accessed: 0,
+            }
+        }
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -113,16 +172,27 @@ pub mod syscall {
             SYS_CAP_DROP => "cap_drop",
             SYS_SPAWN => "spawn",
             SYS_WAITPID => "waitpid",
+            SYS_OPEN => "open",
+            SYS_CLOSE => "close",
+            SYS_FREAD => "fread",
+            SYS_FWRITE => "fwrite",
+            SYS_SEEK => "seek",
+            SYS_FSTAT => "fstat",
+            SYS_DUP => "dup",
+            SYS_DUP2 => "dup2",
             _ => "unknown",
         }
     }
 
     pub mod errno {
+        pub const ENOENT: isize = -2;
         pub const EPERM: isize = -1;
         pub const EAGAIN: isize = -11;
         pub const EFAULT: isize = -14;
         pub const ENODEV: isize = -19;
         pub const EINVAL: isize = -22;
+        pub const EMFILE: isize = -24;
+        pub const ENOSPC: isize = -28;
         pub const ENOSYS: isize = -38;
         pub const EBADF: isize = -9;
         pub const EMSGSIZE: isize = -90;
@@ -134,11 +204,14 @@ pub mod syscall {
 
         pub const fn name(code: isize) -> &'static str {
             match code {
+                ENOENT => "ENOENT",
                 EPERM => "EPERM",
                 EAGAIN => "EAGAIN",
                 EFAULT => "EFAULT",
                 ENODEV => "ENODEV",
                 EINVAL => "EINVAL",
+                EMFILE => "EMFILE",
+                ENOSPC => "ENOSPC",
                 ENOSYS => "ENOSYS",
                 EBADF => "EBADF",
                 EMSGSIZE => "EMSGSIZE",
@@ -248,6 +321,14 @@ mod tests {
         assert_eq!(syscall::name(syscall::SYS_CAP_DROP), "cap_drop");
         assert_eq!(syscall::name(syscall::SYS_SPAWN), "spawn");
         assert_eq!(syscall::name(syscall::SYS_WAITPID), "waitpid");
+        assert_eq!(syscall::name(syscall::SYS_OPEN), "open");
+        assert_eq!(syscall::name(syscall::SYS_CLOSE), "close");
+        assert_eq!(syscall::name(syscall::SYS_FREAD), "fread");
+        assert_eq!(syscall::name(syscall::SYS_FWRITE), "fwrite");
+        assert_eq!(syscall::name(syscall::SYS_SEEK), "seek");
+        assert_eq!(syscall::name(syscall::SYS_FSTAT), "fstat");
+        assert_eq!(syscall::name(syscall::SYS_DUP), "dup");
+        assert_eq!(syscall::name(syscall::SYS_DUP2), "dup2");
         assert_eq!(syscall::name(999), "unknown");
     }
 
@@ -260,8 +341,10 @@ mod tests {
 
     #[test]
     fn errno_name_table_is_stable() {
+        assert_eq!(syscall::errno::name(syscall::errno::ENOENT), "ENOENT");
         assert_eq!(syscall::errno::name(syscall::errno::EINVAL), "EINVAL");
         assert_eq!(syscall::errno::name(syscall::errno::ENOSYS), "ENOSYS");
+        assert_eq!(syscall::errno::name(syscall::errno::EMFILE), "EMFILE");
         assert_eq!(syscall::errno::name(syscall::errno::EAGAIN), "EAGAIN");
         assert_eq!(
             syscall::errno::name(syscall::errno::EAFNOSUPPORT),
@@ -285,7 +368,7 @@ mod tests {
 
     #[test]
     fn syscall_numbering_matches_golden_contract() {
-        assert_eq!(syscall::ABI_REVISION, 3);
+        assert_eq!(syscall::ABI_REVISION, 4);
         assert_eq!(
             [
                 syscall::SYS_WRITE,
@@ -302,8 +385,18 @@ mod tests {
                 syscall::SYS_CAP_DROP,
                 syscall::SYS_SPAWN,
                 syscall::SYS_WAITPID,
+                syscall::SYS_OPEN,
+                syscall::SYS_CLOSE,
+                syscall::SYS_FREAD,
+                syscall::SYS_FWRITE,
+                syscall::SYS_SEEK,
+                syscall::SYS_FSTAT,
+                syscall::SYS_DUP,
+                syscall::SYS_DUP2,
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            ]
         );
     }
 

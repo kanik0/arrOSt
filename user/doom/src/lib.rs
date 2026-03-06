@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn metadata_is_stable() {
         assert_eq!(app_name(), "doom");
-        assert_eq!(abi_revision(), 3);
+        assert_eq!(abi_revision(), 4);
         assert_eq!(BACKEND_ABI_REVISION, 1);
     }
 
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn shared_syscall_contract_matches_golden() {
-        assert_eq!(syscall::ABI_REVISION, 3);
+        assert_eq!(syscall::ABI_REVISION, 4);
         assert_eq!(control_syscalls(), [9, 10, 11, 12, 13, 14]);
         assert_eq!(
             control_syscalls(),

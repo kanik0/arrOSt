@@ -1,4 +1,6 @@
 // kernel/src/gfx/mod.rs: M8 framebuffer desktop with minimal compositor/event queue.
+mod font;
+
 use crate::arch;
 use crate::doom;
 use crate::fs;
@@ -21,6 +23,10 @@ use core::cell::UnsafeCell;
 use core::cmp::min;
 use core::fmt::Write;
 use core::str;
+use font::{
+    CELL_H as FONT_CELL_H, CELL_W as FONT_CELL_W, GLYPH_H, GLYPH_W, NO_BG_ALPHA_THRESHOLD,
+    glyph_alpha,
+};
 
 const WINDOW_COUNT: usize = 8;
 const FILE_MANAGER_WINDOW_INDEX: usize = 0;
@@ -30,9 +36,7 @@ const TERMINAL_WINDOW_COUNT: usize = WINDOW_COUNT - TERMINAL_WINDOW_START;
 const WINDOW_MAX_COLS: usize = 96;
 const WINDOW_MAX_ROWS: usize = 32;
 const DAMAGE_CAPACITY: usize = 24;
-const CHAR_W: usize = 6;
-const CHAR_H: usize = 8;
-const TITLE_BAR_HEIGHT: usize = 18;
+const TITLE_BAR_HEIGHT: usize = 20;
 const WINDOW_PADDING: usize = 8;
 const MIN_WINDOW_WIDTH: usize = 220;
 const MIN_WINDOW_HEIGHT: usize = 140;
@@ -46,22 +50,22 @@ const MAX_BACKBUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DOOM_VIEW_MAX_W: usize = 320;
 const DOOM_VIEW_MAX_H: usize = 200;
 const DOOM_VIEW_MAX_PIXELS: usize = DOOM_VIEW_MAX_W * DOOM_VIEW_MAX_H;
-const TASKBAR_HEIGHT: usize = 28;
+const TASKBAR_HEIGHT: usize = 30;
 const APPS_BUTTON_X: usize = 8;
 const APPS_BUTTON_Y: usize = 4;
 const APPS_BUTTON_W: usize = 44;
-const APPS_BUTTON_H: usize = 20;
+const APPS_BUTTON_H: usize = 22;
 const SYSTEM_BUTTON_GAP: usize = 8;
 const SYSTEM_BUTTON_W: usize = 66;
-const SYSTEM_BUTTON_H: usize = 20;
+const SYSTEM_BUTTON_H: usize = 22;
 const APPS_MENU_W: usize = 148;
-const APPS_MENU_ITEM_H: usize = 22;
+const APPS_MENU_ITEM_H: usize = 24;
 const APPS_MENU_ITEMS: usize = 2;
 const SYSTEM_MENU_W: usize = 148;
-const SYSTEM_MENU_ITEM_H: usize = 22;
+const SYSTEM_MENU_ITEM_H: usize = 24;
 const SYSTEM_MENU_ITEMS: usize = 1;
-const CLOSE_BUTTON_W: usize = 14;
-const CLOSE_BUTTON_H: usize = 14;
+const CLOSE_BUTTON_W: usize = 16;
+const CLOSE_BUTTON_H: usize = 16;
 const TERMINAL_LINE_MAX: usize = 96;
 const TERMINAL_BASE_TTY: u32 = 1;
 const FILE_MANAGER_LIST_LINES: usize = 5;
@@ -87,6 +91,10 @@ const VERSION_BUILD: &str = match option_env!("ARROST_BUILD_COUNT") {
     Some(value) => value,
     None => "0",
 };
+const CHROME_CHAR_W: usize = FONT_CELL_W;
+const CHROME_CHAR_H: usize = FONT_CELL_H;
+const CONTENT_CHAR_W: usize = FONT_CELL_W;
+const CONTENT_CHAR_H: usize = FONT_CELL_H.saturating_add(1);
 
 #[derive(Clone, Copy)]
 pub struct GfxInitReport {
@@ -111,6 +119,20 @@ impl Color {
     const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+}
+
+fn blend_channel(bg: u8, fg: u8, alpha_nibble: u8) -> u8 {
+    let alpha = u16::from(alpha_nibble).saturating_mul(17);
+    let inv = 255u16.saturating_sub(alpha);
+    ((u16::from(bg).saturating_mul(inv) + u16::from(fg).saturating_mul(alpha) + 127) / 255) as u8
+}
+
+fn blend_color(bg: Color, fg: Color, alpha_nibble: u8) -> Color {
+    Color::rgb(
+        blend_channel(bg.r, fg.r, alpha_nibble),
+        blend_channel(bg.g, fg.g, alpha_nibble),
+        blend_channel(bg.b, fg.b, alpha_nibble),
+    )
 }
 
 fn color_from_rgb24(pixel: u32) -> Color {
@@ -339,8 +361,8 @@ impl UiWindow {
     const fn text_grid_for_size(width: usize, height: usize) -> (usize, usize) {
         let body_w = width.saturating_sub(WINDOW_PADDING.saturating_mul(2));
         let body_h = height.saturating_sub(TITLE_BAR_HEIGHT + WINDOW_PADDING.saturating_mul(2));
-        let mut cols = body_w / CHAR_W;
-        let mut rows = body_h / CHAR_H;
+        let mut cols = body_w / CONTENT_CHAR_W;
+        let mut rows = body_h / CONTENT_CHAR_H;
         if cols == 0 {
             cols = 1;
         }
@@ -1486,13 +1508,29 @@ impl GfxState {
         self.push_terminal_text(index, &text);
     }
 
-    fn run_terminal_ls_command(&mut self, index: usize) {
-        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-        let count = fs::list_entries(&mut entries);
+    fn run_terminal_ls_command(&mut self, index: usize, path: &str) {
+        let mut entries = [fs::VfsDirEntry::empty(); 16];
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
         let mut text = String::new();
-        let _ = writeln!(text, "ls: entries={count}");
-        for entry in entries.iter().take(count) {
-            let _ = writeln!(text, "{} ({} bytes)", entry.name(), entry.size());
+        match fs::list_dir(path, &mut entries, current_pid) {
+            Ok(count) => {
+                let _ = writeln!(text, "ls: entries={} path={}", count, path.trim());
+                for entry in entries.iter().take(count) {
+                    match entry.file_type {
+                        fs::FileType::Directory => {
+                            let _ = writeln!(text, "{}/", entry.name_str());
+                        }
+                        _ => {
+                            let _ = writeln!(text, "{}", entry.name_str());
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(text, "ls: {} ({})", path.trim(), err.as_str());
+            }
         }
         self.push_terminal_text(index, &text);
         self.refresh_file_manager_list_view();
@@ -1781,7 +1819,7 @@ impl GfxState {
         if command == "help" {
             self.push_terminal_text(
                 index,
-                "help: help version ticks uptime pid tty clear terminal ls [ /bin ] cat echo > fm doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal)\n",
+                "help: help version ticks uptime pid tty clear terminal ls [<path>] cat echo > fm doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal)\n",
             );
             return true;
         }
@@ -2364,9 +2402,23 @@ impl GfxState {
         }
         if command == "ls" || command == TERMINAL_BIN_LS {
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                state.run_terminal_ls_command(index);
+                state.run_terminal_ls_command(index, "/");
             }) {
-                self.run_terminal_ls_command(index);
+                self.run_terminal_ls_command(index, "/");
+            }
+            return true;
+        }
+        if let Some(path) = command
+            .strip_prefix("ls ")
+            .or_else(|| command.strip_prefix("/bin/ls "))
+        {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: ls [<path>]\n");
+            } else if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
+                state.run_terminal_ls_command(index, path);
+            }) {
+                self.run_terminal_ls_command(index, path);
             }
             return true;
         }
@@ -3432,8 +3484,8 @@ impl GfxState {
         let window = self.windows[index];
         let x = window.x.saturating_add(WINDOW_PADDING);
         let y = window.y.saturating_add(TITLE_BAR_HEIGHT + WINDOW_PADDING);
-        let w = window.visible_cols().saturating_mul(CHAR_W);
-        let h = window.visible_rows().saturating_mul(CHAR_H);
+        let w = window.visible_cols().saturating_mul(CONTENT_CHAR_W);
+        let h = window.visible_rows().saturating_mul(CONTENT_CHAR_H);
         Rect::new(x, y, w, h)
     }
 
@@ -3755,7 +3807,7 @@ impl GfxState {
         );
         self.draw_text(
             apps_rect.x.saturating_add(8),
-            apps_rect.y.saturating_add(6),
+            apps_rect.y.saturating_add(5),
             "Apps",
             bar_text,
             Some(apps_color),
@@ -3775,7 +3827,7 @@ impl GfxState {
         );
         self.draw_text(
             system_rect.x.saturating_add(8),
-            system_rect.y.saturating_add(6),
+            system_rect.y.saturating_add(5),
             "System",
             bar_text,
             Some(system_color),
@@ -3785,7 +3837,7 @@ impl GfxState {
                 .x
                 .saturating_add(system_rect.w)
                 .saturating_add(14),
-            8,
+            9,
             "ARR0ST M9 | apps/system | tab switches focus",
             bar_text,
             Some(bar),
@@ -3815,7 +3867,7 @@ impl GfxState {
             );
             self.draw_text(
                 item_rect.x.saturating_add(8),
-                item_rect.y.saturating_add(7),
+                item_rect.y.saturating_add(6),
                 item.label(),
                 text,
                 Some(item_color),
@@ -3846,7 +3898,7 @@ impl GfxState {
             );
             self.draw_text(
                 item_rect.x.saturating_add(8),
-                item_rect.y.saturating_add(7),
+                item_rect.y.saturating_add(6),
                 item.label(),
                 text,
                 Some(item_color),
@@ -3897,14 +3949,14 @@ impl GfxState {
         if window.minimized {
             self.draw_text(
                 window.x.saturating_add(8),
-                window.y.saturating_add(6),
+                window.y.saturating_add(5),
                 "[min] ",
                 text,
                 Some(title),
             );
             self.draw_text(
                 window.x.saturating_add(44),
-                window.y.saturating_add(6),
+                window.y.saturating_add(5),
                 window.title,
                 text,
                 Some(title),
@@ -3917,7 +3969,7 @@ impl GfxState {
 
         self.draw_text(
             window.x.saturating_add(8),
-            window.y.saturating_add(6),
+            window.y.saturating_add(5),
             window.title,
             text,
             Some(title),
@@ -3939,33 +3991,47 @@ impl GfxState {
             let clip_y1 = clip.y.saturating_add(clip.h).min(self.info.height);
             let text_x0 = origin_x;
             let text_y0 = origin_y;
-            let text_x1 = origin_x.saturating_add(window.visible_cols().saturating_mul(CHAR_W));
-            let text_y1 = origin_y.saturating_add(window.visible_rows().saturating_mul(CHAR_H));
+            let text_x1 =
+                origin_x.saturating_add(window.visible_cols().saturating_mul(CONTENT_CHAR_W));
+            let text_y1 =
+                origin_y.saturating_add(window.visible_rows().saturating_mul(CONTENT_CHAR_H));
 
             if clip_x1 <= text_x0 || clip_x0 >= text_x1 || clip_y1 <= text_y0 || clip_y0 >= text_y1
             {
                 row_end = 0;
             } else {
-                row_start = clip_y0.saturating_sub(text_y0) / CHAR_H;
-                row_end = clip_y1.saturating_sub(text_y0).saturating_add(CHAR_H - 1) / CHAR_H;
+                row_start = clip_y0.saturating_sub(text_y0) / CONTENT_CHAR_H;
+                row_end = clip_y1
+                    .saturating_sub(text_y0)
+                    .saturating_add(CONTENT_CHAR_H - 1)
+                    / CONTENT_CHAR_H;
                 row_end = row_end.min(window.visible_rows());
-                col_start = clip_x0.saturating_sub(text_x0) / CHAR_W;
-                col_end = clip_x1.saturating_sub(text_x0).saturating_add(CHAR_W - 1) / CHAR_W;
+                col_start = clip_x0.saturating_sub(text_x0) / CONTENT_CHAR_W;
+                col_end = clip_x1
+                    .saturating_sub(text_x0)
+                    .saturating_add(CONTENT_CHAR_W - 1)
+                    / CONTENT_CHAR_W;
                 col_end = col_end.min(window.visible_cols());
             }
         }
 
         if row_start < row_end && col_start < col_end {
             for row in row_start..row_end {
-                let draw_y = origin_y.saturating_add(row.saturating_mul(CHAR_H));
+                let draw_y = origin_y.saturating_add(row.saturating_mul(CONTENT_CHAR_H));
                 let len = min(window.line_len[row], window.visible_cols());
                 if len == 0 || col_start >= len {
                     continue;
                 }
                 let draw_end = min(len, col_end);
                 for col in col_start..draw_end {
-                    let draw_x = origin_x.saturating_add(col.saturating_mul(CHAR_W));
-                    self.draw_char(draw_x, draw_y, window.lines[row][col], text, Some(body));
+                    let draw_x = origin_x.saturating_add(col.saturating_mul(CONTENT_CHAR_W));
+                    self.draw_content_char(
+                        draw_x,
+                        draw_y,
+                        window.lines[row][col],
+                        text,
+                        Some(body),
+                    );
                 }
             }
         }
@@ -4238,7 +4304,7 @@ impl GfxState {
 
         self.draw_text(
             draw_x,
-            draw_y.saturating_sub(11),
+            draw_y.saturating_sub(CHROME_CHAR_H),
             "DOOM VIEWPORT",
             Color::rgb(238, 229, 214),
             None,
@@ -4256,7 +4322,7 @@ impl GfxState {
         self.fill_rect(rect.x, rect.y, rect.w, rect.h, bg);
         self.draw_text(
             rect.x.saturating_add(4),
-            rect.y.saturating_add(3),
+            rect.y.saturating_add(2),
             "X",
             fg,
             Some(bg),
@@ -4348,47 +4414,64 @@ impl GfxState {
         if let Some(clip) = self.clip {
             let clip_y0 = clip.y;
             let clip_y1 = clip.y.saturating_add(clip.h).min(self.info.height);
-            if y >= clip_y1 || y.saturating_add(CHAR_H) <= clip_y0 {
+            if y >= clip_y1 || y.saturating_add(CHROME_CHAR_H) <= clip_y0 {
                 return;
             }
             clip_x = Some((clip.x, clip.x.saturating_add(clip.w).min(self.info.width)));
         }
         for byte in text.bytes() {
             if let Some((clip_x0, clip_x1)) = clip_x
-                && (cursor.saturating_add(CHAR_W) <= clip_x0 || cursor >= clip_x1)
+                && (cursor.saturating_add(CHROME_CHAR_W) <= clip_x0 || cursor >= clip_x1)
             {
-                cursor = cursor.saturating_add(CHAR_W);
+                cursor = cursor.saturating_add(CHROME_CHAR_W);
                 continue;
             }
-            self.draw_char(cursor, y, byte, fg, bg);
-            cursor = cursor.saturating_add(CHAR_W);
+            self.draw_chrome_char(cursor, y, byte, fg, bg);
+            cursor = cursor.saturating_add(CHROME_CHAR_W);
         }
     }
 
-    fn draw_char(&mut self, x: usize, y: usize, byte: u8, fg: Color, bg: Option<Color>) {
-        let glyph = glyph_rows(byte);
-        for (row, bits) in glyph.iter().copied().enumerate() {
-            for col in 0..5 {
-                let on = (bits & (1 << (4 - col))) != 0;
+    fn draw_chrome_char(&mut self, x: usize, y: usize, byte: u8, fg: Color, bg: Option<Color>) {
+        self.draw_glyph_cell(x, y, byte, fg, bg, CHROME_CHAR_W, CHROME_CHAR_H);
+    }
+
+    fn draw_content_char(&mut self, x: usize, y: usize, byte: u8, fg: Color, bg: Option<Color>) {
+        self.draw_glyph_cell(x, y, byte, fg, bg, CONTENT_CHAR_W, CONTENT_CHAR_H);
+    }
+
+    fn draw_glyph_cell(
+        &mut self,
+        x: usize,
+        y: usize,
+        byte: u8,
+        fg: Color,
+        bg: Option<Color>,
+        cell_w: usize,
+        cell_h: usize,
+    ) {
+        let glyph = glyph_alpha(byte);
+        for row in 0..cell_h {
+            for col in 0..cell_w {
+                let alpha = if row < GLYPH_H && col < GLYPH_W {
+                    let src_row = GLYPH_H - 1 - row;
+                    glyph[src_row.saturating_mul(GLYPH_W).saturating_add(col)]
+                } else {
+                    0
+                };
                 let px = x.saturating_add(col);
                 let py = y.saturating_add(row);
-                if on {
+                if let Some(bg_color) = bg {
+                    let color = if alpha == 0 {
+                        bg_color
+                    } else if alpha >= 15 {
+                        fg
+                    } else {
+                        blend_color(bg_color, fg, alpha)
+                    };
+                    self.write_pixel(px, py, color);
+                } else if alpha >= NO_BG_ALPHA_THRESHOLD {
                     self.write_pixel(px, py, fg);
-                } else if let Some(bg_color) = bg {
-                    self.write_pixel(px, py, bg_color);
                 }
-            }
-            if let Some(bg_color) = bg {
-                self.write_pixel(x.saturating_add(5), y.saturating_add(row), bg_color);
-            }
-        }
-        if let Some(bg_color) = bg {
-            for col in 0..6 {
-                self.write_pixel(
-                    x.saturating_add(col),
-                    y.saturating_add(CHAR_H - 1),
-                    bg_color,
-                );
             }
         }
     }
@@ -4904,178 +4987,5 @@ fn pixel_format_name(format: PixelFormat) -> &'static str {
         PixelFormat::Bgr => "bgr",
         PixelFormat::U8 => "u8",
         _ => "unknown",
-    }
-}
-
-fn glyph_rows(byte: u8) -> [u8; 7] {
-    let mapped = if byte.is_ascii_lowercase() {
-        byte - b'a' + b'A'
-    } else {
-        byte
-    };
-
-    match mapped {
-        b'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        b'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        b'C' => [
-            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
-        ],
-        b'D' => [
-            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
-        ],
-        b'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        b'F' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        b'G' => [
-            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
-        ],
-        b'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        b'I' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
-        ],
-        b'J' => [
-            0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110,
-        ],
-        b'K' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        b'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        b'M' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        b'N' => [
-            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
-        ],
-        b'O' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        b'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        b'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        b'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        b'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        b'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        b'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        b'V' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        b'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
-        ],
-        b'X' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        b'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        b'Z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        b'0' => [
-            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
-        ],
-        b'1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        b'2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        b'3' => [
-            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        b'4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        b'5' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
-        ],
-        b'6' => [
-            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        b'7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        b'8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        b'9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
-        ],
-        b':' => [
-            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
-        ],
-        b'.' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
-        ],
-        b',' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110, 0b00100,
-        ],
-        b'-' => [
-            0b00000, 0b00000, 0b00000, 0b01110, 0b00000, 0b00000, 0b00000,
-        ],
-        b'/' => [
-            0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000,
-        ],
-        b'|' => [
-            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        b'[' => [
-            0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
-        ],
-        b']' => [
-            0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
-        ],
-        b'(' => [
-            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
-        ],
-        b')' => [
-            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
-        ],
-        b'=' => [
-            0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000,
-        ],
-        b'>' => [
-            0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000,
-        ],
-        b'<' => [
-            0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001,
-        ],
-        b'_' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
-        ],
-        b'!' => [
-            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
-        ],
-        b'?' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
-        ],
-        b' ' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
-        ],
-        _ => [
-            0b11111, 0b10001, 0b00110, 0b00100, 0b00110, 0b10001, 0b11111,
-        ],
     }
 }

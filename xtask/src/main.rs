@@ -1654,6 +1654,7 @@ fn smoke_bin_exec(arch_override: Option<String>) -> Result<()> {
 }
 
 fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
+    let _ = reset_storage_disk_image()?;
     ensure_runtime_artifacts(arch)?;
 
     let smoke_name = "smoke-bin-exec";
@@ -1694,6 +1695,24 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
 
     let smoke_result = (|| -> Result<()> {
         wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "mount: / type=",
+            Duration::from_secs(8),
+            "root mount table log",
+        )?;
+        wait_for_log(
+            &log,
+            "mount: /proc type=procfs ro",
+            Duration::from_secs(8),
+            "procfs mount table log",
+        )?;
+        wait_for_log(
+            &log,
+            "mount: /tmp type=tmpfs rw",
+            Duration::from_secs(8),
+            "tmpfs mount table log",
+        )?;
         let stdin = child
             .stdin
             .as_mut()
@@ -1751,6 +1770,94 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             "README.TXT",
             Duration::from_secs(8),
             "bin cat target file marker",
+        )?;
+
+        send_serial_command(stdin, "ls /proc\n")?;
+        wait_for_log(
+            &log,
+            "path=/proc",
+            Duration::from_secs(8),
+            "procfs listing header",
+        )?;
+        for marker in ["self/", "mounts", "uptime"] {
+            wait_for_log(&log, marker, Duration::from_secs(8), "procfs listing entry")?;
+        }
+
+        send_serial_command(stdin, "cat /proc/self/pid\n")?;
+        wait_for_log(
+            &log,
+            "cat: ",
+            Duration::from_secs(8),
+            "proc self pid cat header",
+        )?;
+        wait_for_log(
+            &log,
+            "/proc/self/pid",
+            Duration::from_secs(8),
+            "proc self pid target marker",
+        )?;
+        let proc_pid_snapshot = snapshot_log(&log);
+        let Some(pid_line) = line_after_matching(&proc_pid_snapshot, "/proc/self/pid") else {
+            bail!("missing pid line after /proc/self/pid output");
+        };
+        let proc_pid = pid_line
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse /proc/self/pid output `{pid_line}`"))?;
+        if proc_pid == 0 {
+            bail!("expected /proc/self/pid to return a non-zero pid");
+        }
+
+        send_serial_command(stdin, "ls /tmp\n")?;
+        wait_for_log(
+            &log,
+            "path=/tmp",
+            Duration::from_secs(8),
+            "tmpfs listing header",
+        )?;
+
+        send_serial_command(stdin, "echo tmp-smoke > /tmp/TMPSMOKE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "echo: wrote ",
+            Duration::from_secs(8),
+            "tmpfs echo write output",
+        )?;
+        wait_for_log(
+            &log,
+            "/tmp/TMPSMOKE.TXT",
+            Duration::from_secs(8),
+            "tmpfs echo target marker",
+        )?;
+
+        send_serial_command(stdin, "cat /tmp/TMPSMOKE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/tmp/TMPSMOKE.TXT",
+            Duration::from_secs(8),
+            "tmpfs cat target marker",
+        )?;
+        wait_for_log(
+            &log,
+            "tmp-smoke",
+            Duration::from_secs(8),
+            "tmpfs cat payload",
+        )?;
+
+        send_serial_command(stdin, "ls /tmp\n")?;
+        wait_for_log(
+            &log,
+            "TMPSMOKE.TXT",
+            Duration::from_secs(8),
+            "tmpfs listing entry",
+        )?;
+
+        send_serial_command(stdin, "cat /TMPSMOKE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: /TMPSMOKE.TXT (not_found)",
+            Duration::from_secs(8),
+            "tmpfs isolation check",
         )?;
 
         send_serial_command(stdin, "/bin/echo bin-smoke > BINSMOKE.TXT\n")?;
@@ -1940,7 +2047,13 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
     }
 
     println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "mount: /proc type=procfs ro") {
+        println!("{smoke_name}: {line}");
+    }
     if let Some(line) = last_matching_line(&log_snapshot, "name=/bin/ps") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "path=/tmp") {
         println!("{smoke_name}: {line}");
     }
     if let Some(line) = last_matching_line(&log_snapshot, "kill: pid=") {
@@ -2169,6 +2282,38 @@ fn smoke_ring3_run_impl(arch: RuntimeArch) -> Result<()> {
             .as_mut()
             .context("failed to capture qemu stdin")?;
 
+        send_serial_command(stdin, "ring3 groundwork\n")?;
+        wait_for_log(
+            &log,
+            "ring3(groundwork):",
+            Duration::from_secs(12),
+            "ring3 groundwork output",
+        )?;
+        wait_for_log(
+            &log,
+            "fd_badfd=-9",
+            Duration::from_secs(8),
+            "ring3 groundwork bad fd check",
+        )?;
+        wait_for_log(
+            &log,
+            "fd_emfile=-24",
+            Duration::from_secs(8),
+            "ring3 groundwork emfile check",
+        )?;
+        wait_for_log(
+            &log,
+            "fd=ok",
+            Duration::from_secs(8),
+            "ring3 groundwork fd smoke",
+        )?;
+        wait_for_log(
+            &log,
+            "result=ok",
+            Duration::from_secs(8),
+            "ring3 groundwork pass result",
+        )?;
+
         send_serial_command(stdin, "ring3 run init\n")?;
         wait_for_log(
             &log,
@@ -2246,6 +2391,9 @@ fn smoke_ring3_run_impl(arch: RuntimeArch) -> Result<()> {
 
     println!("{smoke_name}: PASS");
     if let Some(line) = last_matching_line(&log_snapshot, launch_pattern) {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "ring3(groundwork):") {
         println!("{smoke_name}: {line}");
     }
     if let Some(line) = last_matching_line(&log_snapshot, "nr=5 (sleep)") {
@@ -3215,6 +3363,16 @@ fn last_matching_line<'a>(log: &'a str, marker: &str) -> Option<&'a str> {
     log.lines().rev().find(|line| line.contains(marker))
 }
 
+fn line_after_matching<'a>(log: &'a str, marker: &str) -> Option<&'a str> {
+    let lines: Vec<&str> = log.lines().collect();
+    for index in (0..lines.len()).rev() {
+        if lines[index].contains(marker) {
+            return lines.get(index + 1).copied();
+        }
+    }
+    None
+}
+
 fn parse_metric_value(line: &str, key: &str) -> Option<u64> {
     let start = line.find(key)?;
     let rest = &line[start + key.len()..];
@@ -3272,6 +3430,11 @@ fn ensure_storage_disk_image() -> Result<PathBuf> {
         return Ok(disk_path);
     }
 
+    reset_storage_disk_image()
+}
+
+fn reset_storage_disk_image() -> Result<PathBuf> {
+    let disk_path = PathBuf::from(format!("target/{KERNEL_TARGET}/debug/m6-disk.img"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
