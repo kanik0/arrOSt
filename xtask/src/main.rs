@@ -19,6 +19,9 @@ const USER_INIT_PACKAGE: &str = "arrost-user-init";
 const USER_DOOM_PACKAGE: &str = "arrost-user-doom";
 const USER_INIT_RING3_BIN: &str = "ring3_init";
 const USER_DOOM_RING3_BIN: &str = "ring3_doom";
+const USER_BIN_LS: &str = "ls";
+const USER_BIN_CAT: &str = "cat";
+const USER_BIN_PS: &str = "ps";
 const BUILD_STD: &str = "-Zbuild-std=core,compiler_builtins,alloc";
 const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
 const M6_DISK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
@@ -41,6 +44,12 @@ const USER_INIT_ELF_HINT_ENV: &str = "ARROST_USER_INIT_ELF_HINT";
 const USER_INIT_ELF_PRESENT_ENV: &str = "ARROST_USER_INIT_ELF_PRESENT";
 const USER_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_DOOM_ELF_HINT";
 const USER_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_DOOM_ELF_PRESENT";
+const USER_BIN_LS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_LS_ELF_HINT";
+const USER_BIN_LS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_LS_ELF_PRESENT";
+const USER_BIN_CAT_ELF_HINT_ENV: &str = "ARROST_USER_BIN_CAT_ELF_HINT";
+const USER_BIN_CAT_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_CAT_ELF_PRESENT";
+const USER_BIN_PS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PS_ELF_HINT";
+const USER_BIN_PS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PS_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
 const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
@@ -300,15 +309,16 @@ fn build_impl(
 ) -> Result<()> {
     let build_count = next_build_count()?;
     let ring3_elf_groundwork =
-        ring3_elf_groundwork_override.unwrap_or_else(|| env_truthy(RING3_ELF_GROUNDWORK_ENV));
+        ring3_elf_groundwork_override.unwrap_or_else(default_ring3_elf_groundwork_enabled);
     let version = format!("{VERSION_MAJOR}.{VERSION_MINOR}.{build_count}");
     let build_count_env = build_count.to_string();
     let major_env = VERSION_MAJOR.to_string();
     let minor_env = VERSION_MINOR.to_string();
     println!("ArrOSt build version: {version}");
 
-    let user_init = build_userland_package(
+    let user_init_elf = build_userland_binary(
         USER_INIT_PACKAGE,
+        USER_INIT_RING3_BIN,
         KERNEL_TARGET,
         &build_count_env,
         &major_env,
@@ -321,17 +331,33 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
-    let user_init_elf = build_userland_binary(
-        USER_INIT_PACKAGE,
-        USER_INIT_RING3_BIN,
+    let user_doom_elf = build_userland_binary(
+        USER_DOOM_PACKAGE,
+        USER_DOOM_RING3_BIN,
         KERNEL_TARGET,
         &build_count_env,
         &major_env,
         &minor_env,
     )?;
-    let user_doom_elf = build_userland_binary(
-        USER_DOOM_PACKAGE,
-        USER_DOOM_RING3_BIN,
+    let user_bin_ls = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_LS,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_cat = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_CAT,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_ps = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_PS,
         KERNEL_TARGET,
         &build_count_env,
         &major_env,
@@ -396,6 +422,42 @@ fn build_impl(
         .env(
             USER_DOOM_ELF_PRESENT_ENV,
             if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_LS_ELF_HINT_ENV,
+            user_bin_ls.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_LS_ELF_PRESENT_ENV,
+            if user_bin_ls.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_CAT_ELF_HINT_ENV,
+            user_bin_cat.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_CAT_ELF_PRESENT_ENV,
+            if user_bin_cat.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_PS_ELF_HINT_ENV,
+            user_bin_ps.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_PS_ELF_PRESENT_ENV,
+            if user_bin_ps.size > 0 {
                 "true"
             } else {
                 "false"
@@ -522,7 +584,7 @@ fn build_impl(
         bail!("missing kernel binary at {}", kernel_binary.display());
     }
     let ramdisk_path =
-        create_ramdisk_image(&user_init, &user_doom, &doom_c_backend, &doom_generic)?;
+        create_ramdisk_image(&user_init_elf, &user_doom, &doom_c_backend, &doom_generic)?;
     let _storage_disk_path = ensure_storage_disk_image()?;
 
     let disk_image = PathBuf::from(format!(
@@ -558,8 +620,9 @@ fn build_secondary_target(
 ) -> Result<()> {
     println!("ArrOSt target build: {KERNEL_TARGET_AARCH64}");
 
-    let _user_init = build_userland_package(
+    let user_init_elf = build_userland_binary(
         USER_INIT_PACKAGE,
+        USER_INIT_RING3_BIN,
         KERNEL_TARGET_AARCH64,
         version.build_count,
         version.major,
@@ -572,17 +635,33 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
-    let user_init_elf = build_userland_binary(
-        USER_INIT_PACKAGE,
-        USER_INIT_RING3_BIN,
+    let user_doom_elf = build_userland_binary(
+        USER_DOOM_PACKAGE,
+        USER_DOOM_RING3_BIN,
         KERNEL_TARGET_AARCH64,
         version.build_count,
         version.major,
         version.minor,
     )?;
-    let user_doom_elf = build_userland_binary(
-        USER_DOOM_PACKAGE,
-        USER_DOOM_RING3_BIN,
+    let user_bin_ls = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_LS,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_cat = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_CAT,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_ps = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_PS,
         KERNEL_TARGET_AARCH64,
         version.build_count,
         version.major,
@@ -646,6 +725,42 @@ fn build_secondary_target(
         .env(
             USER_DOOM_ELF_PRESENT_ENV,
             if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_LS_ELF_HINT_ENV,
+            user_bin_ls.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_LS_ELF_PRESENT_ENV,
+            if user_bin_ls.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_CAT_ELF_HINT_ENV,
+            user_bin_cat.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_CAT_ELF_PRESENT_ENV,
+            if user_bin_cat.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_PS_ELF_HINT_ENV,
+            user_bin_ps.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_PS_ELF_PRESENT_ENV,
+            if user_bin_ps.size > 0 {
                 "true"
             } else {
                 "false"
@@ -912,10 +1027,15 @@ fn build_userland_binary(
     major_env: &str,
     minor_env: &str,
 ) -> Result<UserArtifact> {
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .env("ARROST_BUILD_COUNT", build_count_env)
         .env("ARROST_VERSION_MAJOR", major_env)
-        .env("ARROST_VERSION_MINOR", minor_env)
+        .env("ARROST_VERSION_MINOR", minor_env);
+    if let Some(rustflags) = userland_rustflags(target) {
+        command.env("RUSTFLAGS", rustflags);
+    }
+    let status = command
         .args([
             "build",
             "-p",
@@ -936,6 +1056,57 @@ fn build_userland_binary(
     let hint = PathBuf::from(format!("target/{target}/debug/{binary}"));
     let size = std::fs::metadata(&hint).map(|meta| meta.len()).unwrap_or(0);
     Ok(UserArtifact { hint, size })
+}
+
+fn build_userland_fs_binary(
+    package: &str,
+    binary: &str,
+    target: &str,
+    build_count_env: &str,
+    major_env: &str,
+    minor_env: &str,
+) -> Result<UserArtifact> {
+    let mut command = Command::new("cargo");
+    command
+        .env("ARROST_BUILD_COUNT", build_count_env)
+        .env("ARROST_VERSION_MAJOR", major_env)
+        .env("ARROST_VERSION_MINOR", minor_env);
+    if let Some(rustflags) = userland_rustflags(target) {
+        command.env("RUSTFLAGS", rustflags);
+    }
+    let status = command
+        .args([
+            "rustc",
+            "-p",
+            package,
+            "--bin",
+            binary,
+            "--release",
+            "--target",
+            target,
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+            "--",
+            "-C",
+            "strip=debuginfo",
+        ])
+        .status()
+        .with_context(|| format!("cargo rustc for {package} fs bin {binary} ({target}) failed"))?;
+    if !status.success() {
+        bail!("filesystem user binary build failed for {package} bin {binary} ({target})");
+    }
+
+    let hint = PathBuf::from(format!("target/{target}/release/{binary}"));
+    let size = std::fs::metadata(&hint).map(|meta| meta.len()).unwrap_or(0);
+    Ok(UserArtifact { hint, size })
+}
+
+fn userland_rustflags(target: &str) -> Option<&'static str> {
+    if target == KERNEL_TARGET {
+        Some("-C code-model=large")
+    } else {
+        None
+    }
 }
 
 fn base_c_compile_command(_target: &str) -> Command {
@@ -1398,6 +1569,11 @@ fn smoke_proc_caps_impl(arch: RuntimeArch) -> Result<()> {
     let log_snapshot = snapshot_log(&log);
     if let Err(error) = smoke_result {
         eprintln!("{smoke_name} failed: {error}");
+        for pattern in ["ring3 exec:", "shell(exec):", "ls:", "ps: entries="] {
+            if let Some(line) = last_matching_line(&log_snapshot, pattern) {
+                eprintln!("debug[{pattern}]: {line}");
+            }
+        }
         eprintln!("----- serial tail -----");
         eprintln!("{}", log_tail(&log_snapshot, 80));
         return Err(error);
@@ -1693,7 +1869,32 @@ fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
 
 fn smoke_bin_exec(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
-    smoke_bin_exec_impl(arch)
+    let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
+    let restore_ring3_elf_groundwork = default_ring3_elf_groundwork_enabled();
+
+    build_impl(restore_force_fallback, false, false, Some(true), false)?;
+    let smoke_result = smoke_bin_exec_impl(arch);
+    let restore_result = build_impl(
+        restore_force_fallback,
+        false,
+        false,
+        Some(restore_ring3_elf_groundwork),
+        false,
+    );
+    match smoke_result {
+        Ok(()) => {
+            restore_result?;
+            Ok(())
+        }
+        Err(smoke_err) => {
+            if let Err(restore_err) = restore_result {
+                return Err(smoke_err.context(format!(
+                    "bin exec smoke failed and restoring prior ELF groundwork state failed: {restore_err:#}"
+                )));
+            }
+            Err(smoke_err)
+        }
+    }
 }
 
 fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
@@ -1755,6 +1956,18 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             "mount: /tmp type=tmpfs rw",
             Duration::from_secs(8),
             "tmpfs mount table log",
+        )?;
+        wait_for_log(
+            &log,
+            "[init] spawn/wait smoke: PASS",
+            Duration::from_secs(8),
+            "init spawn/wait smoke completion",
+        )?;
+        wait_for_log(
+            &log,
+            "[init] exit(0)",
+            Duration::from_secs(8),
+            "init task exit",
         )?;
         let stdin = child
             .stdin
@@ -2197,7 +2410,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
 fn smoke_fs(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
     let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
-    let restore_ring3_elf_groundwork = env_truthy(RING3_ELF_GROUNDWORK_ENV);
+    let restore_ring3_elf_groundwork = default_ring3_elf_groundwork_enabled();
 
     build_impl(restore_force_fallback, false, false, Some(true), true)?;
     let smoke_result = smoke_fs_impl(arch);
@@ -2621,11 +2834,9 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         else {
             bail!("missing fd_open_readme metric in ring3 groundwork output");
         };
-        if fd_open_readme_rc != abi_errno::EPERM as i64 {
+        if fd_open_readme_rc < 0 {
             bail!(
-                "expected ring3 README open to fail with EPERM (expected {} got {})",
-                abi_errno::EPERM,
-                fd_open_readme_rc
+                "expected ring3 README open to succeed with read permissions, got {fd_open_readme_rc}"
             );
         }
         let Some(fd_open_tmp_rc) = parse_signed_metric_value(groundwork_line, "fd_open_tmp=")
@@ -2821,7 +3032,7 @@ fn smoke_ring3_impl(arch: RuntimeArch) -> Result<()> {
 fn smoke_ring3_run(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
     let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
-    let restore_ring3_elf_groundwork = env_truthy(RING3_ELF_GROUNDWORK_ENV);
+    let restore_ring3_elf_groundwork = default_ring3_elf_groundwork_enabled();
 
     build_impl(restore_force_fallback, false, false, Some(true), false)?;
     let smoke_result = smoke_ring3_run_impl(arch);
@@ -3857,6 +4068,18 @@ fn env_truthy(name: &str) -> bool {
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    match std::env::var(name).ok()?.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Some(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Some(false),
+        _ => None,
+    }
+}
+
+fn default_ring3_elf_groundwork_enabled() -> bool {
+    env_bool(RING3_ELF_GROUNDWORK_ENV).unwrap_or(true)
 }
 
 fn send_serial_command(stdin: &mut ChildStdin, command: &str) -> Result<()> {

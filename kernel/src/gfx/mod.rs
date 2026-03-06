@@ -1448,6 +1448,21 @@ impl GfxState {
         self.push_terminal_text(index, &text);
     }
 
+    fn push_tty_bytes(&mut self, tty: u32, bytes: &[u8]) -> bool {
+        for slot in 0..TERMINAL_WINDOW_COUNT {
+            let Some(process) = self.terminal_processes[slot] else {
+                continue;
+            };
+            if process.tty != tty {
+                continue;
+            }
+            let index = Self::terminal_window_for_slot(slot);
+            self.append_terminal_file_bytes(index, bytes);
+            return true;
+        }
+        false
+    }
+
     fn with_terminal_bin_process(
         &mut self,
         index: usize,
@@ -1479,6 +1494,39 @@ impl GfxState {
         run(self);
         let _ = proc::exit_external_process(pid);
         true
+    }
+
+    fn try_launch_terminal_vfs_user_bin(
+        &mut self,
+        index: usize,
+        path: &'static str,
+        argv: &[&str],
+    ) -> Option<bool> {
+        let Some(tty) = self
+            .terminal_process_for_window(index)
+            .map(|process| process.tty)
+        else {
+            self.push_terminal_text(index, "terminal(exec): tty unavailable\n");
+            return Some(false);
+        };
+
+        let pid_rc = proc::spawn_terminal_vfs_bin_process(path, tty, argv);
+        if pid_rc == errno::ENOSYS {
+            return None;
+        }
+        if pid_rc <= 0 {
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "terminal(exec): failed bin={} rc={} ({})",
+                path,
+                pid_rc,
+                errno::name(pid_rc)
+            );
+            self.push_terminal_text(index, &line);
+            return Some(false);
+        }
+        Some(true)
     }
 
     fn run_terminal_ps_command(&mut self, index: usize) {
@@ -2536,6 +2584,12 @@ impl GfxState {
         }
 
         if command == "ps" || command == TERMINAL_BIN_PS {
+            if self
+                .try_launch_terminal_vfs_user_bin(index, TERMINAL_BIN_PS, &[TERMINAL_BIN_PS])
+                .is_some()
+            {
+                return true;
+            }
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_PS, |state| {
                 state.run_terminal_ps_command(index);
             }) {
@@ -2748,6 +2802,16 @@ impl GfxState {
         }
 
         if command == "ls /bin" || command == "/bin/ls /bin" {
+            if self
+                .try_launch_terminal_vfs_user_bin(
+                    index,
+                    TERMINAL_BIN_LS,
+                    &[TERMINAL_BIN_LS, "/bin"],
+                )
+                .is_some()
+            {
+                return true;
+            }
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
                 state.run_terminal_bin_dir_listing(index);
             }) {
@@ -2757,6 +2821,16 @@ impl GfxState {
         }
         if command == "ls" || command == TERMINAL_BIN_LS {
             let cwd = String::from(self.terminal_cwd(index).unwrap_or("/"));
+            if self
+                .try_launch_terminal_vfs_user_bin(
+                    index,
+                    TERMINAL_BIN_LS,
+                    &[TERMINAL_BIN_LS, cwd.as_str()],
+                )
+                .is_some()
+            {
+                return true;
+            }
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
                 state.run_terminal_ls_command(index, &cwd);
             }) {
@@ -2781,6 +2855,16 @@ impl GfxState {
                         return true;
                     }
                 };
+                if self
+                    .try_launch_terminal_vfs_user_bin(
+                        index,
+                        TERMINAL_BIN_LS,
+                        &[TERMINAL_BIN_LS, resolved.as_str()],
+                    )
+                    .is_some()
+                {
+                    return true;
+                }
                 if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
                     state.run_terminal_ls_command(index, &resolved);
                 }) {
@@ -2810,6 +2894,16 @@ impl GfxState {
                         return true;
                     }
                 };
+                if self
+                    .try_launch_terminal_vfs_user_bin(
+                        index,
+                        TERMINAL_BIN_CAT,
+                        &[TERMINAL_BIN_CAT, resolved.as_str()],
+                    )
+                    .is_some()
+                {
+                    return true;
+                }
                 if !self.with_terminal_bin_process(index, TERMINAL_BIN_CAT, |state| {
                     state.run_terminal_cat_command(index, &resolved);
                 }) {
@@ -5251,9 +5345,8 @@ pub fn launch_terminal() -> bool {
 pub fn set_file_manager_text(text: &str) {
     let _ = with_state_mut(|state| {
         state.set_window_text(FILE_MANAGER_WINDOW_INDEX, text);
-        if state.damage_len > 0 {
-            state.flush_damage();
-        }
+        // Defer redraw to the next UI poll so shell/fs command paths do not
+        // recurse into the renderer on an already deep kernel stack.
     });
 }
 
@@ -5375,6 +5468,17 @@ pub fn log_info() {
         }
         None => serial::write_line("ui: backend=none ready=false"),
     }
+}
+
+pub fn write_tty_bytes(tty: u32, bytes: &[u8]) -> bool {
+    with_state_mut(|state| {
+        let written = state.push_tty_bytes(tty, bytes);
+        if written && state.damage_len > 0 {
+            state.flush_damage();
+        }
+        written
+    })
+    .unwrap_or(false)
 }
 
 fn run_ui_action(action: UiAction) {

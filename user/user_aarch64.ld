@@ -2,7 +2,7 @@ ENTRY(_start);
 
 SECTIONS
 {
-  . = 0x0000200000000000;
+    . = 0x0000000400000000;
 
   .text : ALIGN(4K) { *(.text .text.*) }
   .rodata : ALIGN(4K) { *(.rodata .rodata.*) *(.srodata .srodata.*) }

@@ -89,6 +89,17 @@ pub fn init() -> GdtInitReport {
     }
 }
 
+pub fn set_privilege_stack_top(top: u64) {
+    if top == 0 {
+        return;
+    }
+    // SAFETY: the TSS is initialized once during boot and later updated only on the
+    // single-core ring-3 transition path to point at the current task's kernel stack.
+    unsafe {
+        TSS.privilege_stack_table[PRIVILEGE_STACK_INDEX] = VirtAddr::new(top);
+    }
+}
+
 fn with_ring3_rpl(mut selector: SegmentSelector) -> SegmentSelector {
     selector.set_rpl(PrivilegeLevel::Ring3);
     selector

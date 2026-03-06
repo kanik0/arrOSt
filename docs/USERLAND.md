@@ -48,8 +48,9 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 ## Runtime model
 
 - Cooperative path remains available for legacy worker flow (`spawn`, `waitpid`) in shared kernel address space.
-- With `ARROST_RING3_ELF_GROUNDWORK=true`, `ring3 run <init|doom>` enqueues embedded native ELFs (`ring3_init`, `ring3_doom`) into the ring-3 process table.
-- Ring-3 ELFs are linked into a dedicated user virtual range (`0x0000_2000_...`) and loaded into per-process page tables instead of running from kernel heap virtual addresses.
+- Current builds enable the ELF groundwork path by default; `ring3 run <init|doom>` still enqueues embedded native ELFs (`ring3_init`, `ring3_doom`) into the ring-3 process table for smoke/debug flow.
+- Shell and GUI terminal `/bin/*` launches now load native ELFs from the mounted VFS, build a minimal `argc`/`argv` user stack, and enqueue them into the same ring-3 scheduler.
+- Ring-3 ELFs are linked into dedicated per-arch user virtual ranges (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`) and loaded into per-process page tables instead of running from kernel heap virtual addresses.
 - Ring-3 scheduler is round-robin with multiprocess state tracking (`ready`, `running`, `sleep`, `exited`, `faulted`) and explicit reap.
 - Ring-3 shell controls:
   - `ring3 ps`
@@ -66,7 +67,7 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 ## Current limits
 
 - Kernel mappings are still present in each ring-3 page table, but remain supervisor-only.
-- User apps are still embedded build artifacts; there is no filesystem-backed `execve` path yet.
+- There is no `execve` syscall yet; `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` still uses embedded smoke/debug artifacts.
 - Preemption is not yet hard timer-driven at arbitrary instruction boundaries.
 - Syscall surface remains intentionally small.
 

@@ -74,43 +74,68 @@ impl ResolvedMountPath {
 }
 
 pub fn canonicalize(path: &str) -> Result<CanonicalPath, FsError> {
-    let trimmed = path.trim();
-    let input = if trimmed.is_empty() { "/" } else { trimmed };
+    let path_bytes = path.as_bytes();
+    let mut start = 0usize;
+    let mut end = path_bytes.len();
+    while start < end && path_bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && path_bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let input = if start == end {
+        b"/".as_slice()
+    } else {
+        &path_bytes[start..end]
+    };
 
-    let mut components = [""; MAX_COMPONENTS];
+    let mut component_starts = [0usize; MAX_COMPONENTS];
     let mut depth = 0usize;
+    let mut bytes = [0u8; MAX_PATH_BYTES];
+    let mut len = 0usize;
 
-    for component in input.split('/') {
-        if component.is_empty() || component == "." {
+    let mut index = 0usize;
+    while index < input.len() {
+        while index < input.len() && input[index] == b'/' {
+            index += 1;
+        }
+        if index >= input.len() {
+            break;
+        }
+
+        let component_start = index;
+        while index < input.len() && input[index] != b'/' {
+            index += 1;
+        }
+        let component = &input[component_start..index];
+        let component_len = component.len();
+        if component_len == 1 && component[0] == b'.' {
             continue;
         }
-        if component == ".." {
-            depth = depth.saturating_sub(1);
-            continue;
+        if component_len == 2 && component[0] == b'.' && component[1] == b'.' {
+            if depth > 0 {
+                depth -= 1;
+                len = component_starts[depth];
+            }
+        } else {
+            if depth >= MAX_COMPONENTS {
+                return Err(FsError::InvalidPath);
+            }
+            if len + 1 + component_len > MAX_PATH_BYTES {
+                return Err(FsError::InvalidPath);
+            }
+            component_starts[depth] = len;
+            bytes[len] = b'/';
+            len += 1;
+            bytes[len..len + component_len].copy_from_slice(component);
+            len += component_len;
+            depth += 1;
         }
-        if depth >= MAX_COMPONENTS {
-            return Err(FsError::InvalidPath);
-        }
-        components[depth] = component;
-        depth += 1;
     }
 
-    let mut bytes = [0u8; MAX_PATH_BYTES];
     if depth == 0 {
         bytes[0] = b'/';
         return Ok(CanonicalPath { bytes, len: 1 });
-    }
-
-    let mut len = 0usize;
-    for component in components.iter().take(depth) {
-        let name = component.as_bytes();
-        if len >= MAX_PATH_BYTES || len + 1 + name.len() > MAX_PATH_BYTES {
-            return Err(FsError::InvalidPath);
-        }
-        bytes[len] = b'/';
-        len += 1;
-        bytes[len..len + name.len()].copy_from_slice(name);
-        len += name.len();
     }
 
     Ok(CanonicalPath { bytes, len })

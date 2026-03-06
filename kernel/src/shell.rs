@@ -76,6 +76,7 @@ struct ShellState {
     len: usize,
     cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
     cwd_len: usize,
+    waiting_vfs_pid: Option<u32>,
     doom_capture: bool,
     held_serial_capture_keys: [HeldCaptureKey; SERIAL_CAPTURE_HELD_KEYS],
 }
@@ -89,6 +90,7 @@ impl ShellState {
             len: 0,
             cwd,
             cwd_len: 1,
+            waiting_vfs_pid: None,
             doom_capture: false,
             held_serial_capture_keys: [HeldCaptureKey::inactive(); SERIAL_CAPTURE_HELD_KEYS],
         }
@@ -99,7 +101,11 @@ impl ShellState {
     }
 
     fn cwd(&self) -> &str {
-        str::from_utf8(&self.cwd[..self.cwd_len]).unwrap_or("/")
+        let len = self.cwd_len.clamp(1, fs::MAX_OPEN_PATH_BYTES);
+        if self.cwd[0] != b'/' {
+            return "/";
+        }
+        str::from_utf8(&self.cwd[..len]).unwrap_or("/")
     }
 
     fn set_cwd(&mut self, path: &str) {
@@ -195,6 +201,10 @@ pub fn init() {
 }
 
 pub fn poll() {
+    if !poll_waiting_vfs_child() {
+        return;
+    }
+
     while let Some(event) = keyboard::pop_key_event() {
         process_keyboard_event(event);
     }
@@ -207,9 +217,15 @@ pub fn poll() {
             continue;
         }
         process_byte(byte);
+        if shell_waiting_for_vfs_child() {
+            return;
+        }
     }
     while let Some(byte) = serial::try_read_byte() {
         process_byte(byte);
+        if shell_waiting_for_vfs_child() {
+            return;
+        }
     }
 
     // SAFETY: shell state is accessed on the main loop thread.
@@ -301,7 +317,7 @@ fn process_byte(byte: u8) {
             serial::write_str("\n");
             run_command(shell);
             shell.clear();
-            if !shell.doom_capture {
+            if !shell.doom_capture && shell.waiting_vfs_pid.is_none() {
                 print_prompt();
             }
         }
@@ -322,6 +338,29 @@ fn process_byte(byte: u8) {
     }
 }
 
+fn poll_waiting_vfs_child() -> bool {
+    // SAFETY: shell is single-threaded and only mutated from main loop.
+    let shell = unsafe { &mut *SHELL_STATE.0.get() };
+    let Some(pid) = shell.waiting_vfs_pid else {
+        return true;
+    };
+    let wait_rc = proc::wait_ring3_pid(pid);
+    if wait_rc == errno::EAGAIN {
+        return false;
+    }
+    shell.waiting_vfs_pid = None;
+    if !shell.doom_capture {
+        print_prompt();
+    }
+    true
+}
+
+fn shell_waiting_for_vfs_child() -> bool {
+    // SAFETY: shell state is read on the main loop thread.
+    let shell = unsafe { &*SHELL_STATE.0.get() };
+    shell.waiting_vfs_pid.is_some()
+}
+
 fn run_command(shell: &mut ShellState) {
     if shell.len == 0 {
         return;
@@ -334,6 +373,14 @@ fn run_command(shell: &mut ShellState) {
             return;
         }
     };
+    if input_owned == "symlink" {
+        serial::write_line("usage: symlink <target> <linkpath>");
+        return;
+    }
+    if let Some(rest) = input_owned.strip_prefix("symlink ") {
+        run_shell_symlink_command(shell, rest);
+        return;
+    }
     let normalized_input = normalize_shell_bin_command(input_owned.as_str());
     let input = normalized_input.as_str();
 
@@ -376,11 +423,27 @@ fn run_command(shell: &mut ShellState) {
     }
 
     if input == "ls /bin" || input == "/bin/ls /bin" {
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, "/bin"]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_LS, run_shell_bin_dir_listing);
         return;
     }
     if input == "ls" || input == SERIAL_BIN_LS {
         let cwd = String::from(shell.cwd());
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, cwd.as_str()]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&cwd, pid));
         return;
     }
@@ -400,6 +463,14 @@ fn run_command(shell: &mut ShellState) {
                 return;
             }
         };
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, resolved.as_str()]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&resolved, pid));
         return;
     }
@@ -424,6 +495,14 @@ fn run_command(shell: &mut ShellState) {
                 return;
             }
         };
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_CAT, &[SERIAL_BIN_CAT, resolved.as_str()]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_CAT, |pid| {
             fs::cat_to_serial_for_pid(&resolved, pid)
         });
@@ -590,26 +669,7 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
     if let Some(rest) = input.strip_prefix("/bin/symlink ") {
-        match parse_two_args(rest) {
-            Some((target, link_path)) => {
-                let link_path = match shell.resolve_path(link_path) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        serial::write_fmt(format_args!(
-                            "symlink: {} ({})\n",
-                            link_path,
-                            err.as_str()
-                        ));
-                        return;
-                    }
-                };
-                with_shell_bin_process(SERIAL_BIN_SYMLINK, |_pid| {
-                    fs::symlink_file_to_serial(target, &link_path);
-                    refresh_file_manager_list_view();
-                });
-            }
-            None => serial::write_line("usage: symlink <target> <linkpath>"),
-        }
+        run_shell_symlink_command(shell, rest);
         return;
     }
 
@@ -1126,6 +1186,14 @@ fn run_command(shell: &mut ShellState) {
             with_shell_bin_process(SERIAL_BIN_KILL, |_active_pid| run_shell_kill_command(pid));
         }
         "ps" | "/bin/ps" => {
+            match try_launch_shell_vfs_user_bin(SERIAL_BIN_PS, &[SERIAL_BIN_PS]) {
+                Ok(Some(pid)) => {
+                    shell.waiting_vfs_pid = Some(pid);
+                    return;
+                }
+                Ok(None) => {}
+                Err(()) => return,
+            }
             with_shell_bin_process(SERIAL_BIN_PS, |_active_pid| run_shell_ps_command());
         }
         "syscalls" => {
@@ -1350,6 +1418,23 @@ fn with_shell_bin_process(path: &'static str, run: impl FnOnce(Option<u32>)) {
     let _ = proc::exit_external_process(pid);
 }
 
+fn try_launch_shell_vfs_user_bin(path: &'static str, argv: &[&str]) -> Result<Option<u32>, ()> {
+    let pid_rc = proc::spawn_shell_vfs_bin_process(path, argv);
+    if pid_rc == errno::ENOSYS {
+        return Ok(None);
+    }
+    if pid_rc <= 0 {
+        serial::write_fmt(format_args!(
+            "shell(exec): failed bin={} rc={} ({})\n",
+            path,
+            pid_rc,
+            errno::name(pid_rc)
+        ));
+        return Err(());
+    }
+    Ok(u32::try_from(pid_rc).ok())
+}
+
 fn run_shell_ps_command() {
     proc::log_process_table();
 }
@@ -1371,6 +1456,33 @@ fn run_shell_bin_dir_listing(current_pid: Option<u32>) {
     serial::write_fmt(format_args!("ls: entries={} path=/bin\n", count));
     for entry in entries.iter().take(count) {
         serial::write_fmt(format_args!("/bin/{} (exec)\n", entry.name_str()));
+    }
+}
+
+fn run_shell_symlink_command(shell: &ShellState, rest: &str) {
+    match parse_two_args(rest) {
+        Some((target, link_path)) => {
+            let trimmed = link_path.trim();
+            if trimmed.is_empty() {
+                serial::write_line("usage: symlink <target> <linkpath>");
+                return;
+            }
+            let link_path = if trimmed.starts_with('/') {
+                String::from(trimmed)
+            } else if shell.cwd() == "/" {
+                let mut path = String::from("/");
+                path.push_str(trimmed);
+                path
+            } else {
+                let mut path = String::from(shell.cwd().trim_end_matches('/'));
+                path.push('/');
+                path.push_str(trimmed);
+                path
+            };
+            fs::symlink_file_to_serial(target, &link_path);
+            refresh_file_manager_list_view();
+        }
+        None => serial::write_line("usage: symlink <target> <linkpath>"),
     }
 }
 

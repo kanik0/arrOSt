@@ -24,6 +24,9 @@ pub(crate) enum FdTarget {
     SerialStdin,
     SerialStdout,
     SerialStderr,
+    TtyStdin(u32),
+    TtyStdout(u32),
+    TtyStderr(u32),
     File(OpenFile),
 }
 
@@ -89,22 +92,34 @@ pub struct FdTable {
     descriptions: [FdSlot; MAX_FILE_DESCRIPTIONS],
 }
 
+const SERIAL_FD_SLOTS: [Option<u8>; MAX_FDS] = {
+    let mut fd_slots = [None; MAX_FDS];
+    fd_slots[0] = Some(0);
+    fd_slots[1] = Some(1);
+    fd_slots[2] = Some(2);
+    fd_slots
+};
+
+const SERIAL_FD_DESCRIPTIONS: [FdSlot; MAX_FILE_DESCRIPTIONS] = {
+    let mut descriptions = [FdSlot::empty(); MAX_FILE_DESCRIPTIONS];
+    descriptions[0] = FdSlot::new(FdTarget::SerialStdin, O_RDONLY, 1);
+    descriptions[1] = FdSlot::new(FdTarget::SerialStdout, O_WRONLY, 1);
+    descriptions[2] = FdSlot::new(FdTarget::SerialStderr, O_WRONLY, 1);
+    descriptions
+};
+
 impl FdTable {
     pub const fn new() -> Self {
-        let mut fd_slots = [None; MAX_FDS];
-        fd_slots[0] = Some(0);
-        fd_slots[1] = Some(1);
-        fd_slots[2] = Some(2);
-
-        let mut descriptions = [FdSlot::empty(); MAX_FILE_DESCRIPTIONS];
-        descriptions[0] = FdSlot::new(FdTarget::SerialStdin, O_RDONLY, 1);
-        descriptions[1] = FdSlot::new(FdTarget::SerialStdout, O_WRONLY, 1);
-        descriptions[2] = FdSlot::new(FdTarget::SerialStderr, O_WRONLY, 1);
-
         Self {
-            fd_slots,
-            descriptions,
+            fd_slots: SERIAL_FD_SLOTS,
+            descriptions: SERIAL_FD_DESCRIPTIONS,
         }
+    }
+
+    pub fn set_tty_stdio(&mut self, tty: u32) {
+        self.descriptions[0] = FdSlot::new(FdTarget::TtyStdin(tty), O_RDONLY, 1);
+        self.descriptions[1] = FdSlot::new(FdTarget::TtyStdout(tty), O_WRONLY, 1);
+        self.descriptions[2] = FdSlot::new(FdTarget::TtyStderr(tty), O_WRONLY, 1);
     }
 
     pub fn open_file(&mut self, file: OpenFile, flags: u32) -> Result<u32, FdError> {

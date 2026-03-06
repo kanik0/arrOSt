@@ -19,7 +19,7 @@ pub const MAX_FILE_BYTES: usize = 512;
 // ── Internal capacity constants ──
 
 const MAX_INODES: usize = 64;
-const INODE_DATA_SIZE: usize = 1024;
+const INODE_DATA_SIZE: usize = 16 * 1024;
 
 /// Directory record packed format inside inode data area.
 /// Each record is DIR_RECORD_SIZE bytes:
@@ -160,6 +160,8 @@ impl Inode {
     }
 }
 
+const EMPTY_INODE: Inode = Inode::empty();
+
 // ── RamFs ──
 
 pub struct RamFs {
@@ -170,7 +172,7 @@ pub struct RamFs {
 impl RamFs {
     pub const fn new() -> Self {
         Self {
-            inodes: [Inode::empty(); MAX_INODES],
+            inodes: [EMPTY_INODE; MAX_INODES],
             root_initialized: false,
         }
     }
@@ -207,7 +209,7 @@ impl RamFs {
         // Linear scan for a free inode (skip 0 and already-allocated).
         for i in 2..MAX_INODES {
             if !self.inodes[i].used {
-                self.inodes[i] = Inode::empty();
+                self.inodes[i] = EMPTY_INODE;
                 return Ok(i as InodeNum);
             }
         }
@@ -665,7 +667,7 @@ impl VfsOps for RamFs {
             }
         };
         if should_free {
-            self.inodes[ino as usize] = Inode::empty();
+            self.inodes[ino as usize] = EMPTY_INODE;
         }
         Ok(())
     }
@@ -685,7 +687,7 @@ impl VfsOps for RamFs {
             return Err(FsError::DirectoryNotEmpty);
         }
         self.remove_dir_entry(parent, name)?;
-        self.inodes[ino as usize] = Inode::empty();
+        self.inodes[ino as usize] = EMPTY_INODE;
         // Decrement parent link count (for removed `..` reference).
         self.inodes[parent as usize].link_count =
             self.inodes[parent as usize].link_count.saturating_sub(1);

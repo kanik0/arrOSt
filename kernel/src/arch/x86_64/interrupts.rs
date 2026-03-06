@@ -63,10 +63,26 @@ pub fn init() -> InterruptInitReport {
         // SAFETY: IDT is initialized once before being loaded; handlers are static functions.
         unsafe {
             let mut idt = InterruptDescriptorTable::new();
+            idt.debug.set_handler_fn(debug_handler);
             idt.breakpoint.set_handler_fn(breakpoint_handler);
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            idt.invalid_tss.set_handler_fn(invalid_tss_handler);
+            idt.segment_not_present
+                .set_handler_fn(segment_not_present_handler);
+            idt.stack_segment_fault
+                .set_handler_fn(stack_segment_fault_handler);
+            idt.general_protection_fault
+                .set_handler_fn(general_protection_fault_handler);
+            idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+            idt.device_not_available
+                .set_handler_fn(device_not_available_handler);
+            idt.x87_floating_point
+                .set_handler_fn(x87_floating_point_handler);
+            idt.alignment_check.set_handler_fn(alignment_check_handler);
+            idt.simd_floating_point
+                .set_handler_fn(simd_floating_point_handler);
             idt.page_fault.set_handler_fn(page_fault_handler);
             // SAFETY: entry address points to a dedicated naked int80 handler with iretq return.
             idt[SYSCALL_VECTOR]
@@ -145,6 +161,23 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial::write_fmt(format_args!("{stack_frame:#?}\n"));
 }
 
+extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "debug",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        None,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_line("EXCEPTION: DEBUG");
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
@@ -185,7 +218,209 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::arch::halt_forever();
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "invalid tss",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        Some(error_code),
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: INVALID TSS rip={:#018x} err={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        error_code
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn segment_not_present_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "segment not present",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        Some(error_code),
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: SEGMENT NOT PRESENT rip={:#018x} err={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        error_code
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn stack_segment_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "stack segment fault",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        Some(error_code),
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: STACK SEGMENT FAULT rip={:#018x} err={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        error_code
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_general_protection(
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        error_code,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: GENERAL PROTECTION rip={:#018x} err={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        error_code
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "invalid opcode",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        None,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: INVALID OPCODE rip={:#018x}\n",
+        stack_frame.instruction_pointer.as_u64()
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "device not available",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        None,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: DEVICE NOT AVAILABLE rip={:#018x}\n",
+        stack_frame.instruction_pointer.as_u64()
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "x87 floating point",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        None,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: X87 FLOATING POINT rip={:#018x}\n",
+        stack_frame.instruction_pointer.as_u64()
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn alignment_check_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "alignment check",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        Some(error_code),
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: ALIGNMENT CHECK rip={:#018x} err={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        error_code
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn simd_floating_point_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    if ring3::handle_trap(
+        "simd floating point",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        None,
+        from_ring3,
+    ) {
+        return;
+    }
+
+    serial::write_fmt(format_args!(
+        "EXCEPTION: SIMD FLOATING POINT rip={:#018x}\n",
+        stack_frame.instruction_pointer.as_u64()
+    ));
+    serial::write_fmt(format_args!("{stack_frame:#?}\n"));
+    crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
+    ring3::sample_user_timer(
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.stack_pointer.as_u64(),
+        from_ring3,
+    );
     time::on_timer_tick();
     pic::end_of_interrupt(InterruptIndex::Timer.as_u8());
 }

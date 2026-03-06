@@ -129,10 +129,11 @@ When `ARROST_RING3_BOOT_SMOKE=true` is set at build time, boot flow performs an 
 When `ARROST_RING3_BOOT_SMOKE_FAULT=true` is also set (aarch64 only), boot smoke intentionally triggers a controlled EL0 sync fault to validate fallback/resume diagnostics.
 Those smoke sequences are dispatched through process-layer syscall capability policy (`pid/caps/name` context) and contribute to shared syscall statistics.
 A cross-platform shell command (`ring3 smoke`) also exercises ring-3 policy dispatch through that same process-layer context (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) without requiring hardware ring transition support.
-With `ARROST_RING3_ELF_GROUNDWORK=true`, an additional shell smoke (`ring3 groundwork`) loads a minimal native ELF user image into a private user virtual range, validates process-model metadata (`trapframe`, kernel stack top), page-table based pointer dispatch (`copy_from_user`/`copy_to_user`), and the filesystem descriptor syscall path (`open/fread/fwrite/seek/fstat/dup/dup2`).
-With `ARROST_RING3_ELF_GROUNDWORK=true`, shell command `ring3 run <init|doom>` enqueues embedded native ELF artifacts (`ring3_init`/`ring3_doom`) into the ring-3 multiprocess scheduler through the architecture gate (`int 0x80`/`SVC`).
+Current builds enable the ELF groundwork path by default: shell smoke `ring3 groundwork` loads a minimal native ELF user image into a private user virtual range, validates process-model metadata (`trapframe`, kernel stack top), page-table based pointer dispatch (`copy_from_user`/`copy_to_user`), and the filesystem descriptor syscall path (`open/fread/fwrite/seek/fstat/dup/dup2`).
+Current builds also keep `ring3 run <init|doom>` as an embedded native ELF smoke/debug path through the same architecture gate (`int 0x80`/`SVC`).
 Ring-3 runtime dispatch handles `yield` and `sleep` as scheduler preemption points, and `xtask smoke-ring3-run` validates multiprocess runtime (`init` + `doom`) plus `yield/sleep/exit` flow on both architectures.
 Runtime launch stores process address-space token metadata and performs switch/restore around user execution on both architectures.
+Filesystem-backed `/bin/*` launch does not change the ABI revision: it currently uses a kernel-mediated spawn-from-path flow over the existing ABI, with no new `exec`/`execve` syscall yet.
 
 ## Userland shim
 

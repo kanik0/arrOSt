@@ -1,5 +1,11 @@
 use crate::mem;
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{
+    alloc::{alloc_zeroed, handle_alloc_error},
+    boxed::Box,
+    vec,
+    vec::Vec,
+};
+use core::alloc::Layout;
 #[cfg(target_arch = "aarch64")]
 use core::arch::asm;
 use core::fmt;
@@ -16,11 +22,16 @@ pub const MAX_USER_RANGES: usize = 8;
 const USER_PAGE_BYTES: usize = 4096;
 const USER_STACK_BYTES: usize = 16 * 1024;
 const USER_STACK_GAP_BYTES: u64 = 64 * 1024;
-const KERNEL_STACK_BYTES: usize = 8 * 1024;
+// x86_64 user traps execute the kernel syscall path on this per-process stack.
+// 32 KiB is too tight once deeper VFS resolution and the syscall dispatcher stack up.
+const KERNEL_STACK_BYTES: usize = 64 * 1024;
 const MAX_LOADABLE_SEGMENT_BYTES: usize = 128 * 1024;
 const SMOKE_SEGMENT_SCRATCH_BYTES: usize = 512;
 const SMOKE_ELF_SEGMENT_OFFSET: usize = 0x100;
+#[cfg(target_arch = "x86_64")]
 const SMOKE_ELF_BASE_VADDR: u64 = 0x0000_2000_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const SMOKE_ELF_BASE_VADDR: u64 = 0x0000_0004_0000_0000;
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
@@ -44,25 +55,10 @@ struct UserPage {
     bytes: [u8; USER_PAGE_BYTES],
 }
 
-impl UserPage {
-    fn zeroed() -> Self {
-        Self {
-            bytes: [0; USER_PAGE_BYTES],
-        }
-    }
-}
-
 #[cfg(target_arch = "aarch64")]
 #[repr(C, align(4096))]
 struct Aarch64PageTable {
     entries: [u64; 512],
-}
-
-#[cfg(target_arch = "aarch64")]
-impl Aarch64PageTable {
-    fn new() -> Self {
-        Self { entries: [0; 512] }
-    }
 }
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -71,21 +67,63 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LE: u8 = 1;
 const ELF_TYPE_EXECUTABLE: u16 = 2;
+const ELF_TYPE_DYNAMIC: u16 = 3;
 const ELF_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_SEGMENT_LOAD: u32 = 1;
+const ELF_SEGMENT_DYNAMIC: u32 = 2;
 const ELF_PF_X: u32 = 1;
 const ELF_PF_W: u32 = 2;
 const ELF_PF_R: u32 = 4;
+const ELF_DYNAMIC_ENTRY_SIZE: usize = 16;
+const ELF_RELA_ENTRY_SIZE: usize = 24;
+const ELF_DT_NULL: u64 = 0;
+const ELF_DT_RELA: u64 = 7;
+const ELF_DT_RELASZ: u64 = 8;
+const ELF_DT_RELAENT: u64 = 9;
+const ELF_DT_RELACOUNT: u64 = 0x6fff_fff9;
 
 #[cfg(target_arch = "x86_64")]
 const ELF_MACHINE_NATIVE: u16 = 62;
 #[cfg(target_arch = "aarch64")]
 const ELF_MACHINE_NATIVE: u16 = 183;
+#[cfg(target_arch = "x86_64")]
+const ELF_RELOC_RELATIVE: u64 = 8;
+#[cfg(target_arch = "aarch64")]
+const ELF_RELOC_RELATIVE: u64 = 1027;
 
 const RING3_ELF_GROUNDWORK_ENV: &str = match option_env!("ARROST_RING3_ELF_GROUNDWORK") {
     Some(value) => value,
     None => "false",
 };
+
+unsafe fn zeroed_box<T>() -> Box<T> {
+    let layout = Layout::new::<T>();
+    // SAFETY: `alloc_zeroed` returns suitably aligned memory for `layout`; null is
+    // delegated to the kernel's allocation error handler.
+    let ptr = unsafe { alloc_zeroed(layout) };
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+    // SAFETY: callers only instantiate types whose all-zero bit pattern is valid.
+    unsafe { Box::from_raw(ptr.cast::<T>()) }
+}
+
+fn boxed_zeroed_user_page() -> Box<UserPage> {
+    // SAFETY: a zeroed user page is a valid blank 4 KiB backing page.
+    unsafe { zeroed_box::<UserPage>() }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boxed_zeroed_x86_page_table() -> Box<PageTable> {
+    // SAFETY: a zeroed x86 page table contains only unused entries.
+    unsafe { zeroed_box::<PageTable>() }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn boxed_zeroed_aarch64_page_table() -> Box<Aarch64PageTable> {
+    // SAFETY: a zeroed aarch64 page table contains only invalid descriptors.
+    unsafe { zeroed_box::<Aarch64PageTable>() }
+}
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_SMOKE_CODE: [u8; 25] = [
@@ -183,6 +221,9 @@ pub enum Ring3ElfLoadError {
     SegmentTooLarge { bytes: u64 },
     TooManyUserRanges,
     EntryOutsideLoadableSegments { entry: u64 },
+    InvalidDynamicRelocations,
+    UnsupportedDynamicRelocation { info: u64 },
+    ArgumentStackOverflow,
     AddressSpaceCreate(&'static str),
     AddressSpaceMap(&'static str),
 }
@@ -205,6 +246,13 @@ impl fmt::Display for Ring3ElfLoadError {
             Self::EntryOutsideLoadableSegments { entry } => {
                 write!(f, "ELF entry not mapped by PT_LOAD segments: {entry:#018x}")
             }
+            Self::InvalidDynamicRelocations => {
+                write!(f, "invalid ELF dynamic relocation table")
+            }
+            Self::UnsupportedDynamicRelocation { info } => {
+                write!(f, "unsupported ELF dynamic relocation info: {info:#018x}")
+            }
+            Self::ArgumentStackOverflow => write!(f, "user argument stack does not fit"),
             Self::AddressSpaceCreate(error) => {
                 write!(f, "failed to create address space: {error}")
             }
@@ -223,6 +271,13 @@ pub struct Ring3ProcessImage {
     _address_space_owner: AddressSpaceOwner,
     _owned_kernel_buffers: Vec<Box<[u8]>>,
     _owned_user_pages: Vec<Box<UserPage>>,
+}
+
+struct LoadedUserPage {
+    vaddr: u64,
+    page: Box<UserPage>,
+    writable: bool,
+    executable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -326,7 +381,9 @@ pub fn switch_to_address_space(
     #[cfg(target_arch = "aarch64")]
     {
         let current = current_address_space_token();
-        // SAFETY: switching TTBR0_EL1 to provided root token is controlled by kernel ring3 runtime.
+        // SAFETY: switching TTBR0_EL1 to provided root token is controlled by kernel ring3
+        // runtime. Keep the sequence conservative here: some host/firmware profiles used by the
+        // smoke path do not tolerate broader current-EL TLB maintenance in this code path.
         unsafe {
             asm!(
                 "msr ttbr0_el1, {root}",
@@ -354,7 +411,14 @@ pub fn build_native_smoke_elf() -> Vec<u8> {
 }
 
 pub fn load_native_process_image(elf_bytes: &[u8]) -> Result<Ring3ProcessImage, Ring3ElfLoadError> {
-    load_process_image(elf_bytes, ELF_MACHINE_NATIVE)
+    load_process_image(elf_bytes, ELF_MACHINE_NATIVE, &[])
+}
+
+pub fn load_native_process_image_with_args(
+    elf_bytes: &[u8],
+    argv: &[&str],
+) -> Result<Ring3ProcessImage, Ring3ElfLoadError> {
+    load_process_image(elf_bytes, ELF_MACHINE_NATIVE, argv)
 }
 
 pub fn validate_user_access(
@@ -462,6 +526,7 @@ pub fn copy_to_user<T: Copy>(
 fn load_process_image(
     elf_bytes: &[u8],
     expected_machine: u16,
+    argv: &[&str],
 ) -> Result<Ring3ProcessImage, Ring3ElfLoadError> {
     let header = parse_elf_header(elf_bytes, expected_machine)?;
     let mut user_ranges = empty_user_ranges();
@@ -471,6 +536,7 @@ fn load_process_image(
     let mut highest_user_end = header.entry;
     let mut owned_kernel_buffers = Vec::<Box<[u8]>>::new();
     let mut owned_user_pages = Vec::<Box<UserPage>>::new();
+    let mut loaded_user_pages = Vec::<LoadedUserPage>::new();
     let (address_space, mut address_space_owner) =
         create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
 
@@ -530,7 +596,26 @@ fn load_process_image(
             let page_vaddr = page_base
                 .checked_add(page_index_u64.saturating_mul(USER_PAGE_BYTES as u64))
                 .ok_or(Ring3ElfLoadError::SegmentBounds)?;
-            let mut page = Box::new(UserPage::zeroed());
+            // Linkers may emit adjacent PT_LOAD segments that share the same first page.
+            // Stage segment bytes per virtual page, merge permissions, then map once.
+            if let Some(loaded_page) = loaded_user_pages
+                .iter_mut()
+                .find(|loaded_page| loaded_page.vaddr == page_vaddr)
+            {
+                populate_segment_page(
+                    &mut loaded_page.page,
+                    page_index,
+                    page_offset,
+                    file_offset,
+                    file_size,
+                    elf_bytes,
+                )?;
+                loaded_page.writable |= writable;
+                loaded_page.executable |= executable;
+                continue;
+            }
+
+            let mut page = boxed_zeroed_user_page();
             populate_segment_page(
                 &mut page,
                 page_index,
@@ -539,19 +624,35 @@ fn load_process_image(
                 file_size,
                 elf_bytes,
             )?;
-            map_user_page(
-                &mut address_space_owner,
-                address_space,
-                page_vaddr,
-                &page,
+            loaded_user_pages.push(LoadedUserPage {
+                vaddr: page_vaddr,
+                page,
                 writable,
                 executable,
-            )
-            .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
-            mapped_pages = mapped_pages.saturating_add(1);
-            owned_user_pages.push(page);
+            });
         }
     }
+
+    for loaded_page in loaded_user_pages {
+        map_user_page(
+            &mut address_space_owner,
+            address_space,
+            loaded_page.vaddr,
+            &loaded_page.page,
+            loaded_page.writable,
+            loaded_page.executable,
+        )
+        .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
+        mapped_pages = mapped_pages.saturating_add(1);
+        owned_user_pages.push(loaded_page.page);
+    }
+    apply_dynamic_relocations(
+        elf_bytes,
+        &header,
+        &user_ranges,
+        user_range_count,
+        address_space,
+    )?;
 
     let entry_ip = entry_mapped.then_some(header.entry).ok_or(
         Ring3ElfLoadError::EntryOutsideLoadableSegments {
@@ -578,7 +679,7 @@ fn load_process_image(
         let page_vaddr = stack_start
             .checked_add(page_index_u64.saturating_mul(USER_PAGE_BYTES as u64))
             .ok_or(Ring3ElfLoadError::SegmentBounds)?;
-        let page = Box::new(UserPage::zeroed());
+        let page = boxed_zeroed_user_page();
         map_user_page(
             &mut address_space_owner,
             address_space,
@@ -591,7 +692,13 @@ fn load_process_image(
         mapped_pages = mapped_pages.saturating_add(1);
         owned_user_pages.push(page);
     }
-    let user_sp = align_down(stack_start.saturating_add(USER_STACK_BYTES as u64), 16);
+    let user_sp = populate_user_stack(
+        &user_ranges,
+        user_range_count,
+        address_space,
+        stack_start,
+        argv,
+    )?;
 
     let kernel_stack = vec![0u8; KERNEL_STACK_BYTES].into_boxed_slice();
     let kernel_stack_top = align_down(
@@ -613,6 +720,133 @@ fn load_process_image(
     })
 }
 
+fn populate_user_stack(
+    user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
+    user_range_count: usize,
+    address_space: AddressSpaceToken,
+    stack_start: u64,
+    argv: &[&str],
+) -> Result<u64, Ring3ElfLoadError> {
+    let stack_top = align_down(stack_start.saturating_add(USER_STACK_BYTES as u64), 16);
+    let mut sp = stack_top;
+    let mut arg_ptrs = Vec::<u64>::new();
+    if arg_ptrs.try_reserve_exact(argv.len()).is_err() {
+        return Err(Ring3ElfLoadError::ArgumentStackOverflow);
+    }
+
+    for arg in argv.iter().rev() {
+        let bytes = arg.as_bytes();
+        let bytes_with_nul = bytes
+            .len()
+            .checked_add(1)
+            .ok_or(Ring3ElfLoadError::ArgumentStackOverflow)?;
+        let bytes_with_nul_u64 =
+            u64::try_from(bytes_with_nul).map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+        sp = sp
+            .checked_sub(bytes_with_nul_u64)
+            .ok_or(Ring3ElfLoadError::ArgumentStackOverflow)?;
+        if sp < stack_start {
+            return Err(Ring3ElfLoadError::ArgumentStackOverflow);
+        }
+        copy_to_user_bytes(user_ranges, user_range_count, address_space, sp, bytes)
+            .map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+        copy_to_user_bytes(
+            user_ranges,
+            user_range_count,
+            address_space,
+            sp.saturating_add(bytes.len() as u64),
+            &[0],
+        )
+        .map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+        arg_ptrs.push(sp);
+    }
+
+    arg_ptrs.reverse();
+    let table_bytes = argv
+        .len()
+        .checked_add(2)
+        .and_then(|slots| slots.checked_mul(size_of::<u64>()))
+        .ok_or(Ring3ElfLoadError::ArgumentStackOverflow)?;
+    let table_bytes_u64 =
+        u64::try_from(table_bytes).map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+    let table_start = align_down(
+        sp.checked_sub(table_bytes_u64)
+            .ok_or(Ring3ElfLoadError::ArgumentStackOverflow)?,
+        16,
+    );
+    if table_start < stack_start {
+        return Err(Ring3ElfLoadError::ArgumentStackOverflow);
+    }
+
+    let argc = argv.len() as u64;
+    copy_to_user(
+        user_ranges,
+        user_range_count,
+        address_space,
+        table_start,
+        &argc,
+    )
+    .map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+
+    let mut cursor = table_start.saturating_add(size_of::<u64>() as u64);
+    for ptr in arg_ptrs {
+        copy_to_user(user_ranges, user_range_count, address_space, cursor, &ptr)
+            .map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+        cursor = cursor.saturating_add(size_of::<u64>() as u64);
+    }
+
+    let null_ptr = 0u64;
+    copy_to_user(
+        user_ranges,
+        user_range_count,
+        address_space,
+        cursor,
+        &null_ptr,
+    )
+    .map_err(|_| Ring3ElfLoadError::ArgumentStackOverflow)?;
+
+    Ok(table_start)
+}
+
+fn apply_dynamic_relocations(
+    elf_bytes: &[u8],
+    header: &ElfHeader,
+    user_ranges: &[Option<UserMemoryRange>; MAX_USER_RANGES],
+    user_range_count: usize,
+    address_space: AddressSpaceToken,
+) -> Result<(), Ring3ElfLoadError> {
+    let Some(relocations) = parse_dynamic_relocation_table(elf_bytes, header)? else {
+        return Ok(());
+    };
+
+    for index in 0..relocations.rela_count {
+        let rela_offset = u64::try_from(index.saturating_mul(ELF_RELA_ENTRY_SIZE))
+            .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        let rela_addr = relocations
+            .rela_addr
+            .checked_add(rela_offset)
+            .ok_or(Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        let rela =
+            copy_from_user::<ElfRela>(user_ranges, user_range_count, address_space, rela_addr)
+                .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        if rela.info != ELF_RELOC_RELATIVE {
+            return Err(Ring3ElfLoadError::UnsupportedDynamicRelocation { info: rela.info });
+        }
+        let value =
+            u64::try_from(rela.addend).map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        copy_to_user(
+            user_ranges,
+            user_range_count,
+            address_space,
+            rela.offset,
+            &value,
+        )
+        .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(target_arch = "x86_64")]
 fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwner), &'static str> {
     let (current_frame, _) = Cr3::read();
@@ -622,7 +856,7 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     };
     let current_table = current_virt as *const PageTable;
 
-    let mut process_root = Box::new(PageTable::new());
+    let mut process_root = boxed_zeroed_x86_page_table();
     // SAFETY: current_table points to active P4 mapped in kernel address space.
     let current_table_ref = unsafe { &*current_table };
     for index in 0..512 {
@@ -650,12 +884,13 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     if current.root_table == 0 {
         return Err("empty TTBR0 root table");
     }
-    let Some(current_virt) = mem::phys_to_virt(current.root_table) else {
+    let current_root_phys = current.root_table & AARCH64_TABLE_ADDR_MASK;
+    let Some(current_virt) = mem::phys_to_virt(current_root_phys) else {
         return Err("failed to resolve current TTBR0 virtual address");
     };
     let current_table = current_virt as *const Aarch64PageTable;
 
-    let mut process_root = Box::new(Aarch64PageTable::new());
+    let mut process_root = boxed_zeroed_aarch64_page_table();
     // SAFETY: current TTBR0 root is mapped in the kernel address space and remains valid.
     let current_table_ref = unsafe { &*current_table };
     process_root
@@ -919,7 +1154,7 @@ fn x86_ensure_child_table(
         return Ok(child_virt as *mut PageTable);
     }
 
-    let new_table = Box::new(PageTable::new());
+    let new_table = boxed_zeroed_x86_page_table();
     let new_table_ptr = (&*new_table as *const PageTable) as *mut PageTable;
     let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
         return Err("failed to translate new x86 page-table physical address");
@@ -950,10 +1185,9 @@ fn map_user_page_aarch64(
         return Err("empty process TTBR0 root table");
     }
 
-    let l0_ptr = root as *mut Aarch64PageTable;
-    let l1_ptr = aarch64_ensure_child_table(l0_ptr, aarch64_table_index(user_vaddr, 0), tables)?;
-    let l2_ptr = aarch64_ensure_child_table(l1_ptr, aarch64_table_index(user_vaddr, 1), tables)?;
-    let l3_ptr = aarch64_ensure_child_table(l2_ptr, aarch64_table_index(user_vaddr, 2), tables)?;
+    let l1_ptr = root as *mut Aarch64PageTable;
+    let l2_ptr = aarch64_ensure_child_table(l1_ptr, aarch64_table_index(user_vaddr, 1), 1, tables)?;
+    let l3_ptr = aarch64_ensure_child_table(l2_ptr, aarch64_table_index(user_vaddr, 2), 2, tables)?;
     let entry_index = aarch64_table_index(user_vaddr, 3);
     let template =
         aarch64_descriptor_template_from_kernel_alias(backing_page.bytes.as_ptr() as u64)?;
@@ -985,6 +1219,7 @@ fn map_user_page_aarch64(
 fn aarch64_ensure_child_table(
     parent_ptr: *mut Aarch64PageTable,
     index: usize,
+    level: usize,
     tables: &mut Vec<Box<Aarch64PageTable>>,
 ) -> Result<*mut Aarch64PageTable, &'static str> {
     // SAFETY: caller provides a valid page-table pointer from the process-owned hierarchy.
@@ -992,19 +1227,79 @@ fn aarch64_ensure_child_table(
     let descriptor = parent.entries[index];
     if (descriptor & AARCH64_TABLE_VALID) != 0 {
         if (descriptor & AARCH64_TABLE_TABLE_OR_PAGE) == 0 {
-            return Err("encountered block mapping in user address-space walk");
+            return aarch64_split_block_mapping(parent, index, level, descriptor, tables);
         }
         let child_phys = descriptor & AARCH64_TABLE_ADDR_MASK;
         let Some(child_virt) = mem::phys_to_virt(child_phys) else {
             return Err("failed to resolve child aarch64 page-table virtual address");
         };
-        return Ok(child_virt as *mut Aarch64PageTable);
+        let child_ptr = child_virt as *mut Aarch64PageTable;
+        if aarch64_owned_child_table(child_ptr, tables) {
+            return Ok(child_ptr);
+        }
+        return aarch64_clone_child_table(parent, index, child_ptr, tables);
     }
 
-    let new_table = Box::new(Aarch64PageTable::new());
+    let new_table = boxed_zeroed_aarch64_page_table();
     let new_table_ptr = (&*new_table as *const Aarch64PageTable) as *mut Aarch64PageTable;
     let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
         return Err("failed to translate new aarch64 page-table physical address");
+    };
+    parent.entries[index] = (new_table_phys & AARCH64_TABLE_ADDR_MASK)
+        | AARCH64_TABLE_VALID
+        | AARCH64_TABLE_TABLE_OR_PAGE;
+    tables.push(new_table);
+    Ok(new_table_ptr)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_owned_child_table(
+    child_ptr: *mut Aarch64PageTable,
+    tables: &[Box<Aarch64PageTable>],
+) -> bool {
+    let child_addr = child_ptr as usize;
+    tables
+        .iter()
+        .any(|table| ((&**table as *const Aarch64PageTable) as usize) == child_addr)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_clone_child_table(
+    parent: &mut Aarch64PageTable,
+    index: usize,
+    child_ptr: *mut Aarch64PageTable,
+    tables: &mut Vec<Box<Aarch64PageTable>>,
+) -> Result<*mut Aarch64PageTable, &'static str> {
+    let mut new_table = boxed_zeroed_aarch64_page_table();
+    // SAFETY: descriptor points to a valid child table page currently mapped in kernel space.
+    let child = unsafe { &*child_ptr };
+    new_table.entries.copy_from_slice(&child.entries);
+    let new_table_ptr = (&*new_table as *const Aarch64PageTable) as *mut Aarch64PageTable;
+    let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
+        return Err("failed to translate cloned aarch64 page-table physical address");
+    };
+    parent.entries[index] = (new_table_phys & AARCH64_TABLE_ADDR_MASK)
+        | AARCH64_TABLE_VALID
+        | AARCH64_TABLE_TABLE_OR_PAGE;
+    tables.push(new_table);
+    Ok(new_table_ptr)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_split_block_mapping(
+    parent: &mut Aarch64PageTable,
+    index: usize,
+    level: usize,
+    _descriptor: u64,
+    tables: &mut Vec<Box<Aarch64PageTable>>,
+) -> Result<*mut Aarch64PageTable, &'static str> {
+    if !(level == 1 || level == 2) {
+        return Err("unsupported block mapping level in user address-space walk");
+    }
+    let new_table = boxed_zeroed_aarch64_page_table();
+    let new_table_ptr = (&*new_table as *const Aarch64PageTable) as *mut Aarch64PageTable;
+    let Some(new_table_phys) = mem::virt_to_phys(new_table_ptr as usize) else {
+        return Err("failed to translate split aarch64 page-table physical address");
     };
     parent.entries[index] = (new_table_phys & AARCH64_TABLE_ADDR_MASK)
         | AARCH64_TABLE_VALID
@@ -1197,6 +1492,20 @@ struct ProgramHeader {
     mem_size: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DynamicRelocationTable {
+    rela_addr: u64,
+    rela_count: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ElfRela {
+    offset: u64,
+    info: u64,
+    addend: i64,
+}
+
 fn parse_elf_header(
     elf_bytes: &[u8],
     expected_machine: u16,
@@ -1214,7 +1523,7 @@ fn parse_elf_header(
         return Err(Ring3ElfLoadError::UnsupportedData(elf_bytes[5]));
     }
     let elf_type = read_u16(elf_bytes, 16).ok_or(Ring3ElfLoadError::InvalidHeader)?;
-    if elf_type != ELF_TYPE_EXECUTABLE {
+    if elf_type != ELF_TYPE_EXECUTABLE && elf_type != ELF_TYPE_DYNAMIC {
         return Err(Ring3ElfLoadError::InvalidHeader);
     }
 
@@ -1278,6 +1587,81 @@ fn parse_program_header(
         mem_size: read_u64(elf_bytes, offset + 40)
             .ok_or(Ring3ElfLoadError::InvalidProgramHeaders)?,
     })
+}
+
+fn parse_dynamic_relocation_table(
+    elf_bytes: &[u8],
+    header: &ElfHeader,
+) -> Result<Option<DynamicRelocationTable>, Ring3ElfLoadError> {
+    for index in 0..header.program_header_count {
+        let ph = parse_program_header(elf_bytes, header, index)?;
+        if ph.segment_type != ELF_SEGMENT_DYNAMIC || ph.file_size == 0 {
+            continue;
+        }
+
+        let dynamic_offset = usize::try_from(ph.file_offset)
+            .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        let dynamic_size = usize::try_from(ph.file_size)
+            .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        if dynamic_size % ELF_DYNAMIC_ENTRY_SIZE != 0 {
+            return Err(Ring3ElfLoadError::InvalidDynamicRelocations);
+        }
+        let dynamic_end = dynamic_offset
+            .checked_add(dynamic_size)
+            .ok_or(Ring3ElfLoadError::InvalidDynamicRelocations)?;
+        let dynamic_bytes = elf_bytes
+            .get(dynamic_offset..dynamic_end)
+            .ok_or(Ring3ElfLoadError::InvalidDynamicRelocations)?;
+
+        let mut rela_addr = None;
+        let mut rela_size = 0usize;
+        let mut rela_ent = 0usize;
+        let mut rela_count = None;
+        for entry in dynamic_bytes.chunks_exact(ELF_DYNAMIC_ENTRY_SIZE) {
+            let tag = read_u64(entry, 0).ok_or(Ring3ElfLoadError::InvalidDynamicRelocations)?;
+            let value = read_u64(entry, 8).ok_or(Ring3ElfLoadError::InvalidDynamicRelocations)?;
+            match tag {
+                ELF_DT_NULL => break,
+                ELF_DT_RELA => rela_addr = Some(value),
+                ELF_DT_RELASZ => {
+                    rela_size = usize::try_from(value)
+                        .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+                }
+                ELF_DT_RELAENT => {
+                    rela_ent = usize::try_from(value)
+                        .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?;
+                }
+                ELF_DT_RELACOUNT => {
+                    rela_count = Some(
+                        usize::try_from(value)
+                            .map_err(|_| Ring3ElfLoadError::InvalidDynamicRelocations)?,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let Some(rela_addr) = rela_addr else {
+            return Ok(None);
+        };
+        if rela_size == 0 {
+            return Ok(None);
+        }
+        if rela_ent != ELF_RELA_ENTRY_SIZE || rela_size % rela_ent != 0 {
+            return Err(Ring3ElfLoadError::InvalidDynamicRelocations);
+        }
+        let total_entries = rela_size / rela_ent;
+        let rela_count = rela_count.unwrap_or(total_entries);
+        if rela_count > total_entries {
+            return Err(Ring3ElfLoadError::InvalidDynamicRelocations);
+        }
+        return Ok(Some(DynamicRelocationTable {
+            rela_addr,
+            rela_count,
+        }));
+    }
+
+    Ok(None)
 }
 
 fn append_user_range(

@@ -106,6 +106,7 @@ static RING3_SMOKE_TRAP_VALID: AtomicU8 = AtomicU8::new(0);
 static RING3_SMOKE_TRAP_ELR: AtomicU64 = AtomicU64::new(0);
 static RING3_SMOKE_TRAP_SP_EL0: AtomicU64 = AtomicU64::new(0);
 static RING3_SMOKE_TRAP_RET0: AtomicU64 = AtomicU64::new(0);
+static RING3_TRACE_LOGS: AtomicU8 = AtomicU8::new(1);
 static RING3_SMOKE_EXPECT_FAULT: AtomicBool = AtomicBool::new(false);
 static SVC_GATE_SEEN: AtomicBool = AtomicBool::new(false);
 static mut RING3_SMOKE_STACK: SmokeStack = SmokeStack([0; RING3_SMOKE_STACK_BYTES]);
@@ -121,6 +122,7 @@ pub fn run_boot_smoke(continue_fn: fn() -> !) -> bool {
         RING3_SMOKE_TASK_NAME,
         RING3_SMOKE_CAPS_DEFAULT,
     );
+    let launch = process.launch_context();
     let user_ip = if expect_fault {
         ring3_smoke_user_entry_fault as *const () as usize as u64
     } else {
@@ -129,7 +131,7 @@ pub fn run_boot_smoke(continue_fn: fn() -> !) -> bool {
     let user_context = El0Context::new(user_ip, user_stack_top());
     if let Err(error) = arm_and_enter(
         continue_fn,
-        process,
+        launch,
         user_context,
         expect_fault,
         "ring3 smoke(a64)",
@@ -144,26 +146,19 @@ pub fn run_boot_smoke(continue_fn: fn() -> !) -> bool {
 
 pub fn run_loaded_context(
     continue_fn: fn() -> !,
-    process: proc::Ring3ProcessContext,
+    launch: proc::Ring3LaunchContext,
 ) -> Result<(), &'static str> {
     let context = El0Context::with_x0(
-        process.trap_frame.ip,
-        process.trap_frame.sp,
-        process.trap_frame.ret0,
+        launch.trap_frame.ip,
+        launch.trap_frame.sp,
+        launch.trap_frame.ret0,
     );
-    arm_and_enter(
-        continue_fn,
-        process,
-        context,
-        false,
-        "ring3 run(a64)",
-        false,
-    )
+    arm_and_enter(continue_fn, launch, context, false, "ring3 run(a64)", false)
 }
 
 fn arm_and_enter(
     continue_fn: fn() -> !,
-    process: proc::Ring3ProcessContext,
+    launch: proc::Ring3LaunchContext,
     user_context: El0Context,
     expect_fault: bool,
     label: &str,
@@ -174,7 +169,13 @@ fn arm_and_enter(
         return Err("gate already active");
     }
     RING3_SMOKE_EXPECT_FAULT.store(expect_fault, Ordering::Release);
-    if arm_process_context && !proc::arm_ring3_context(process) {
+    if arm_process_context
+        && !proc::arm_ring3_context(proc::Ring3ProcessContext::new(
+            launch.pid,
+            launch.name,
+            launch.syscall_caps,
+        ))
+    {
         RING3_SMOKE_STATE.store(previous, Ordering::Release);
         return Err("failed to arm proc ring3 context");
     }
@@ -182,6 +183,7 @@ fn arm_and_enter(
     let kernel_sp = read_sp();
     let kernel_daif = read_daif();
     RING3_SMOKE_HITS.store(0, Ordering::Release);
+    RING3_TRACE_LOGS.store((!launch.name.starts_with("/bin/")) as u8, Ordering::Release);
     RING3_SMOKE_RETURN_SP.store(kernel_sp, Ordering::Release);
     RING3_SMOKE_RETURN_DAIF.store(kernel_daif, Ordering::Release);
     RING3_SMOKE_CONTINUE_FN.store(continue_fn as usize as u64, Ordering::Release);
@@ -191,8 +193,8 @@ fn arm_and_enter(
         user_context.entry_ip,
         user_context.entry_sp,
         ESR_EC_SVC64,
-        process.pid,
-        process.syscall_caps,
+        launch.pid,
+        launch.syscall_caps,
         if expect_fault { "fault" } else { "normal" }
     ));
 
@@ -225,37 +227,45 @@ pub fn dispatch_svc(
     );
     let result = dispatch.result;
     if dispatch.action == proc::Ring3SyscallAction::ReturnKernel {
+        let trace_logs = RING3_TRACE_LOGS.load(Ordering::Acquire) != 0;
         if call.number == SYS_EXIT && result == 0 {
             let exit_code = call.args[0] as i32;
-            serial::write_fmt(format_args!(
-                "ring3 smoke(a64): svc hit={} elr={:#018x} sp_el0={:#018x} imm={} nr={} ({}) exit_code={} -> kernel resume\n",
-                hit,
-                elr,
-                sp_el0,
-                svc_imm,
-                call.number,
-                arrostd::syscall::name(call.number),
-                exit_code
-            ));
+            if trace_logs {
+                serial::write_fmt(format_args!(
+                    "ring3 smoke(a64): svc hit={} elr={:#018x} sp_el0={:#018x} imm={} nr={} ({}) exit_code={} -> kernel resume\n",
+                    hit,
+                    elr,
+                    sp_el0,
+                    svc_imm,
+                    call.number,
+                    arrostd::syscall::name(call.number),
+                    exit_code
+                ));
+            }
             RING3_SMOKE_STATE.store(STATE_COMPLETED, Ordering::Release);
         } else {
-            serial::write_fmt(format_args!(
-                "ring3 smoke(a64): svc hit={} elr={:#018x} sp_el0={:#018x} imm={} nr={} ({}) a0={:#x} rc={} -> kernel resume\n",
-                hit,
-                elr,
-                sp_el0,
-                svc_imm,
-                call.number,
-                arrostd::syscall::name(call.number),
-                call.args[0],
-                result
-            ));
+            if trace_logs {
+                serial::write_fmt(format_args!(
+                    "ring3 smoke(a64): svc hit={} elr={:#018x} sp_el0={:#018x} imm={} nr={} ({}) a0={:#x} rc={} -> kernel resume\n",
+                    hit,
+                    elr,
+                    sp_el0,
+                    svc_imm,
+                    call.number,
+                    arrostd::syscall::name(call.number),
+                    call.args[0],
+                    result
+                ));
+            }
         }
         RING3_SMOKE_TRAP_ELR.store(elr, Ordering::Release);
         RING3_SMOKE_TRAP_SP_EL0.store(sp_el0, Ordering::Release);
         RING3_SMOKE_TRAP_RET0.store(result as u64, Ordering::Release);
         RING3_SMOKE_TRAP_VALID.store(1, Ordering::Release);
         resume_boot_smoke_to_kernel();
+    }
+    if RING3_TRACE_LOGS.load(Ordering::Acquire) == 0 {
+        return Some(result);
     }
     let result_name = if result < 0 {
         errno::name(result)

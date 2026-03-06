@@ -5,6 +5,7 @@ pub mod abi {
     pub const USERLAND_ABI_REVISION: u16 = 4;
     pub const USERLAND_INIT_APP: &str = "init";
     pub const USERLAND_DOOM_APP: &str = "doom";
+    pub const USERLAND_PATH_MAX: usize = 160;
 
     pub const fn shell_prompt() -> &'static str {
         "arrost> "
@@ -186,6 +187,7 @@ pub mod syscall {
 
     pub mod errno {
         pub const ENOENT: isize = -2;
+        pub const ENOEXEC: isize = -8;
         pub const EPERM: isize = -1;
         pub const EAGAIN: isize = -11;
         pub const EFAULT: isize = -14;
@@ -206,6 +208,7 @@ pub mod syscall {
         pub const fn name(code: isize) -> &'static str {
             match code {
                 ENOENT => "ENOENT",
+                ENOEXEC => "ENOEXEC",
                 EPERM => "EPERM",
                 EAGAIN => "EAGAIN",
                 EFAULT => "EFAULT",
@@ -303,9 +306,338 @@ pub mod syscall {
     }
 }
 
+pub mod runtime {
+    use crate::syscall::{
+        FileStat, O_RDONLY, SYS_CLOSE, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_OPEN,
+        SYS_SEEK, SYS_WRITE,
+    };
+    use core::{slice, str};
+
+    pub struct Args {
+        argc: usize,
+        argv: *const *const u8,
+    }
+
+    impl Args {
+        /// Build an argument view over the kernel-provided initial user stack.
+        ///
+        /// # Safety
+        /// The caller must provide the exact `argc`/`argv` pair installed by the
+        /// kernel on process startup, and every non-null `argv[i]` up to `argc`
+        /// must point to a valid NUL-terminated UTF-8 string in user memory.
+        pub const unsafe fn from_raw(argc: usize, argv: *const *const u8) -> Self {
+            Self { argc, argv }
+        }
+
+        pub const fn len(&self) -> usize {
+            self.argc
+        }
+
+        pub const fn is_empty(&self) -> bool {
+            self.argc == 0
+        }
+
+        pub fn get(&self, index: usize) -> Option<&str> {
+            if index >= self.argc {
+                return None;
+            }
+            // SAFETY: `argv` originates from the kernel-built user stack.
+            let ptr = unsafe { *self.argv.add(index) };
+            if ptr.is_null() {
+                return None;
+            }
+            let len = cstr_len(ptr);
+            // SAFETY: kernel populated the string bytes and trailing NUL.
+            let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+            str::from_utf8(bytes).ok()
+        }
+    }
+
+    fn cstr_len(ptr: *const u8) -> usize {
+        let mut len = 0usize;
+        loop {
+            // SAFETY: caller guarantees `ptr` points to a valid C string.
+            let byte = unsafe { *ptr.add(len) };
+            if byte == 0 {
+                return len;
+            }
+            len += 1;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall0(number: u64) -> isize {
+        let mut result = number;
+        // SAFETY: follows the ArrOSt `int 0x80` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inlateout("rax") result,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall0(number: u64) -> isize {
+        let mut result: u64;
+        // SAFETY: follows the ArrOSt EL0 `svc` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") number,
+                lateout("x0") result,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall1(number: u64, arg0: u64) -> isize {
+        let mut result = number;
+        // SAFETY: follows the ArrOSt `int 0x80` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inlateout("rax") result,
+                in("rdi") arg0,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall1(number: u64, arg0: u64) -> isize {
+        let mut result: u64;
+        // SAFETY: follows the ArrOSt EL0 `svc` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") number,
+                inlateout("x0") arg0 => result,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> isize {
+        let mut result = number;
+        // SAFETY: follows the ArrOSt `int 0x80` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inlateout("rax") result,
+                in("rdi") arg0,
+                in("rsi") arg1,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> isize {
+        let mut result: u64;
+        // SAFETY: follows the ArrOSt EL0 `svc` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") number,
+                inlateout("x0") arg0 => result,
+                in("x1") arg1,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
+        let mut result = number;
+        // SAFETY: follows the ArrOSt `int 0x80` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inlateout("rax") result,
+                in("rdi") arg0,
+                in("rsi") arg1,
+                in("rdx") arg2,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
+        let mut result: u64;
+        // SAFETY: follows the ArrOSt EL0 `svc` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") number,
+                inlateout("x0") arg0 => result,
+                in("x1") arg1,
+                in("x2") arg2,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    pub fn exit(code: i32) -> ! {
+        let _ = syscall1(SYS_EXIT, code as u64);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn write_stdout(bytes: &[u8]) -> isize {
+        syscall2(SYS_WRITE, bytes.as_ptr() as u64, bytes.len() as u64)
+    }
+
+    pub fn write_stdout_str(text: &str) -> isize {
+        write_stdout(text.as_bytes())
+    }
+
+    pub fn open_readonly(path: &str) -> isize {
+        syscall3(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            O_RDONLY as u64,
+            path.len() as u64,
+        )
+    }
+
+    pub fn open(path: &str, flags: u32) -> isize {
+        syscall3(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            flags as u64,
+            path.len() as u64,
+        )
+    }
+
+    pub fn close(fd: u32) -> isize {
+        syscall1(SYS_CLOSE, fd as u64)
+    }
+
+    pub fn fread(fd: u32, out: &mut [u8]) -> isize {
+        syscall3(
+            SYS_FREAD,
+            fd as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        )
+    }
+
+    pub fn fwrite(fd: u32, data: &[u8]) -> isize {
+        syscall3(
+            SYS_FWRITE,
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    }
+
+    pub fn seek(fd: u32, offset: u64, whence: u64) -> isize {
+        syscall3(SYS_SEEK, fd as u64, offset, whence)
+    }
+
+    pub fn fstat(fd: u32, stat: &mut FileStat) -> isize {
+        syscall3(
+            SYS_FSTAT,
+            fd as u64,
+            stat as *mut FileStat as u64,
+            core::mem::size_of::<FileStat>() as u64,
+        )
+    }
+
+    pub fn copy_fd_to_stdout(fd: u32, buffer: &mut [u8]) -> isize {
+        loop {
+            let read = fread(fd, buffer);
+            if read <= 0 {
+                return read;
+            }
+            let used = read as usize;
+            let written = write_stdout(&buffer[..used]);
+            if written < 0 {
+                return written;
+            }
+            if written != read {
+                return 0;
+            }
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! user_entry {
+    ($main:path) => {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::global_asm!(
+            r#"
+            .global _start
+        _start:
+            mov rbx, rsp
+            mov rdi, [rbx]
+            lea rsi, [rbx + 8]
+            and rsp, -16
+            call {rust_main}
+            mov rdi, rax
+            mov eax, {sys_exit}
+            int 0x80
+        1:
+            jmp 1b
+        "#,
+            rust_main = sym __arrost_user_entry_main,
+            sys_exit = const $crate::syscall::SYS_EXIT,
+        );
+
+        #[cfg(target_arch = "aarch64")]
+        core::arch::global_asm!(
+            r#"
+            .global _start
+        _start:
+            ldr x0, [sp]
+            add x1, sp, #8
+            bl {rust_main}
+            mov x8, #{sys_exit}
+            svc #0
+        1:
+            b 1b
+        "#,
+            rust_main = sym __arrost_user_entry_main,
+            sys_exit = const $crate::syscall::SYS_EXIT,
+        );
+
+        #[unsafe(no_mangle)]
+        extern "C" fn __arrost_user_entry_main(
+            argc: usize,
+            argv: *const *const u8,
+        ) -> isize {
+            let code: i32 = $main(argc, argv);
+            code as isize
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
-    use super::syscall;
+    use super::{abi, syscall};
 
     #[test]
     fn syscall_name_table_is_stable() {
@@ -344,6 +676,7 @@ mod tests {
     #[test]
     fn errno_name_table_is_stable() {
         assert_eq!(syscall::errno::name(syscall::errno::ENOENT), "ENOENT");
+        assert_eq!(syscall::errno::name(syscall::errno::ENOEXEC), "ENOEXEC");
         assert_eq!(syscall::errno::name(syscall::errno::EINVAL), "EINVAL");
         assert_eq!(syscall::errno::name(syscall::errno::ENOSYS), "ENOSYS");
         assert_eq!(syscall::errno::name(syscall::errno::ELOOP), "ELOOP");
@@ -410,6 +743,11 @@ mod tests {
         assert_eq!(syscall::caps::PROC, 0x4);
         assert_eq!(syscall::caps::TIME, 0x8);
         assert_eq!(syscall::caps::ALL, 0xF);
+    }
+
+    #[test]
+    fn userland_path_limit_is_stable() {
+        assert_eq!(abi::USERLAND_PATH_MAX, 160);
     }
 
     #[test]

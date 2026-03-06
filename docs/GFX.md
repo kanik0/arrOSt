@@ -57,7 +57,7 @@ When Doom runtime is active, a dedicated Doom window is opened for viewport + st
 - File-manager commands are path-aware in both serial shell and GUI terminal (`fm list [<path>]`, `fm cd <dir>`, `fm open`, `fm copy`, `fm delete`).
 - GUI terminal command loop includes process controls (`ps`, `kill <pid>`, `waitx <pid|any|all>`) against scheduler-visible entries.
 - `ps`, `doom status`, runtime process controls (`spawn`/`wait`/`waitx`/`ring3 wait`), diagnostics (`syscalls`/`disk`/`mouse`/`ui`/`sync`/`reload`), and network tooling (`net`/`ping`/`udp`/`curl`) in GUI terminal are rendered from internal snapshots/APIs (no serial-mirror dependency).
-- GUI terminal now exposes a filesystem-backed `/bin` namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`, `/bin/link`, `/bin/symlink`; discoverable via `ls /bin`), executed as scheduler-visible external processes.
+- GUI terminal now exposes a filesystem-backed `/bin` namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`, `/bin/link`, `/bin/symlink`; discoverable via `ls /bin`), executed as scheduler-visible ring-3 binary processes.
 - GUI terminal also auto-resolves plain command names like `ls`, `cat`, `ps`, `link`, and `symlink` through that `/bin` namespace when the backing entry exists.
 
 ## Limits

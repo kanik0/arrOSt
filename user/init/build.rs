@@ -2,6 +2,9 @@ use std::env;
 
 fn main() {
     emit_user_linker_script("ring3_init");
+    emit_user_linker_script("ls");
+    emit_user_linker_script("cat");
+    emit_user_linker_script("ps");
 }
 
 fn emit_user_linker_script(bin_name: &str) {

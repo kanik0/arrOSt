@@ -41,6 +41,9 @@ const DATA_REGION_START: u64 = JOURNAL_START + JOURNAL_SECTORS; // 161
 
 /// Maximum direct block pointers per inode.
 const DIRECT_BLOCKS: usize = 12;
+const INDIRECT_PTRS_PER_BLOCK: usize = storage::SECTOR_SIZE / 4;
+const INDIRECT_NEXT_SLOT: usize = INDIRECT_PTRS_PER_BLOCK - 1;
+const INDIRECT_DATA_PTRS: usize = INDIRECT_PTRS_PER_BLOCK - 1;
 
 /// Mode type bits (upper 4 bits of mode u16).
 const MODE_TYPE_MASK: u16 = 0xF000;
@@ -121,6 +124,16 @@ fn current_timestamp() -> u64 {
     time::uptime_millis()
 }
 
+fn indirect_block_entry(buf: &[u8; storage::SECTOR_SIZE], slot: usize) -> u32 {
+    let off = slot * 4;
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn set_indirect_block_entry(buf: &mut [u8; storage::SECTOR_SIZE], slot: usize, value: u32) {
+    let off = slot * 4;
+    buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 impl DiskFsV2 {
     pub const fn new() -> Self {
         Self {
@@ -197,6 +210,14 @@ impl DiskFsV2 {
             return Err(FsError::StorageUnavailable);
         }
         self.with_metadata_tx(|_| Ok(()))
+    }
+
+    pub fn max_files(&self) -> usize {
+        (INODE_COUNT.saturating_sub(1)) as usize
+    }
+
+    pub fn max_file_bytes(&self) -> usize {
+        self.data_blocks.saturating_sub(1) as usize * storage::SECTOR_SIZE
     }
 
     fn with_metadata_tx<R>(
@@ -385,7 +406,27 @@ impl DiskFsV2 {
                     self.note_bitmap_dirty();
                 }
             }
-            // TODO: indirect block handling in future milestone
+            let mut remaining = bc.saturating_sub(DIRECT_BLOCKS as u32);
+            let mut indirect_blk = inode.indirect;
+            while remaining > 0 && indirect_blk != 0 {
+                let mut ind_buf = [0u8; storage::SECTOR_SIZE];
+                if self.read_block(indirect_blk, &mut ind_buf).is_err() {
+                    break;
+                }
+                let entries = remaining.min(INDIRECT_DATA_PTRS as u32) as usize;
+                for slot in 0..entries {
+                    let blk = indirect_block_entry(&ind_buf, slot);
+                    if blk != 0 {
+                        self.bitmap.free(blk);
+                        self.note_bitmap_dirty();
+                    }
+                }
+                let next = indirect_block_entry(&ind_buf, INDIRECT_NEXT_SLOT);
+                self.bitmap.free(indirect_blk);
+                self.note_bitmap_dirty();
+                indirect_blk = next;
+                remaining = remaining.saturating_sub(entries as u32);
+            }
             self.inodes[idx] = DiskInode::empty();
             self.free_inode_count = self.free_inode_count.saturating_add(1);
         }
@@ -444,24 +485,16 @@ impl DiskFsV2 {
             }
             Ok(blk)
         } else {
-            // Indirect block support: read the indirect block to find pointer.
             if inode.indirect == 0 {
                 return Err(FsError::StorageIo);
             }
-            let ind_offset = logical - DIRECT_BLOCKS as u32;
-            let ptrs_per_block = storage::SECTOR_SIZE / 4; // 128
-            if ind_offset >= ptrs_per_block as u32 {
-                return Err(FsError::StorageNoSpace);
-            }
+            let ind_offset = (logical - DIRECT_BLOCKS as u32) as usize;
+            let chain_index = ind_offset / INDIRECT_DATA_PTRS;
+            let entry_index = ind_offset % INDIRECT_DATA_PTRS;
+            let indirect_blk = self.indirect_chain_block(inode.indirect, chain_index)?;
             let mut ind_buf = [0u8; storage::SECTOR_SIZE];
-            self.read_block(inode.indirect, &mut ind_buf)?;
-            let off = ind_offset as usize * 4;
-            let blk = u32::from_le_bytes([
-                ind_buf[off],
-                ind_buf[off + 1],
-                ind_buf[off + 2],
-                ind_buf[off + 3],
-            ]);
+            self.read_block(indirect_blk, &mut ind_buf)?;
+            let blk = indirect_block_entry(&ind_buf, entry_index);
             if blk == 0 {
                 return Err(FsError::StorageIo);
             }
@@ -482,25 +515,69 @@ impl DiskFsV2 {
             if logical < DIRECT_BLOCKS as u32 {
                 self.inodes[ino as usize].direct[logical as usize] = new_blk;
             } else {
-                // Need indirect block.
-                if self.inodes[ino as usize].indirect == 0 {
-                    let ind_blk = self.bitmap.alloc()?;
-                    self.note_bitmap_dirty();
-                    // Zero indirect block.
-                    let zero = [0u8; storage::SECTOR_SIZE];
-                    self.write_block_metadata(ind_blk, &zero)?;
-                    self.inodes[ino as usize].indirect = ind_blk;
-                }
-                let ind_offset = logical - DIRECT_BLOCKS as u32;
+                let ind_offset = (logical - DIRECT_BLOCKS as u32) as usize;
+                let chain_index = ind_offset / INDIRECT_DATA_PTRS;
+                let entry_index = ind_offset % INDIRECT_DATA_PTRS;
+                let indirect_blk = self.ensure_indirect_chain_block(ino, chain_index)?;
                 let mut ind_buf = [0u8; storage::SECTOR_SIZE];
-                self.read_block(self.inodes[ino as usize].indirect, &mut ind_buf)?;
-                let off = ind_offset as usize * 4;
-                ind_buf[off..off + 4].copy_from_slice(&new_blk.to_le_bytes());
-                self.write_block_metadata(self.inodes[ino as usize].indirect, &ind_buf)?;
+                self.read_block(indirect_blk, &mut ind_buf)?;
+                set_indirect_block_entry(&mut ind_buf, entry_index, new_blk);
+                self.write_block_metadata(indirect_blk, &ind_buf)?;
             }
             self.inodes[ino as usize].block_count = logical + 1;
         }
         Ok(())
+    }
+
+    fn indirect_chain_block(&self, start: u32, chain_index: usize) -> Result<u32, FsError> {
+        let mut block = start;
+        for _ in 0..chain_index {
+            if block == 0 {
+                return Err(FsError::StorageIo);
+            }
+            let mut ind_buf = [0u8; storage::SECTOR_SIZE];
+            self.read_block(block, &mut ind_buf)?;
+            block = indirect_block_entry(&ind_buf, INDIRECT_NEXT_SLOT);
+        }
+        if block == 0 {
+            return Err(FsError::StorageIo);
+        }
+        Ok(block)
+    }
+
+    fn alloc_zeroed_indirect_block(&mut self) -> Result<u32, FsError> {
+        let ind_blk = self.bitmap.alloc()?;
+        self.note_bitmap_dirty();
+        self.write_block_metadata(ind_blk, &[0u8; storage::SECTOR_SIZE])?;
+        Ok(ind_blk)
+    }
+
+    fn ensure_indirect_chain_block(
+        &mut self,
+        ino: u32,
+        chain_index: usize,
+    ) -> Result<u32, FsError> {
+        if self.inodes[ino as usize].indirect == 0 {
+            let ind_blk = self.alloc_zeroed_indirect_block()?;
+            self.inodes[ino as usize].indirect = ind_blk;
+        }
+
+        let mut block = self.inodes[ino as usize].indirect;
+        for _ in 0..chain_index {
+            let mut ind_buf = [0u8; storage::SECTOR_SIZE];
+            self.read_block(block, &mut ind_buf)?;
+            let next = indirect_block_entry(&ind_buf, INDIRECT_NEXT_SLOT);
+            let next = if next == 0 {
+                let new_block = self.alloc_zeroed_indirect_block()?;
+                set_indirect_block_entry(&mut ind_buf, INDIRECT_NEXT_SLOT, new_block);
+                self.write_block_metadata(block, &ind_buf)?;
+                new_block
+            } else {
+                next
+            };
+            block = next;
+        }
+        Ok(block)
     }
 
     // ── Root directory initialization ───────────────────────────────────
@@ -566,7 +643,7 @@ impl DiskFsV2 {
                 if entry_ino != 0 && name_len as usize <= MAX_VNAME_LEN {
                     let entry_name =
                         &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
-                    if entry_name == name {
+                    if bytes_eq(entry_name, name) {
                         return Ok((entry_ino, ftype));
                     }
                 }
@@ -631,7 +708,7 @@ impl DiskFsV2 {
                 if entry_ino != 0 && name_len as usize <= MAX_VNAME_LEN {
                     let entry_name =
                         &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
-                    if entry_name == name {
+                    if bytes_eq(entry_name, name) {
                         // Found it. Merge with previous entry or zero it.
                         if let Some(po) = prev_off {
                             // Extend previous entry's rec_len.
@@ -673,7 +750,7 @@ impl DiskFsV2 {
                 }
                 if entry_ino != 0 && name_len == 2 {
                     let entry_name = &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + 2];
-                    if entry_name == b".." {
+                    if is_dotdot_component(entry_name) {
                         buf[off..off + 4].copy_from_slice(&parent_ino.to_le_bytes());
                         self.write_block_metadata(blk, &buf)?;
                         self.inodes[dir_ino as usize].modified = current_timestamp();
@@ -704,7 +781,7 @@ impl DiskFsV2 {
                 if entry_ino != 0 {
                     let entry_name =
                         &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + name_len as usize];
-                    if entry_name != b"." && entry_name != b".." {
+                    if !is_dot_component(entry_name) && !is_dotdot_component(entry_name) {
                         return Ok(false);
                     }
                 }
@@ -749,8 +826,7 @@ impl DiskFsV2 {
             return Ok(0);
         }
         let end = offset as u64 + data.len() as u64;
-        // Limit file size (direct+indirect = 12+128 blocks = 71680 bytes).
-        let max_blocks = DIRECT_BLOCKS as u32 + storage::SECTOR_SIZE as u32 / 4;
+        let max_blocks = self.data_blocks.saturating_sub(1);
         let max_size = max_blocks as u64 * storage::SECTOR_SIZE as u64;
         if end > max_size {
             return Err(FsError::FileTooLarge);
@@ -805,10 +881,10 @@ impl DiskFsV2 {
     fn resolve_path(&self, path: &[u8]) -> Result<u32, FsError> {
         let mut cur = ROOT_INO;
         for component in split_path(path) {
-            if component == b"." || component.is_empty() {
+            if component.is_empty() || is_dot_component(component) {
                 continue;
             }
-            if component == b".." {
+            if is_dotdot_component(component) {
                 // Look up .. in directory.
                 let (parent, _) = self.dir_lookup(cur, b"..")?;
                 cur = parent;
@@ -1431,7 +1507,7 @@ impl DiskFsV2 {
             let mut arr: [&[u8]; 8] = [&[]; 8];
             let mut idx = 0;
             for c in split_path(path) {
-                if c.is_empty() || c == b"." {
+                if c.is_empty() || is_dot_component(c) {
                     continue;
                 }
                 if idx < 8 {
@@ -1449,7 +1525,7 @@ impl DiskFsV2 {
 
         let mut cur = ROOT_INO;
         for &comp in &components[..count - 1] {
-            if comp == b".." {
+            if is_dotdot_component(comp) {
                 let (p, _) = self.dir_lookup(cur, b"..")?;
                 cur = p;
                 continue;
@@ -1605,6 +1681,28 @@ impl<'a> Iterator for PathSplitter<'a> {
 
 fn split_path(path: &[u8]) -> PathSplitter<'_> {
     PathSplitter { remaining: path }
+}
+
+fn bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn is_dot_component(component: &[u8]) -> bool {
+    component.len() == 1 && component[0] == b'.'
+}
+
+fn is_dotdot_component(component: &[u8]) -> bool {
+    component.len() == 2 && component[0] == b'.' && component[1] == b'.'
 }
 
 // ── Inode encode/decode ─────────────────────────────────────────────────

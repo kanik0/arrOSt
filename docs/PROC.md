@@ -5,15 +5,14 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 ## Current model
 
 - Fixed small cooperative kernel task table (`init`, `sh`, workers).
-- Dedicated ring-3 process table for ELF user processes (`init`, `doom`) with parent ownership (`sh`) and explicit reap.
+- Dedicated ring-3 process table for ELF user processes (`init`, `doom`, and VFS-backed `/bin/*` binaries) with parent ownership (`sh`) and explicit reap.
 - Additional scheduler-managed external process table for compositor-launched runtime entries (GUI terminals and Doom runtime session).
-- External table also hosts short-lived shell/GUI binary exec entries (filesystem-backed `/bin/*` commands).
 - Ring-3 runtime state machine: `ready`, `running`, `sleep`, `exited`, `faulted`.
 - Round-robin ring-3 scheduling with syscall-timeslice preemption (`yield/sleep/exit` force kernel return; other syscalls can be timesliced).
 - Per-task syscall capability masks (coarse-grained isolation step).
 - Per-process file-descriptor tables for cooperative and ring-3 execution contexts (`fd 0-2` = serial).
 - Per-process address-space ownership for ring-3 ELF tasks: each process gets its own root page table plus dedicated user mappings for ELF segments and stack.
-- Ring-3 ELFs are linked into a dedicated user virtual range (`0x0000_2000_...`), instead of reusing kernel heap virtual addresses.
+- Ring-3 ELFs are linked into dedicated per-arch user virtual ranges (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`), instead of reusing kernel heap virtual addresses.
 - Kernel/user copies for ring-3 syscalls always walk the process page tables and translate through kernel-visible physical aliases.
 - Runtime capability introspection/drop syscalls (`cap_get`, `cap_drop`) remain shared across cooperative and ring-3 paths.
 - Cooperative lifecycle syscalls (`spawn`, `waitpid`) remain available for kernel-simulated workers.
@@ -23,9 +22,10 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Optional boot/fault smoke flags still validate architecture gates (`ARROST_RING3_BOOT_SMOKE`, `ARROST_RING3_BOOT_SMOKE_FAULT`).
 - Ring-3 dispatch reuses process-layer capability policy/counters through `Ring3ProcessContext`.
 - Cross-platform shell smoke `ring3 smoke` validates ring-3 policy dispatch (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the same process-layer context checks on both `x86_64` and `aarch64`.
-- Optional groundwork flag (`ARROST_RING3_ELF_GROUNDWORK=true`) enables native ELF loader + process metadata + isolated user mappings + user-pointer checked syscalls.
+- Current builds enable the ELF groundwork path by default; the build-time override `ARROST_RING3_ELF_GROUNDWORK=false` remains available for forcing the old pre-M12 path.
 - `ring3 groundwork` now also validates the fd-table syscall path (`open/close/fread/fwrite/seek/fstat/dup/dup2`) including `EBADF` and `EMFILE` behavior.
 - Shell command `ring3 run <init|doom>` now enqueues ring-3 processes into the multiprocess scheduler (non-blocking).
+- Shell and GUI terminal `/bin/*` launches now read ELF bytes from the mounted VFS, enforce the execute bit, build a minimal `argc`/`argv` stack, and run as `domain=ring3 kind=binary`.
 - Shell commands `ring3 ps` and `ring3 wait <pid|any|all>` expose ring-3 process table and reap flow.
 - Cross-platform `xtask` smoke `smoke-ring3-run` now validates multiprocess runtime (`init` + `doom`) and ring-3 preemption points (`yield/sleep/exit`).
 - Unified `kill <pid>` path now targets cooperative, ring-3, and external scheduler entries.
@@ -69,13 +69,13 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 
 - Kernel mappings are still present in each ring-3 page table, but remain supervisor-only.
 - No `fork`, copy-on-write, demand paging, or swap.
-- No filesystem-backed `execve` yet: ring-3 apps are still embedded build artifacts (`ring3_init`, `ring3_doom`).
+- No `execve` syscall yet: `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).
 - Capability masks remain policy checks layered on top of hardware user/kernel separation.
 - External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.
 - `procfs` currently exposes only a minimal synthetic view (`self/pid`, `mounts`, `uptime`) and is not a full `/proc` implementation.
 - External GUI/runtime entries carry an fd table for model consistency, but they do not issue filesystem syscalls yet.
-- Bare command names in shell/GUI terminal can auto-dispatch to filesystem-backed `/bin/*` helpers; those executions still appear through the external scheduler table.
+- Bare command names in shell/GUI terminal can auto-dispatch to filesystem-backed `/bin/*` helpers; those executions appear in the ring-3 process table as `kind=binary`.
 
 ## Relevant files
 

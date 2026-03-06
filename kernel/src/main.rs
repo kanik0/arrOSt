@@ -403,6 +403,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         proc_report.scripted_input_bytes
     ));
 
+    arch::x86_64::ring3::capture_kernel_resume_rsp();
     let _ = arch::x86_64::ring3::run_boot_smoke(
         run_loop,
         irq.user_code_selector,

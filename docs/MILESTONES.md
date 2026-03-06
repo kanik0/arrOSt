@@ -104,95 +104,33 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 ---
 
-## M12: Filesystem-backed execve [WORK IN PROGRESS]
+## M12: VFS-Backed ELF Launch + Exec Groundwork
 
-**Status**: In Progress
-**Limitation**: There is no filesystem-backed execve path yet; ring-3 apps are still embedded artifacts (ring3_init, ring3_doom).
-**Goal**: Implement `execve` syscall that loads ELF binaries from the VFS into a fresh ring-3 process.
+**Status**: Complete
+**Delivered**: Shell and GUI terminal commands now execute real ring-3 ELF binaries read from `/bin/*` in the mounted VFS, without depending on embedded helper artifacts for normal command dispatch.
 
-### Context
+### Delivered scope
 
-Currently, ring-3 ELF binaries (`ring3_init`, `ring3_doom`) are embedded into the kernel at build time via `include_bytes!()` in `kernel/build.rs`. The function `ring3_groundwork.rs` loads them from in-memory byte slices. The goal is to read ELF files from the filesystem (`/bin/init`, `/bin/doom`, etc.) and load them into ring-3 processes at runtime.
+- VFS-backed ELF loading for `/bin/*` entries seeded on the real filesystem.
+- Kernel-mediated spawn-from-path flow that reuses the existing scheduler and ring-3 isolation machinery.
+- Minimal user stack construction with `argc`, `argv[]`, strings, and alignment.
+- Execute-bit enforcement plus explicit failures for missing path, non-executable file, and invalid ELF.
+- Shell and GUI terminal auto-dispatch of plain commands to `/bin/<cmd>` when present.
+- Cross-architecture ring-3 launch support on `x86_64` and `aarch64`.
+- Preservation of `ring3 run <init|doom>` as an embedded smoke/debug path.
+- ABI revision remains `4`.
 
-### Dependencies
-- Requires working VFS (already available: diskfs-v2, ramfs).
-- Requires per-process page-table creation (already available).
+### Validation snapshot
 
-### Implementation Plan
+- `cargo xtask smoke-bin-exec --arch x86_64`
+- `cargo xtask smoke-bin-exec --arch aarch64`
+- `cargo xtask smoke-ring3-run --arch x86_64`
+- `cargo xtask smoke-ring3-fault --arch aarch64`
 
-#### Step 1: Add `SYS_EXECVE` syscall number
-**Files to modify**: `crates/arrostd/src/lib.rs`
+### Remaining follow-up
 
-1. Add `SYS_EXECVE = 23` to the syscall number constants.
-2. Add `EXECVE` to capability masks (gate it under a new `EXEC` cap or reuse `PROC`).
-3. Bump `ABI_REVISION` to `5`.
-4. Add `execve` to the userland shim if needed.
-
-#### Step 2: Implement ELF parser for filesystem-loaded binaries
-**Files to create**: `kernel/src/proc/elf.rs`
-
-1. Define a minimal ELF64 parser struct that takes a `&[u8]` (file contents read from VFS).
-2. Parse ELF header: verify magic, class (64-bit), endianness, type (ET_EXEC), machine (EM_X86_64 or EM_AARCH64).
-3. Iterate PT_LOAD program headers: extract `p_vaddr`, `p_memsz`, `p_filesz`, `p_offset`, `p_flags`.
-4. Return a `Vec<LoadSegment>` with: `{ vaddr: u64, data: &[u8], memsz: usize, flags: u32 }`.
-5. Return the entry point `e_entry`.
-6. Validate that all `p_vaddr` values fall within the user virtual range (`0x0000_2000_...`).
-7. Return `Err(ENOEXEC)` for invalid ELF files.
-
-#### Step 3: Implement the `execve` kernel handler
-**Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/proc/ring3_groundwork.rs`
-
-1. Add `fn sys_execve(path_ptr: u64, path_len: u64, ctx: &mut Ring3ProcessContext) -> i64` to the syscall dispatch.
-2. Copy the path string from user memory using `copy_from_user`.
-3. Open the file via VFS: `fs::open(path, O_RDONLY)`.
-4. Read the entire file content into a kernel buffer: `fs::fread(fd, buf, len)`.
-5. Close the fd.
-6. Parse the ELF using the parser from Step 2.
-7. Tear down the current process's user mappings (unmap all user pages in the process page table).
-8. Reset the process fd table (close all fds except 0, 1, 2).
-9. Map new ELF segments into the process page table (reuse existing `map_user_page` from ring3_groundwork).
-10. Allocate and map a new user stack.
-11. Set the process entry point to the ELF `e_entry`.
-12. Reset the process trap frame to start execution at the new entry point with the new stack pointer.
-13. Return 0 on success (the process will not return from execve; it starts executing the new image).
-
-#### Step 4: Populate `/bin` with ELF binaries at boot
-**Files to modify**: `kernel/src/fs/mod.rs`, `kernel/src/main.rs`
-
-1. During filesystem initialization, create `/bin/` directory if it doesn't exist.
-2. Write the embedded `ring3_init` and `ring3_doom` ELF bytes into `/bin/init` and `/bin/doom` as regular files.
-3. This bridges the embedded-artifact approach with the filesystem approach: the same bytes are now available both ways.
-4. Future user binaries can be placed on the disk image directly by `xtask` without embedding.
-
-#### Step 5: Update `ring3 run` to use filesystem path
-**Files to modify**: `kernel/src/shell.rs`, `kernel/src/proc/mod.rs`
-
-1. Change `ring3 run init` to internally call the execve path with `/bin/init`.
-2. Change `ring3 run doom` to use `/bin/doom`.
-3. Keep the embedded fallback: if the file doesn't exist in VFS, fall back to the embedded artifact.
-4. Add `ring3 run <path>` that accepts an arbitrary filesystem path.
-
-#### Step 6: Wire execve into the spawn flow
-**Files to modify**: `kernel/src/proc/mod.rs`
-
-1. Add a `spawn_from_path(path: &str) -> Result<Pid, i64>` function that:
-   - Creates a new process entry in the ring-3 table.
-   - Creates a new page table.
-   - Calls the ELF loader with the file from VFS.
-   - Enqueues the process in the scheduler.
-2. Wire this into the `spawn` syscall as an additional variant (app_id=0 means use path from arg1).
-
-#### Step 7: Testing
-1. Run `cargo xtask smoke-ring3-run --arch x86_64` and `--arch aarch64` - should still pass using `/bin/init` and `/bin/doom`.
-2. Add a new smoke test `smoke-execve` that:
-   - Boots the OS.
-   - Writes a minimal test ELF to `/bin/test` (can be the init binary).
-   - Runs `ring3 run /bin/test`.
-   - Verifies the process runs and exits.
-3. Run `cargo xtask smoke-fs` to verify filesystem is not regressed.
-
-#### Step 8: Documentation
-**Files to update**: `docs/PROC.md`, `docs/SYSCALLS.md`, `docs/USERLAND.md`, `docs/FS.md`, `README.md`
+- A true `exec`/`execve` syscall is still future work.
+- ABI revision `5` should be considered only when that syscall lands.
 
 ---
 
@@ -203,7 +141,7 @@ Currently, ring-3 ELF binaries (`ring3_init`, `ring3_doom`) are embedded into th
 **Goal**: Implement `fork()` with CoW pages, demand-paged user mappings, and a basic swap backend.
 
 ### Dependencies
-- M12 (execve) should be complete or nearly complete.
+- M12 (VFS-backed ELF launch groundwork) should be complete; true `exec`/`execve` remains optional follow-up.
 - M14 (Timer-Driven Hard Preemption) is recommended for fork to be useful.
 
 ### Implementation Plan
@@ -403,7 +341,7 @@ Currently, ring-3 processes only yield control back to the kernel when they make
 **Goal**: Expand the syscall ABI toward a broader POSIX-like subset.
 
 ### Dependencies
-- M12 (execve) for `exec` family.
+- M12 (VFS-backed ELF launch groundwork) for running `/bin/*` user binaries; a future true `exec` family still needs separate syscall work.
 - M13 (fork) for `fork`/`wait` family.
 - M14 (timer preemption) for signals.
 
@@ -756,7 +694,7 @@ pub trait AudioDevice {
 **Goal**: Full TCP/IP stack with proper state machine, congestion control, and socket API. Classic Unix network utilities as `/bin/*` executables with standard syntax and behavior.
 
 ### Dependencies
-- M12 (execve) recommended for running utilities as ring-3 binaries.
+- M12 (VFS-backed ELF launch groundwork) recommended for running utilities as ring-3 binaries.
 - M15 (Extended Syscalls) for socket API syscalls.
 
 ### Implementation Plan
@@ -1199,12 +1137,11 @@ Add smoke tests in `xtask/src/main.rs`:
 
 | Priority | Milestone | Rationale |
 |----------|-----------|-----------|
-| 1 | **M12**: Filesystem-backed execve [WIP] | Foundation for running any binary from disk |
-| 2 | **M14**: Timer-Driven Hard Preemption | Required for robust multiprocess runtime |
-| 3 | **M15**: Extended Syscall Surface | Needed by M13, M19 utilities |
-| 4 | **M16**: Extended ProcFS | Needed by M19 utilities for status queries |
-| 5 | **M13**: fork + CoW + Demand Paging | Classic Unix process model |
-| 6 | **M19**: TCP/IP + Unix Utilities | Full networking stack + user tools |
-| 7 | **M11**: KPTI | Security hardening |
-| 8 | **M17**: Full-Data Journaling | Filesystem reliability |
-| 9 | **M18**: Hardware Diversification | Platform portability |
+| 1 | **M14**: Timer-Driven Hard Preemption | Required for robust multiprocess runtime |
+| 2 | **M15**: Extended Syscall Surface | Needed by M13, M19 utilities |
+| 3 | **M16**: Extended ProcFS | Needed by M19 utilities for status queries |
+| 4 | **M13**: fork + CoW + Demand Paging | Classic Unix process model |
+| 5 | **M19**: TCP/IP + Unix Utilities | Full networking stack + user tools |
+| 6 | **M11**: KPTI | Security hardening |
+| 7 | **M17**: Full-Data Journaling | Filesystem reliability |
+| 8 | **M18**: Hardware Diversification | Platform portability |

@@ -15,7 +15,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - UEFI boot on `x86_64` and `aarch64`, with serial diagnostics always available.
 - Windowed framebuffer desktop UI with taskbar, terminal windows, file manager, and Doom viewport.
 - QEMU/virtio-first device stack for block, net, input, and audio.
-- Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external `/bin/*` helpers.
+- Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external runtime helpers.
 - Ring-3 ELF isolation with per-process page-table ownership, dedicated user virtual mappings, and kernel-resume fault containment.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
 - Syscall ABI revision `4`, including filesystem syscalls and per-process fd tables.
@@ -57,7 +57,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Permission enforcement is active in the VFS.
 - Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
 - Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
-- Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists.
+- Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
 
 Representative commands:
 
@@ -72,10 +72,10 @@ Representative commands:
 ### Processes and syscalls
 
 - Cooperative kernel task table for core runtime tasks.
-- Ring-3 multiprocess runtime for embedded ELF apps (`init`, `doom`).
-- Additional external process table for compositor-launched terminals, Doom runtime sessions, and `/bin/*` helper execution.
+- Ring-3 multiprocess runtime for VFS-backed `/bin/*` ELFs plus embedded `ring3 run` smoke/debug apps (`init`, `doom`).
+- Additional external process table for compositor-launched terminals and Doom runtime sessions.
 - Ring-3 scheduling is round-robin with syscall-timeslice preemption.
-- Ring-3 ELF segments and stacks are mapped into a dedicated user virtual range (`0x0000_2000_...`) owned by each process.
+- Ring-3 ELF segments and stacks are mapped into dedicated per-arch user virtual ranges owned by each process (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`).
 - Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
 - `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
 - `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
@@ -115,7 +115,7 @@ Useful runtime commands:
 ## Known limitations
 
 - Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
-- There is no filesystem-backed `execve` path yet; ring-3 apps are still embedded artifacts (`ring3_init`, `ring3_doom`).
+- There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
 - Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
 - The syscall surface is intentionally small and not POSIX-complete.
@@ -202,7 +202,7 @@ Useful environment overrides:
 - `AAVMF_VARS=/path/to/AAVMF_VARS.fd`
 - `ARROST_RING3_BOOT_SMOKE=true|false`
 - `ARROST_RING3_BOOT_SMOKE_FAULT=true|false` (`aarch64` only)
-- `ARROST_RING3_ELF_GROUNDWORK=true|false`
+- `ARROST_RING3_ELF_GROUNDWORK=true|false` (`true` by default for `xtask build/run`; set to `false` only to force the old pre-M12 path)
 
 Notes:
 

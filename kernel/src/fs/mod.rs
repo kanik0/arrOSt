@@ -14,6 +14,9 @@ mod mount;
 mod procfs;
 mod ramfs;
 mod tmpfs;
+mod user_bin_embed {
+    include!(concat!(env!("OUT_DIR"), "/user_vfs_bin_embed.rs"));
+}
 
 use crate::proc::{self, FsIdentity};
 use crate::serial;
@@ -352,7 +355,7 @@ impl FsState {
                     if VfsOps::file_count(&self.diskfs_v2) == 0 {
                         self.seed_defaults_diskfs();
                     } else {
-                        self.ensure_builtin_bins_diskfs();
+                        self.ensure_builtin_bins();
                         let _ = self.diskfs_v2.sync_metadata();
                     }
                 }
@@ -433,8 +436,8 @@ impl FsState {
                 storage_backed: true,
                 file_count: Vfs::file_count(&self.diskfs_v2),
                 used_bytes: Vfs::used_bytes(&self.diskfs_v2),
-                max_files: MAX_FILES,
-                max_file_bytes: MAX_FILE_BYTES,
+                max_files: self.diskfs_v2.max_files(),
+                max_file_bytes: self.diskfs_v2.max_file_bytes(),
             },
         }
     }
@@ -466,6 +469,172 @@ impl FsState {
             current_pid,
             root_backend: self.root_backend_name(),
         }
+    }
+
+    fn proc_generated_text(&self, file: ProcOpenFile) -> Result<String, FsError> {
+        match file {
+            ProcOpenFile::Ps => self.render_proc_ps_text(),
+            ProcOpenFile::FsList {
+                path,
+                path_len,
+                current_pid,
+            } => {
+                let path =
+                    core::str::from_utf8(&path[..path_len]).map_err(|_| FsError::InvalidPath)?;
+                self.render_proc_fslist_text(path, current_pid)
+            }
+            _ => Err(FsError::InvalidPath),
+        }
+    }
+
+    fn proc_generated_stat(&self, file: ProcOpenFile) -> Result<Stat, FsError> {
+        match file {
+            ProcOpenFile::Ps => {
+                let len = self.render_proc_ps_text()?.len();
+                Ok(Stat {
+                    ino: 6,
+                    file_type: FileType::Regular,
+                    mode: 0o444,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    size: len as u32,
+                    created: 0,
+                    modified: 0,
+                    accessed: 0,
+                })
+            }
+            ProcOpenFile::FsList { .. } => {
+                let len = self.proc_generated_text(file)?.len();
+                Ok(Stat {
+                    ino: 7,
+                    file_type: FileType::Regular,
+                    mode: 0o444,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    size: len as u32,
+                    created: 0,
+                    modified: 0,
+                    accessed: 0,
+                })
+            }
+            _ => self.procfs.stat_file(file, self.root_backend_name()),
+        }
+    }
+
+    fn proc_generated_read(
+        &self,
+        file: ProcOpenFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize, FsError> {
+        match file {
+            ProcOpenFile::Ps | ProcOpenFile::FsList { .. } => {
+                let text = self.proc_generated_text(file)?;
+                let bytes = text.as_bytes();
+                let Ok(offset) = usize::try_from(offset) else {
+                    return Ok(0);
+                };
+                if offset >= bytes.len() {
+                    return Ok(0);
+                }
+                let to_copy = out.len().min(bytes.len() - offset);
+                out[..to_copy].copy_from_slice(&bytes[offset..offset + to_copy]);
+                Ok(to_copy)
+            }
+            _ => self
+                .procfs
+                .read_open_file(file, self.root_backend_name(), offset, out),
+        }
+    }
+
+    fn render_proc_ps_text(&self) -> Result<String, FsError> {
+        let mut entries = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+        let count = proc::snapshot_processes(&mut entries);
+        let mut text = String::new();
+        let _ = writeln!(text, "ps: entries={count}");
+        for entry in entries.iter().take(count) {
+            let kind = entry.external_kind;
+            match entry.state {
+                proc::ProcessState::Sleeping { until_tick } => {
+                    let _ = write!(
+                        text,
+                        "pid={} parent={} name={} state=sleep until_tick={} domain={}",
+                        entry.pid,
+                        entry.parent_pid,
+                        entry.name,
+                        until_tick,
+                        entry.domain.as_str()
+                    );
+                }
+                proc::ProcessState::Exited { code } => {
+                    let _ = write!(
+                        text,
+                        "pid={} parent={} name={} state=exited code={} domain={}",
+                        entry.pid,
+                        entry.parent_pid,
+                        entry.name,
+                        code,
+                        entry.domain.as_str()
+                    );
+                }
+                _ => {
+                    let _ = write!(
+                        text,
+                        "pid={} parent={} name={} state={} domain={}",
+                        entry.pid,
+                        entry.parent_pid,
+                        entry.name,
+                        entry.state.as_str(),
+                        entry.domain.as_str()
+                    );
+                }
+            }
+            if let Some(kind) = kind {
+                let _ = write!(text, " kind={kind}");
+            }
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    fn render_proc_fslist_text(
+        &self,
+        target: &str,
+        current_pid: Option<u32>,
+    ) -> Result<String, FsError> {
+        let mut entries = [VfsDirEntry::empty(); 32];
+        let count = self.list_dir(target, &mut entries, current_pid)?;
+        let mut text = String::new();
+        let _ = writeln!(text, "ls: entries={} path={}", count, target);
+        for entry in entries.iter().take(count) {
+            let mut full_path = String::new();
+            if target == "/" {
+                full_path.push('/');
+                full_path.push_str(entry.name_str());
+            } else {
+                full_path.push_str(target.trim_end_matches('/'));
+                full_path.push('/');
+                full_path.push_str(entry.name_str());
+            }
+
+            if entry.file_type == FileType::Directory {
+                let _ = writeln!(text, "{}/", full_path);
+                continue;
+            }
+
+            let executable = self
+                .stat_path(full_path.as_str(), current_pid)
+                .map(|stat| (stat.mode & 0o111) != 0)
+                .unwrap_or(false);
+            if executable {
+                let _ = writeln!(text, "{} (exec)", full_path);
+            } else {
+                let _ = writeln!(text, "{}", full_path);
+            }
+        }
+        Ok(text)
     }
 
     fn dentry_cache(&self) -> &DentryCache {
@@ -589,8 +758,17 @@ impl FsState {
             ResolvedPath::Inode(node) => self.inode_stat(node),
             ResolvedPath::Proc(canonical) => {
                 let resolved = resolve_mount(&canonical);
-                self.procfs
-                    .stat_path(resolved.local_path(), self.procfs_context(current_pid))
+                match resolved.local_path() {
+                    "" | "self" => self
+                        .procfs
+                        .stat_path(resolved.local_path(), self.procfs_context(current_pid)),
+                    local_path => {
+                        let file = self
+                            .procfs
+                            .open_file(local_path, self.procfs_context(current_pid))?;
+                        self.proc_generated_stat(file)
+                    }
+                }
             }
         }
     }
@@ -647,8 +825,10 @@ impl FsState {
             }
             ResolvedPath::Proc(canonical) => {
                 let resolved = resolve_mount(&canonical);
-                self.procfs
-                    .read_file(resolved.local_path(), self.procfs_context(current_pid), out)
+                let file = self
+                    .procfs
+                    .open_file(resolved.local_path(), self.procfs_context(current_pid))?;
+                self.proc_generated_read(file, 0, out)
             }
         }
     }
@@ -737,10 +917,27 @@ impl FsState {
         link_path: &str,
         current_pid: Option<u32>,
     ) -> Result<(), FsError> {
-        let canonical = canonicalize(link_path)?;
-        let (parent_path, name) = split_parent_path(canonical.as_str())?;
         let identity = proc::fs_identity(current_pid);
-        let result = match self.resolve_path(parent_path, true)? {
+        let canonical = if is_canonical_absolute_path(link_path) {
+            None
+        } else {
+            Some(canonicalize(link_path)?)
+        };
+        let link_path = canonical.as_ref().map_or(link_path, CanonicalPath::as_str);
+        let (parent_path, name) = split_parent_path(link_path)?;
+        let parent = if parent_path.len() == 1 && parent_path.as_bytes()[0] == b'/' {
+            let ino = match self.backend {
+                FsBackend::RamFs => self.ramfs.root_inode(),
+                FsBackend::DiskFsV2 => self.diskfs_v2.root_inode(),
+            };
+            ResolvedPath::Inode(ResolvedInode {
+                mount: MountKind::Root,
+                ino,
+            })
+        } else {
+            self.resolve_path(parent_path, true)?
+        };
+        let result = match parent {
             ResolvedPath::Inode(parent) => {
                 let parent_stat = self.inode_stat(parent)?;
                 require_inode_permission(identity, &parent_stat, 0o2)?;
@@ -991,10 +1188,7 @@ impl FsState {
                 self.inode_touch_accessed(ResolvedInode { mount, ino })?;
                 Ok(read)
             }
-            OpenFile::Proc(file) => {
-                self.procfs
-                    .read_open_file(file, self.root_backend_name(), offset, out)
-            }
+            OpenFile::Proc(file) => self.proc_generated_read(file, offset, out),
         }
     }
 
@@ -1027,7 +1221,7 @@ impl FsState {
                 MountKind::Tmp => self.tmpfs.stat(ino),
                 MountKind::Proc => Err(FsError::InvalidPath),
             },
-            OpenFile::Proc(file) => self.procfs.stat_file(file, self.root_backend_name()),
+            OpenFile::Proc(file) => self.proc_generated_stat(file),
         }
     }
 
@@ -1039,7 +1233,7 @@ impl FsState {
         let _ = self
             .ramfs
             .write("/MILESTONE.TXT", b"M2: inode-based diskfs-v2\n");
-        self.ensure_builtin_bins_ramfs();
+        self.ensure_builtin_bins();
     }
 
     fn seed_defaults_diskfs(&mut self) {
@@ -1053,20 +1247,52 @@ impl FsState {
             "/MILESTONE.TXT",
             b"M2: inode-based diskfs-v2\n",
         );
-        self.ensure_builtin_bins_diskfs();
+        self.ensure_builtin_bins();
         let _ = self.diskfs_v2.sync_metadata();
     }
 
-    fn ensure_builtin_bins_ramfs(&mut self) {
+    fn ensure_builtin_bins(&mut self) {
+        match self.mkdir_path("/bin", 0o755, None) {
+            Ok(()) | Err(FsError::AlreadyExists) => {}
+            Err(err) => {
+                serial::write_fmt(format_args!(
+                    "FS: seed /bin mkdir failed ({})\n",
+                    err.as_str()
+                ));
+                return;
+            }
+        }
         for path in BIN_EXEC_PATHS {
-            let _ = self.ramfs.write(path, b"#!/arrost/bin\n");
+            let (data, mode) = builtin_bin_seed_payload(path);
+            if let Err(err) = self.seed_file_with_mode(path, data, mode) {
+                serial::write_fmt(format_args!(
+                    "FS: seed {} failed ({})\n",
+                    path,
+                    err.as_str()
+                ));
+            }
         }
     }
 
-    fn ensure_builtin_bins_diskfs(&mut self) {
-        for path in BIN_EXEC_PATHS {
-            let _ = Vfs::write(&mut self.diskfs_v2, path, b"#!/arrost/bin\n");
+    fn seed_file_with_mode(&mut self, path: &str, data: &[u8], mode: u16) -> Result<(), FsError> {
+        let file = self.open_path(path, None, O_WRONLY | O_CREAT | O_TRUNC)?;
+        let _ = self.write_open_file(file, 0, data)?;
+        self.chmod_path(path, mode, None)
+    }
+}
+
+fn builtin_bin_seed_payload(path: &str) -> (&'static [u8], u16) {
+    match path {
+        "/bin/ls" if !user_bin_embed::ARROST_USER_BIN_LS_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_LS_ELF_BYTES, 0o755)
         }
+        "/bin/cat" if !user_bin_embed::ARROST_USER_BIN_CAT_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_CAT_ELF_BYTES, 0o755)
+        }
+        "/bin/ps" if !user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES, 0o755)
+        }
+        _ => (b"#!/arrost/bin\n", 0o755),
     }
 }
 
@@ -1164,7 +1390,7 @@ pub fn link_file(source: &str, destination: &str) -> Result<(), FsError> {
 }
 
 pub fn symlink_file(target: &str, link_path: &str) -> Result<(), FsError> {
-    symlink_file_for_pid(target, link_path, proc::shell_pid())
+    symlink_file_for_pid(target, link_path, None)
 }
 
 pub fn delete_file_for_pid(path: &str, current_pid: Option<u32>) -> Result<(), FsError> {
@@ -1459,7 +1685,8 @@ enum ResolvedPath {
 }
 
 fn split_parent_path(path: &str) -> Result<(&str, &str), FsError> {
-    if path == "/" {
+    let path_bytes = path.as_bytes();
+    if path_bytes.len() == 1 && path_bytes[0] == b'/' {
         return Err(FsError::IsADirectory);
     }
     let Some(index) = path.rfind('/') else {
@@ -1467,10 +1694,61 @@ fn split_parent_path(path: &str) -> Result<(&str, &str), FsError> {
     };
     let parent = if index == 0 { "/" } else { &path[..index] };
     let name = &path[index + 1..];
-    if name.is_empty() || name == "." || name == ".." {
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty()
+        || (name_bytes.len() == 1 && name_bytes[0] == b'.')
+        || (name_bytes.len() == 2 && name_bytes[0] == b'.' && name_bytes[1] == b'.')
+    {
         return Err(FsError::InvalidPath);
     }
     Ok((parent, name))
+}
+
+fn is_canonical_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_OPEN_PATH_BYTES || bytes[0] != b'/' {
+        return false;
+    }
+    if bytes.len() == 1 {
+        return true;
+    }
+    if bytes[bytes.len() - 1] == b'/' {
+        return false;
+    }
+
+    let mut index = 1usize;
+    while index < bytes.len() {
+        let component_start = index;
+        while index < bytes.len() && bytes[index] != b'/' {
+            if bytes[index].is_ascii_whitespace() {
+                return false;
+            }
+            index += 1;
+        }
+
+        let component_len = index.saturating_sub(component_start);
+        if component_len == 0 {
+            return false;
+        }
+        if component_len == 1 && bytes[component_start] == b'.' {
+            return false;
+        }
+        if component_len == 2
+            && bytes[component_start] == b'.'
+            && bytes[component_start + 1] == b'.'
+        {
+            return false;
+        }
+
+        if index < bytes.len() {
+            index += 1;
+            if index >= bytes.len() || bytes[index] == b'/' {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn list_inode_dir(

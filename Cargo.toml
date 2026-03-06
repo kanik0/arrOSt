@@ -8,14 +8,14 @@ edition = "2024"
 [workspace]
 resolver = "2"
 members = [
-    "kernel",
-    "xtask",
-    "crates/arrostd",
-    "user/init",
-    "user/doom",
-    "boot/aarch64-uefi-loader",
+  "kernel",
+  "xtask",
+  "crates/arrostd",
+  "user/init",
+  "user/doom",
+  "boot/aarch64-uefi-loader",
 ]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
