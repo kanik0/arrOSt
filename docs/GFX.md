@@ -53,9 +53,12 @@ When Doom runtime is active, a dedicated Doom window is opened for viewport + st
 - `ui next`
 - `ui minimize`
 - `fm` and related subcommands
+- GUI terminal supports working-directory aware filesystem commands (`pwd`, `cd`, `ls`, `cat`, `echo`, `stat`, `chmod`, `mkdir`, `mv`, `link`, `symlink`).
+- File-manager commands are path-aware in both serial shell and GUI terminal (`fm list [<path>]`, `fm cd <dir>`, `fm open`, `fm copy`, `fm delete`).
 - GUI terminal command loop includes process controls (`ps`, `kill <pid>`, `waitx <pid|any|all>`) against scheduler-visible entries.
 - `ps`, `doom status`, runtime process controls (`spawn`/`wait`/`waitx`/`ring3 wait`), diagnostics (`syscalls`/`disk`/`mouse`/`ui`/`sync`/`reload`), and network tooling (`net`/`ping`/`udp`/`curl`) in GUI terminal are rendered from internal snapshots/APIs (no serial-mirror dependency).
-- GUI terminal now exposes a filesystem-backed `/bin` namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`; discoverable via `ls /bin`), executed as scheduler-visible external processes.
+- GUI terminal now exposes a filesystem-backed `/bin` namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`, `/bin/link`, `/bin/symlink`; discoverable via `ls /bin`), executed as scheduler-visible external processes.
+- GUI terminal also auto-resolves plain command names like `ls`, `cat`, `ps`, `link`, and `symlink` through that `/bin` namespace when the backing entry exists.
 
 ## Limits
 
@@ -64,6 +67,7 @@ When Doom runtime is active, a dedicated Doom window is opened for viewport + st
 - Glyph sampling is vertically corrected in the compositor, so the generated raster font is rendered upright on screen.
 - UI is optimized for kernel bring-up and debugging, not full desktop UX.
 - Terminal emulator sessions are compositor-managed and intentionally minimal (not yet full VT/ANSI emulation).
+- Terminal working directories are per-window; the file-manager pane tracks its own current path.
 - GUI terminal command set is intentionally smaller than the serial shell command surface.
 
 ## Relevant files

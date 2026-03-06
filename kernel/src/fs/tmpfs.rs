@@ -13,6 +13,7 @@ impl TmpFs {
 
     pub fn ensure_root(&mut self) {
         self.inner.ensure_root();
+        let _ = self.inner.chmod(super::ROOT_INO, 0o777);
     }
 }
 
@@ -37,8 +38,20 @@ impl VfsOps for TmpFs {
         self.inner.write_data(ino, offset, data)
     }
 
+    fn readlink(&self, ino: InodeNum, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.inner.readlink(ino, buf)
+    }
+
+    fn touch_accessed(&mut self, ino: InodeNum) -> Result<(), FsError> {
+        self.inner.touch_accessed(ino)
+    }
+
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError> {
         self.inner.truncate(ino, size)
+    }
+
+    fn chmod(&mut self, ino: InodeNum, mode: u16) -> Result<(), FsError> {
+        self.inner.chmod(ino, mode)
     }
 
     fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
@@ -49,12 +62,36 @@ impl VfsOps for TmpFs {
         self.inner.mkdir(parent, name, mode)
     }
 
+    fn link(&mut self, parent: InodeNum, name: &[u8], target: InodeNum) -> Result<(), FsError> {
+        self.inner.link(parent, name, target)
+    }
+
+    fn symlink(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<InodeNum, FsError> {
+        self.inner.symlink(parent, name, target)
+    }
+
     fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError> {
         self.inner.unlink(parent, name)
     }
 
     fn rmdir(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError> {
         self.inner.rmdir(parent, name)
+    }
+
+    fn rename(
+        &mut self,
+        old_parent: InodeNum,
+        old_name: &[u8],
+        new_parent: InodeNum,
+        new_name: &[u8],
+    ) -> Result<(), FsError> {
+        self.inner
+            .rename(old_parent, old_name, new_parent, new_name)
     }
 
     fn readdir(

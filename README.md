@@ -6,82 +6,117 @@
   <em>A Rust OS, slow-roasted.</em>
 </p>
 
-ArrOSt is an educational 64-bit operating system written in Rust (`no_std`) and designed to run on QEMU with UEFI firmware.
-Supported runtime targets are `x86_64-unknown-none` and `aarch64-unknown-none`.
-`aarch64-unknown-none` boots on QEMU `virt` through an AAVMF/UEFI chainloader path, with firmware framebuffer handoff (`uefi-gop`, `ramfb` default), virtio-mmio transport, and serial-first diagnostics.
+ArrOSt is an educational 64-bit operating system written in Rust (`no_std`) and developed for QEMU-first bring-up.
+The current targets are `x86_64-unknown-none` and `aarch64-unknown-none`, with a UEFI boot path on both architectures.
+The project favors observable behavior, serial-first diagnostics, reproducible smoke coverage, and incremental subsystem work over broad platform support.
 
-The project focuses on practical kernel engineering with observable behavior, reproducible headless tests, and incremental subsystem bring-up.
+## What ArrOSt includes today
+
+- UEFI boot on `x86_64` and `aarch64`, with serial diagnostics always available.
+- Windowed framebuffer desktop UI with taskbar, terminal windows, file manager, and Doom viewport.
+- QEMU/virtio-first device stack for block, net, input, and audio.
+- Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external `/bin/*` helpers.
+- Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
+- Syscall ABI revision `4`, including filesystem syscalls and per-process fd tables.
+- Cross-target build orchestration and smoke automation through `cargo xtask`.
+- DoomGeneric integration with runtime controls, viewport rendering, and virtio-audio preference when available.
 
 ## Repository layout
 
-- `kernel/`: kernel crate (`no_std`) with architecture, memory, interrupts, devices, shell, graphics, networking, and Doom runtime bridge.
-- `crates/arrostd/`: shared ABI/syscall constants for kernel and user crates.
-- `user/init/`: minimal userland metadata crate (ABI contract).
-- `user/doom/`: Doom metadata crate plus C bridge/backend sources.
-- `xtask/`: build orchestration, image creation, and smoke test harnesses.
-- `scripts/`: QEMU and vendor helper scripts.
-- `docs/`: subsystem-level technical documentation.
+- `kernel/`: `no_std` kernel crate with architecture code, memory, interrupts, drivers, process model, filesystem, shell, graphics, and network stack.
+- `crates/arrostd/`: shared ABI, syscall numbers, constants, and userland shim helpers.
+- `user/init/`: embedded ring-3 init app metadata and artifact.
+- `user/doom/`: embedded ring-3 Doom app metadata, Doom bridge code, and DoomGeneric integration sources.
+- `xtask/`: build orchestration, image generation, ABI checks, and QEMU smoke harnesses.
+- `scripts/`: QEMU launch scripts and helper scripts such as DoomGeneric vendoring.
+- `docs/`: subsystem documentation for boot, memory, interrupts, process model, syscalls, storage, filesystem, networking, graphics, userland, and Doom.
 
-## Current status
+## Current implementation snapshot
 
-### Working today
+### Boot and platform
 
-- UEFI boot on QEMU with serial-first diagnostics on both `x86_64-unknown-none` and `aarch64-unknown-none`.
-- Cross-target build support for `x86_64-unknown-none` and `aarch64-unknown-none`.
-- `aarch64` boot on QEMU `virt` via AAVMF/UEFI chainloader with framebuffer UI (`uefi-gop` via `ramfb` by default), serial shell, ring3 preemptive scheduler (syscall-timeslice), virtio block/network over virtio-mmio, DHCP, and diskfs.
-- Physical memory mapping, paging setup, kernel heap, and allocation smoke checks.
-- `x86_64` interrupt path: IDT/GDT/PIC/PIT with keyboard and mouse IRQ handling, plus ring-3 transition groundwork (`user` selectors, TSS `RSP0`, `int 0x80` DPL3 gate).
-- Optional `x86_64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) runs CPL3 `int 0x80` (`getpid/time_ms/exit`) and routes syscall policy/accounting through process-layer context (`pid/caps/name`).
-- `aarch64` interrupt path: EL1 vectors + GICv2 virtual timer IRQ with automatic runtime fallback to counter polling when unexpected IRQ sources are observed.
-- Optional `aarch64` boot smoke (`ARROST_RING3_BOOT_SMOKE=true`) attempts EL0->EL1 `SVC` (`getpid/time_ms/exit`) through lower-EL sync vectors and routes syscall policy/accounting through process-layer context (`pid/caps/name`).
-- Optional `aarch64` fault smoke (`ARROST_RING3_BOOT_SMOKE=true` + `ARROST_RING3_BOOT_SMOKE_FAULT=true`) triggers a controlled EL0 sync fault (`BRK`) and validates kernel fallback/resume.
-- Syscall ABI includes `getpid`, `time_ms`, `cap_get`, `cap_drop`, `spawn`, `waitpid`, and per-task capability enforcement diagnostics.
-- Ring3 runtime now supports preemptive multiprocess scheduling (round-robin, syscall-timeslice) for embedded ELF apps (`init`, `doom`) through non-blocking `ring3 run` enqueue and `ring3 wait` reap.
-- Shell ring3 controls include `ring3 run <init|doom>`, `ring3 ps`, `ring3 wait <pid|any|all>`.
-- Shell command `user apps` exposes cooperative userland app contracts (`id/name/caps/sleep/exit`) sourced from user crates.
-- Shell command `ring3 smoke` runs a cross-platform ring-3 policy smoke (`getpid/time_ms/socket/sendto(bad_ptr)/recvfrom(bad_ptr)/cap_get/cap_drop/exit`) through the shared process-layer syscall context checks.
-- In-kernel serial shell with filesystem, UI, network, and Doom control commands.
-- Framebuffer desktop compositor with top taskbar and `Apps` launcher (`doom`, `terminal`).
-- Taskbar `System` menu with `shutdown` action (graceful stop path: capture off, Doom stop, filesystem sync, halt).
-- Windowed UI includes file manager, on-demand Doom viewport window, and multiple terminal windows.
-- GUI terminal emulator sessions are compositor-managed, multi-instance, and isolated from the serial shell parser/state.
-- Each GUI terminal has its own UI-local PID/TTY identity, input line buffer, and output surface.
-- GUI terminal command handling is API-driven (no serial-output mirroring), including process/runtime diagnostics and network tooling (`net`/`ping`/`udp`/`curl`).
-- Filesystem-backed `/bin` command namespace (`/bin/ls`, `/bin/ps`, `/bin/kill`, `/bin/cat`, `/bin/echo`, `/bin/fm`, `/bin/doom`, `/bin/terminal`) runs as scheduler-visible external processes (`ps`/`kill`/`waitx` lifecycle).
-- Window chrome supports close (`X`) for app windows (terminal kill/close, doom stop/close).
-- Click focus updates z-order (focused window raised to front) and Doom keyboard capture target.
-- Virtio block storage backend with persistent disk image.
-- Filesystem layer with disk-backed and RAM fallback implementations.
-- Virtio network backend with ARP/IPv4, ICMP ping, UDP send/receive, and basic HTTP/UDP curl paths.
-- DoomGeneric integration (`doom play`) with viewport rendering, keyboard capture, and audio path (`virtio-sound` preferred, silent fallback when audio backend is unavailable).
-- Automated smoke tests for Doom normal path, long-run, strict virtio audio, and fallback mode.
+- `x86_64` boots through a UEFI disk image produced by `xtask`.
+- `aarch64` boots on QEMU `virt` through an AAVMF/UEFI chainloader path with staged ESP payloads.
+- `aarch64` runtime uses virtio-mmio discovery, while shared drivers keep a legacy-style register model where needed.
+- Serial diagnostics remain the baseline debugging path even when framebuffer UI is active.
 
-### Not implemented yet
+### Filesystem
 
-- Strong ring-3 process isolation with dedicated user-only page-table ownership per process.
-- Hard preemption without syscall/trap boundary dependence.
-- Full POSIX-like syscall surface.
-- Production-grade TCP/IP stack and broader protocol support.
-- Filesystem hierarchy features beyond current flat file model.
-- Hardware support outside the current QEMU/virtio-first target.
+- Root filesystem mounts `diskfs-v2` when persistent storage is ready, otherwise falls back to `ramfs`.
+- Synthetic mounts:
+  - `/proc` -> read-only `procfs`
+  - `/tmp` -> volatile `tmpfs` with world-writable root (`0777`)
+- `diskfs-v2` provides:
+  - inode-based hierarchical directories
+  - automatic migration from `diskfs-v1`
+  - fixed inode table plus block bitmap allocator
+  - redo-only metadata journal with replay on mount
+- Path resolution is mount-aware and supports `.` / `..`, hard links, symlinks, and `ELOOP` after 8 symlink hops.
+- File metadata tracks `uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, and `ctime`.
+- Permission enforcement is active in the VFS.
+- Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
+- Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
+- Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists.
 
-## Doom integration
+Representative commands:
 
-### What works
+- `pwd`, `cd <dir>`, `ls [<path>]`
+- `cat <file>`, `echo <text> > <file>`
+- `mkdir <dir>`, `mv <src> <dst>`
+- `link <src> <dst>`, `symlink <target> <linkpath>`
+- `stat <path>`, `chmod <mode> <path>`
+- `sync`, `reload`
+- `cat /proc/self/pid`, `cat /proc/mounts`, `cat /proc/uptime`
 
-- `doom play` starts DoomGeneric when sources and WAD are available.
-- Frame output is rendered in a dedicated Doom compositor window.
-- Runtime input supports shell injection (`doom key`/`doom keyup`) and capture mode.
-- Doom capture follows focused Doom window in UI, with serial-shell fallback controls (`doom capture on|off` and `ESC`).
-- Viewport filter can be switched at runtime (`doom view bilinear|nearest`, default `nearest`).
-- Minimal `/arr.cfg` persistence is wired through the Doom shim.
-- PCM pipeline is active with runtime metrics (`doom status`, `doom audio status`).
-- Virtio audio long-run smoke checks are available and enforced.
+### Processes and syscalls
 
-### What is still pending
+- Cooperative kernel task table for core runtime tasks.
+- Ring-3 multiprocess runtime for embedded ELF apps (`init`, `doom`).
+- Additional external process table for compositor-launched terminals, Doom runtime sessions, and `/bin/*` helper execution.
+- Ring-3 scheduling is round-robin with syscall-timeslice preemption.
+- `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
+- `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
+- Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
+- ABI revision is `4`.
 
-- Music/synthesis fidelity vs original Doom output (current synth is functional but not final-quality).
-- Broader gameplay/input polish beyond the current capture and command-based controls.
+Current syscall surface includes:
+
+- lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`
+- capabilities: `cap_get`, `cap_drop`
+- networking: `socket`, `sendto`, `recvfrom`
+- filesystem: `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, `dup2`
+
+Useful runtime commands:
+
+- `user apps`
+- `ring3`
+- `ring3 smoke`
+- `ring3 groundwork`
+- `ring3 run <init|doom>`
+- `ring3 ps`
+- `ring3 wait <pid|any|all>`
+- `ps`
+- `kill <pid|self>`
+- `waitx <pid|any|all>`
+- `syscalls`
+
+### UI, networking, and Doom
+
+- Desktop compositor with taskbar and `Apps` launcher.
+- Multi-window GUI terminal sessions with independent state.
+- File manager backed by the current VFS API.
+- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, and basic `curl` support for UDP and HTTP requests.
+- DoomGeneric runtime with dedicated window, keyboard capture, configurable viewport filter, and audio status/control commands.
+
+## Known limitations
+
+- Ring-3 isolation is still partial: hardware transition exists, but user/kernel separation is not yet production-grade.
+- Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
+- The syscall surface is intentionally small and not POSIX-complete.
+- `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
+- `diskfs-v2` journals metadata only; file data is not journaled.
+- Storage, graphics, and device support remain QEMU/virtio-first.
+- Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.
 
 ## Build
 
@@ -94,39 +129,43 @@ The project focuses on practical kernel engineering with observable behavior, re
   - `clippy`
 - `qemu-system-x86_64`
 - `qemu-system-aarch64`
-- UEFI firmware files (OVMF/edk2 for `x86_64`, AAVMF/edk2 for `aarch64`)
-- C compiler toolchain (`cc`/clang) for Doom bridge objects
+- UEFI firmware files:
+  - OVMF/edk2 for `x86_64`
+  - AAVMF/edk2 for `aarch64`
+- C compiler toolchain (`cc` or clang-compatible) for Doom bridge objects
 
-### Build image
+### Build artifacts
 
 ```bash
 cargo xtask build
 ```
 
-Show `xtask` command usage:
+This produces:
+
+- kernel and user artifacts for `x86_64-unknown-none` and `aarch64-unknown-none`
+- UEFI boot image at `target/x86_64-unknown-none/debug/bootimage-arrost-kernel.bin`
+- shared storage image at `target/x86_64-unknown-none/debug/m6-disk.img`
+- `aarch64` kernel ELF at `target/aarch64-unknown-none/debug/arrost-kernel`
+- `aarch64` UEFI loader at `target/aarch64-unknown-uefi/debug/arrost-aarch64-uefi-loader.efi`
+- staged `aarch64` ESP payload at `target/aarch64-unknown-none/debug/efi/`
+
+Show `xtask` usage:
 
 ```bash
 cargo xtask --help
 ```
 
-This produces:
-
-- kernel + user artifacts for `x86_64-unknown-none` and `aarch64-unknown-none`
-- UEFI boot image at `target/x86_64-unknown-none/debug/bootimage-arrost-kernel.bin`
-- storage image at `target/x86_64-unknown-none/debug/m6-disk.img`
-- aarch64 kernel ELF at `target/aarch64-unknown-none/debug/arrost-kernel`
-- aarch64 UEFI loader at `target/aarch64-unknown-uefi/debug/arrost-aarch64-uefi-loader.efi`
-- staged aarch64 ESP payload at `target/aarch64-unknown-none/debug/efi/` (`EFI/BOOT/BOOTAA64.EFI` + `arrost-kernel`)
-
 ## Run
 
 ### Interactive QEMU
+
+Default (`x86_64`):
 
 ```bash
 cargo xtask run
 ```
 
-aarch64 path:
+`aarch64`:
 
 ```bash
 cargo xtask run --arch aarch64
@@ -145,88 +184,86 @@ Useful environment overrides:
 - `QEMU_CPU=auto|host|qemu64|...`
 - `QEMU_SMP=auto|<cores>`
 - `QEMU_AUDIO=auto|none|coreaudio|wav`
-- `QEMU_FB=auto|ramfb|bochs|none`
 - `QEMU_AUDIO_WAV_PATH=/tmp/arrost.wav`
+- `QEMU_FB=auto|ramfb|bochs|none`
+- `QEMU_INPUT=virtio|ps2`
 - `QEMU_VIRTIO_SND=on|off`
-- `QEMU_INPUT=virtio|ps2` (`x86_64`; `aarch64` run path uses virtio-input)
-- `QEMU_VIRTIO_BUS=mmio|auto` (`pci` is accepted as alias but forced to `mmio` on `aarch64`)
-- `QEMU_GIC_VERSION=2|3|max` (`aarch64`)
-- `ARROST_RING3_BOOT_SMOKE=true|false` (`x86_64`: CPL3 `int 0x80`; `aarch64`: EL0 `SVC` lower-EL sync; optional boot-time `getpid/time_ms/exit` smoke sequence)
-- `ARROST_RING3_BOOT_SMOKE_FAULT=true|false` (`aarch64` only: optional controlled EL0 fault variant for boot smoke fallback/resume checks)
+- `QEMU_VIRTIO_BUS=mmio|auto`
+- `QEMU_GIC_VERSION=2|3|max`
+- `OVMF_CODE=/path/to/OVMF_CODE.fd`
+- `OVMF_VARS=/path/to/OVMF_VARS.fd`
 - `AAVMF_CODE=/path/to/AAVMF_CODE.fd`
 - `AAVMF_VARS=/path/to/AAVMF_VARS.fd`
+- `ARROST_RING3_BOOT_SMOKE=true|false`
+- `ARROST_RING3_BOOT_SMOKE_FAULT=true|false` (`aarch64` only)
+- `ARROST_RING3_ELF_GROUNDWORK=true|false`
 
-Note: on macOS, `scripts/qemu-aarch64.sh` resolves `QEMU_ACCEL=auto` to `hvf` when available, with `tcg` fallback.
-Note: `QEMU_FB=auto` prefers `ramfb` (firmware GOP handoff path) and falls back to `bochs-display` when needed.
-Note: on `aarch64`, kernel-side audio uses virtio-sound when a host audio backend is available.
+Notes:
 
-Suggested Doom performance profile (host-dependent):
-
-```bash
-QEMU_ACCEL=auto QEMU_CPU=auto QEMU_SMP=auto cargo xtask run
-```
+- On `aarch64`, virtio runs through virtio-mmio; `pci` aliases are forced back to `mmio`.
+- `QEMU_FB=auto` prefers firmware framebuffer handoff (`ramfb`) when available.
+- `ARROST_DISABLE_DENTRY_CACHE=1` is a build-time switch that disables the dentry cache in the compiled kernel.
 
 ### Doom prerequisites
 
-- Vendor DoomGeneric sources:
+Vendor DoomGeneric sources:
 
 ```bash
 scripts/vendor_doomgeneric.sh
 ```
 
-The script is idempotent and also repairs incomplete/inconsistent local checkouts of `user/doom/third_party/doomgeneric`.
-
-- Place WAD at:
+Place the WAD at:
 
 ```text
 user/doom/wad/doom1.wad
 ```
 
-## Test
+## Validation
 
 ### Formatting and lint
 
 ```bash
 cargo fmt --all
-cargo clippy -p xtask -- -D warnings
+cargo clippy -p xtask --all-targets -- -D warnings
 cargo clippy -p arrost-kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
 cargo build -p arrost-kernel --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 ```
 
-### Unit tests
+### ABI and unit checks
 
 ```bash
 cargo xtask abi-check
-# opzionale: limita ai check ABI build-only di una singola architettura
 cargo xtask abi-check --arch x86_64
 cargo xtask abi-check --arch aarch64
-# opzionale: multi-target esplicito (equivalente al default)
-cargo xtask abi-check --arch x86_64 --arch aarch64
 cargo test -p xtask
 cargo test -p arrost-user-init
 cargo test -p arrost-user-doom
 ```
 
-### QEMU smoke tests
+### QEMU smoke suites
 
-```bash
-cargo xtask smoke-doom --arch x86_64
-cargo xtask smoke-doom --arch aarch64
-cargo xtask smoke-doom-long --arch x86_64
-cargo xtask smoke-doom-long --arch aarch64
-cargo xtask smoke-doom-virtio --arch aarch64
-cargo xtask smoke-doom-fallback --arch x86_64
-cargo xtask smoke-doom-fallback --arch aarch64
-cargo xtask smoke-proc-caps --arch x86_64
-cargo xtask smoke-proc-caps --arch aarch64
-cargo xtask smoke-proc-spawn --arch x86_64
-cargo xtask smoke-proc-spawn --arch aarch64
-cargo xtask smoke-ring3 --arch x86_64
-cargo xtask smoke-ring3 --arch aarch64
-cargo xtask smoke-ring3-run --arch x86_64
-cargo xtask smoke-ring3-run --arch aarch64
-cargo xtask smoke-ring3-fault --arch aarch64
-```
+Representative smoke commands:
+
+- `cargo xtask smoke-doom --arch x86_64`
+- `cargo xtask smoke-doom --arch aarch64`
+- `cargo xtask smoke-doom-long --arch x86_64`
+- `cargo xtask smoke-doom-long --arch aarch64`
+- `cargo xtask smoke-doom-virtio --arch aarch64`
+- `cargo xtask smoke-doom-fallback --arch x86_64`
+- `cargo xtask smoke-doom-fallback --arch aarch64`
+- `cargo xtask smoke-proc-caps --arch x86_64`
+- `cargo xtask smoke-proc-caps --arch aarch64`
+- `cargo xtask smoke-proc-spawn --arch x86_64`
+- `cargo xtask smoke-proc-spawn --arch aarch64`
+- `cargo xtask smoke-bin-exec --arch x86_64`
+- `cargo xtask smoke-bin-exec --arch aarch64`
+- `cargo xtask smoke-fs --arch x86_64`
+- `cargo xtask smoke-fs --arch aarch64`
+- `cargo xtask smoke-ring3 --arch x86_64`
+- `cargo xtask smoke-ring3 --arch aarch64`
+- `cargo xtask smoke-ring3-run --arch x86_64`
+- `cargo xtask smoke-ring3-run --arch aarch64`
+- `cargo xtask smoke-ring3-fault --arch aarch64`
 
 ## Documentation index
 
@@ -244,4 +281,4 @@ cargo xtask smoke-ring3-fault --arch aarch64
 
 ## License
 
-Apache-2.0 (see workspace metadata in `Cargo.toml`).
+Apache-2.0.

@@ -194,6 +194,7 @@ pub mod syscall {
         pub const EMFILE: isize = -24;
         pub const ENOSPC: isize = -28;
         pub const ENOSYS: isize = -38;
+        pub const ELOOP: isize = -40;
         pub const EBADF: isize = -9;
         pub const EMSGSIZE: isize = -90;
         pub const EPROTONOSUPPORT: isize = -93;
@@ -213,6 +214,7 @@ pub mod syscall {
                 EMFILE => "EMFILE",
                 ENOSPC => "ENOSPC",
                 ENOSYS => "ENOSYS",
+                ELOOP => "ELOOP",
                 EBADF => "EBADF",
                 EMSGSIZE => "EMSGSIZE",
                 EPROTONOSUPPORT => "EPROTONOSUPPORT",
@@ -344,6 +346,7 @@ mod tests {
         assert_eq!(syscall::errno::name(syscall::errno::ENOENT), "ENOENT");
         assert_eq!(syscall::errno::name(syscall::errno::EINVAL), "EINVAL");
         assert_eq!(syscall::errno::name(syscall::errno::ENOSYS), "ENOSYS");
+        assert_eq!(syscall::errno::name(syscall::errno::ELOOP), "ELOOP");
         assert_eq!(syscall::errno::name(syscall::errno::EMFILE), "EMFILE");
         assert_eq!(syscall::errno::name(syscall::errno::EAGAIN), "EAGAIN");
         assert_eq!(

@@ -75,16 +75,6 @@ impl DiskFs {
         self.mount_or_format()
     }
 
-    pub fn remount(&mut self) -> Result<(), FsError> {
-        self.mounted = false;
-        self.init()
-    }
-
-    pub fn sync_metadata(&mut self) -> Result<(), FsError> {
-        self.ensure_mounted()?;
-        self.persist_metadata()
-    }
-
     fn ensure_mounted(&mut self) -> Result<(), FsError> {
         if self.mounted {
             return Ok(());

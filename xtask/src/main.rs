@@ -33,6 +33,7 @@ const DOOM_GENERIC_INCLUDE_DIR: &str = "user/doom/third_party/doomgeneric/doomge
 const DOOM_GENERIC_PORT_SOURCE: &str = "user/doom/c/doomgeneric_arrost.c";
 const DOOM_WAD_HINT: &str = "user/doom/wad/doom1.wad";
 const DOOM_FORCE_FALLBACK_ENV: &str = "ARROST_DOOM_FORCE_FALLBACK";
+const FS_TRACE_DENTRY_ENV: &str = "ARROST_FS_TRACE_DENTRY";
 const RING3_BOOT_SMOKE_ENV: &str = "ARROST_RING3_BOOT_SMOKE";
 const RING3_BOOT_SMOKE_FAULT_ENV: &str = "ARROST_RING3_BOOT_SMOKE_FAULT";
 const RING3_ELF_GROUNDWORK_ENV: &str = "ARROST_RING3_ELF_GROUNDWORK";
@@ -42,7 +43,7 @@ const USER_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_DOOM_ELF_HINT";
 const USER_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -86,6 +87,7 @@ enum TopLevelCommand {
     SmokeProcCaps,
     SmokeProcSpawn,
     SmokeBinExec,
+    SmokeFs,
     SmokeRing3,
     SmokeRing3Run,
     SmokeRing3Fault,
@@ -116,6 +118,22 @@ struct DoomGenericArtifact {
     wad_present: bool,
 }
 
+#[derive(Clone, Copy)]
+struct BuildVersionEnv<'a> {
+    build_count: &'a str,
+    major: &'a str,
+    minor: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct SecondaryBuildOptions {
+    force_fallback: bool,
+    ring3_boot_smoke: bool,
+    ring3_boot_smoke_fault: bool,
+    ring3_elf_groundwork: bool,
+    trace_dentry: bool,
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let top_level = parse_top_level_command(args.next().as_deref());
@@ -134,6 +152,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeProcCaps) => smoke_proc_caps(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcSpawn) => smoke_proc_spawn(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeBinExec) => smoke_bin_exec(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeFs) => smoke_fs(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Fault) => smoke_ring3_fault(parse_run_arch_arg(args)?),
@@ -161,6 +180,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-proc-caps") => Ok(TopLevelCommand::SmokeProcCaps),
         Some("smoke-proc-spawn") => Ok(TopLevelCommand::SmokeProcSpawn),
         Some("smoke-bin-exec") => Ok(TopLevelCommand::SmokeBinExec),
+        Some("smoke-fs") => Ok(TopLevelCommand::SmokeFs),
         Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
         Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
         Some("smoke-ring3-fault") => Ok(TopLevelCommand::SmokeRing3Fault),
@@ -262,7 +282,13 @@ fn parse_abi_check_arch_args(args: impl Iterator<Item = String>) -> Result<Vec<R
 }
 
 fn build() -> Result<()> {
-    build_impl(env_truthy(DOOM_FORCE_FALLBACK_ENV), false, false, None)
+    build_impl(
+        env_truthy(DOOM_FORCE_FALLBACK_ENV),
+        false,
+        false,
+        None,
+        false,
+    )
 }
 
 fn build_impl(
@@ -270,6 +296,7 @@ fn build_impl(
     ring3_boot_smoke: bool,
     ring3_boot_smoke_fault: bool,
     ring3_elf_groundwork_override: Option<bool>,
+    trace_dentry: bool,
 ) -> Result<()> {
     let build_count = next_build_count()?;
     let ring3_elf_groundwork =
@@ -470,6 +497,10 @@ fn build_impl(
                 "false"
             },
         )
+        .env(
+            FS_TRACE_DENTRY_ENV,
+            if trace_dentry { "true" } else { "false" },
+        )
         .args([
             "build",
             "-p",
@@ -504,58 +535,58 @@ fn build_impl(
         .context("failed to create UEFI disk image")?;
 
     build_secondary_target(
-        &build_count_env,
-        &major_env,
-        &minor_env,
-        force_fallback,
-        ring3_boot_smoke,
-        ring3_boot_smoke_fault,
-        ring3_elf_groundwork,
+        BuildVersionEnv {
+            build_count: &build_count_env,
+            major: &major_env,
+            minor: &minor_env,
+        },
+        SecondaryBuildOptions {
+            force_fallback,
+            ring3_boot_smoke,
+            ring3_boot_smoke_fault,
+            ring3_elf_groundwork,
+            trace_dentry,
+        },
     )?;
 
     Ok(())
 }
 
 fn build_secondary_target(
-    build_count_env: &str,
-    major_env: &str,
-    minor_env: &str,
-    force_fallback: bool,
-    ring3_boot_smoke: bool,
-    ring3_boot_smoke_fault: bool,
-    ring3_elf_groundwork: bool,
+    version: BuildVersionEnv<'_>,
+    options: SecondaryBuildOptions,
 ) -> Result<()> {
     println!("ArrOSt target build: {KERNEL_TARGET_AARCH64}");
 
     let _user_init = build_userland_package(
         USER_INIT_PACKAGE,
         KERNEL_TARGET_AARCH64,
-        build_count_env,
-        major_env,
-        minor_env,
+        version.build_count,
+        version.major,
+        version.minor,
     )?;
     let user_doom = build_userland_package(
         USER_DOOM_PACKAGE,
         KERNEL_TARGET_AARCH64,
-        build_count_env,
-        major_env,
-        minor_env,
+        version.build_count,
+        version.major,
+        version.minor,
     )?;
     let user_init_elf = build_userland_binary(
         USER_INIT_PACKAGE,
         USER_INIT_RING3_BIN,
         KERNEL_TARGET_AARCH64,
-        build_count_env,
-        major_env,
-        minor_env,
+        version.build_count,
+        version.major,
+        version.minor,
     )?;
     let user_doom_elf = build_userland_binary(
         USER_DOOM_PACKAGE,
         USER_DOOM_RING3_BIN,
         KERNEL_TARGET_AARCH64,
-        build_count_env,
-        major_env,
-        minor_env,
+        version.build_count,
+        version.major,
+        version.minor,
     )?;
     let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET_AARCH64)?;
     let doom_generic = build_doom_generic_artifact(KERNEL_TARGET_AARCH64)?;
@@ -579,17 +610,17 @@ fn build_secondary_target(
         doom_generic.wad_hint.display(),
         doom_generic.wad_present
     );
-    let doom_generic_ready_for_kernel = doom_generic.ready && !force_fallback;
-    if force_fallback {
+    let doom_generic_ready_for_kernel = doom_generic.ready && !options.force_fallback;
+    if options.force_fallback {
         println!(
             "ArrOSt doomgeneric ({KERNEL_TARGET_AARCH64}): forcing ready=false for kernel metadata ({DOOM_FORCE_FALLBACK_ENV}=true)"
         );
     }
 
     let status = Command::new("cargo")
-        .env("ARROST_BUILD_COUNT", build_count_env)
-        .env("ARROST_VERSION_MAJOR", major_env)
-        .env("ARROST_VERSION_MINOR", minor_env)
+        .env("ARROST_BUILD_COUNT", version.build_count)
+        .env("ARROST_VERSION_MAJOR", version.major)
+        .env("ARROST_VERSION_MINOR", version.minor)
         .env("ARROST_DOOM_APP", "doom")
         .env(
             "ARROST_DOOM_ARTIFACT_HINT",
@@ -698,11 +729,15 @@ fn build_secondary_target(
         )
         .env(
             RING3_BOOT_SMOKE_ENV,
-            if ring3_boot_smoke { "true" } else { "false" },
+            if options.ring3_boot_smoke {
+                "true"
+            } else {
+                "false"
+            },
         )
         .env(
             RING3_BOOT_SMOKE_FAULT_ENV,
-            if ring3_boot_smoke_fault {
+            if options.ring3_boot_smoke_fault {
                 "true"
             } else {
                 "false"
@@ -710,7 +745,15 @@ fn build_secondary_target(
         )
         .env(
             RING3_ELF_GROUNDWORK_ENV,
-            if ring3_elf_groundwork {
+            if options.ring3_elf_groundwork {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            FS_TRACE_DENTRY_ENV,
+            if options.trace_dentry {
                 "true"
             } else {
                 "false"
@@ -1237,9 +1280,9 @@ fn smoke_doom_virtio(arch_override: Option<String>) -> Result<()> {
 
 fn smoke_doom_fallback(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
-    build_impl(true, false, false, None)?;
+    build_impl(true, false, false, None, false)?;
     let smoke_result = smoke_doom_impl(arch, false, true, false);
-    let restore_result = build_impl(false, false, false, None);
+    let restore_result = build_impl(false, false, false, None, false);
     match smoke_result {
         Ok(()) => {
             restore_result?;
@@ -1728,6 +1771,8 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             "/bin/fm (exec)",
             "/bin/doom (exec)",
             "/bin/terminal (exec)",
+            "/bin/link (exec)",
+            "/bin/symlink (exec)",
         ] {
             wait_for_log(
                 &log,
@@ -1737,7 +1782,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             )?;
         }
 
-        send_serial_command(stdin, "/bin/ps\n")?;
+        send_serial_command(stdin, "ps\n")?;
         wait_for_log(
             &log,
             "name=/bin/ps",
@@ -1875,6 +1920,90 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             "BINSMOKE.TXT",
             Duration::from_secs(8),
             "bin fm open target marker",
+        )?;
+
+        send_serial_command(stdin, "echo hard-smoke > LINKSRC.TXT\n")?;
+        wait_for_log(
+            &log,
+            "LINKSRC.TXT",
+            Duration::from_secs(8),
+            "hard-link source creation",
+        )?;
+
+        send_serial_command(stdin, "link LINKSRC.TXT LINKDST.TXT\n")?;
+        wait_for_log(
+            &log,
+            "link: /LINKSRC.TXT -> /LINKDST.TXT",
+            Duration::from_secs(8),
+            "hard-link creation output",
+        )?;
+
+        send_serial_command(stdin, "fm delete LINKSRC.TXT\n")?;
+        wait_for_log(
+            &log,
+            "fm: deleted /LINKSRC.TXT",
+            Duration::from_secs(8),
+            "hard-link source deletion",
+        )?;
+
+        send_serial_command(stdin, "cat LINKDST.TXT\n")?;
+        wait_for_log(
+            &log,
+            "LINKDST.TXT",
+            Duration::from_secs(8),
+            "hard-link cat target marker",
+        )?;
+        wait_for_log(
+            &log,
+            "hard-smoke",
+            Duration::from_secs(8),
+            "hard-link preserved payload",
+        )?;
+
+        send_serial_command(stdin, "symlink LINKDST.TXT LINKSYM.TXT\n")?;
+        wait_for_log(
+            &log,
+            "symlink: /LINKSYM.TXT -> LINKDST.TXT",
+            Duration::from_secs(8),
+            "symlink creation output",
+        )?;
+
+        send_serial_command(stdin, "cat LINKSYM.TXT\n")?;
+        wait_for_log(
+            &log,
+            "LINKSYM.TXT",
+            Duration::from_secs(8),
+            "symlink cat target marker",
+        )?;
+        wait_for_log(
+            &log,
+            "hard-smoke",
+            Duration::from_secs(8),
+            "symlink followed payload",
+        )?;
+
+        send_serial_command(stdin, "symlink LOOP_B LOOP_A\n")?;
+        wait_for_log(
+            &log,
+            "symlink: /LOOP_A -> LOOP_B",
+            Duration::from_secs(8),
+            "loop symlink A creation",
+        )?;
+
+        send_serial_command(stdin, "symlink LOOP_A LOOP_B\n")?;
+        wait_for_log(
+            &log,
+            "symlink: /LOOP_B -> LOOP_A",
+            Duration::from_secs(8),
+            "loop symlink B creation",
+        )?;
+
+        send_serial_command(stdin, "cat LOOP_A\n")?;
+        wait_for_log(
+            &log,
+            "cat: /LOOP_A (eloop)",
+            Duration::from_secs(8),
+            "symlink loop detection",
         )?;
 
         send_serial_command(stdin, "/bin/doom status\n")?;
@@ -2065,6 +2194,492 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
     Ok(())
 }
 
+fn smoke_fs(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
+    let restore_ring3_elf_groundwork = env_truthy(RING3_ELF_GROUNDWORK_ENV);
+
+    build_impl(restore_force_fallback, false, false, Some(true), true)?;
+    let smoke_result = smoke_fs_impl(arch);
+    let restore_result = build_impl(
+        restore_force_fallback,
+        false,
+        false,
+        Some(restore_ring3_elf_groundwork),
+        false,
+    );
+    match smoke_result {
+        Ok(()) => {
+            restore_result?;
+            Ok(())
+        }
+        Err(smoke_err) => {
+            if let Err(restore_err) = restore_result {
+                return Err(smoke_err.context(format!(
+                    "fs smoke failed and restoring prior ELF groundwork state failed: {restore_err:#}"
+                )));
+            }
+            Err(smoke_err)
+        }
+    }
+}
+
+fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
+    let _ = reset_storage_disk_image()?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-fs";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        send_serial_command(stdin, "pwd\n")?;
+        wait_for_line_after(
+            &log,
+            "pwd",
+            "/",
+            Duration::from_secs(8),
+            "initial pwd output",
+        )?;
+
+        send_serial_command(stdin, "cd /bin\n")?;
+        wait_for_log(&log, "cd /bin", Duration::from_secs(8), "cd /bin echo")?;
+        send_serial_command(stdin, "pwd\n")?;
+        wait_for_line_after(
+            &log,
+            "pwd",
+            "/bin",
+            Duration::from_secs(8),
+            "pwd after cd /bin",
+        )?;
+
+        send_serial_command(stdin, "ls\n")?;
+        wait_for_log(
+            &log,
+            "ls: entries=",
+            Duration::from_secs(8),
+            "ls in /bin header",
+        )?;
+        let ls_bin_snapshot = snapshot_log(&log);
+        let Some(ls_bin_header) = last_matching_line(&ls_bin_snapshot, "ls: entries=") else {
+            bail!("missing ls output header for /bin");
+        };
+        if !ls_bin_header.contains("path=/bin") {
+            bail!("expected ls header for /bin, got `{ls_bin_header}`");
+        }
+        let Some(first_bin_entry) = line_after_matching(&ls_bin_snapshot, "ls: entries=") else {
+            bail!("missing ls output entry for /bin");
+        };
+        if first_bin_entry.trim() != "ls" {
+            bail!("expected first /bin entry to be `ls`, got `{first_bin_entry}`");
+        }
+
+        send_serial_command(stdin, "cd ..\n")?;
+        wait_for_log(&log, "cd ..", Duration::from_secs(8), "cd .. echo")?;
+        send_serial_command(stdin, "pwd\n")?;
+        wait_for_line_after(&log, "pwd", "/", Duration::from_secs(8), "pwd after cd ..")?;
+
+        send_serial_command(stdin, "mkdir /home\n")?;
+        wait_for_log(
+            &log,
+            "mkdir: /home mode=0o755",
+            Duration::from_secs(8),
+            "mkdir output",
+        )?;
+        send_serial_command(stdin, "echo test > /home/file.txt\n")?;
+        wait_for_log(
+            &log,
+            "/home/file.txt",
+            Duration::from_secs(8),
+            "echo /home/file.txt output",
+        )?;
+        send_serial_command(stdin, "cat /home/file.txt\n")?;
+        wait_for_log(
+            &log,
+            "/home/file.txt",
+            Duration::from_secs(8),
+            "cat /home/file.txt header",
+        )?;
+        wait_for_log(
+            &log,
+            "test",
+            Duration::from_secs(8),
+            "cat /home/file.txt payload",
+        )?;
+
+        send_serial_command(stdin, "echo cache-smoke > /DCACHE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/DCACHE.TXT",
+            Duration::from_secs(8),
+            "DCACHE create output",
+        )?;
+        send_serial_command(stdin, "cat /DCACHE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: 11 bytes from /DCACHE.TXT",
+            Duration::from_secs(8),
+            "DCACHE first cat header",
+        )?;
+        send_serial_command(stdin, "cat /DCACHE.TXT\n")?;
+        wait_for_log(
+            &log,
+            "dentry: hit path=/DCACHE.TXT",
+            Duration::from_secs(8),
+            "DCACHE cache hit",
+        )?;
+
+        send_serial_command(stdin, "echo rename-cache > /DENTRYOLD.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/DENTRYOLD.TXT",
+            Duration::from_secs(8),
+            "DENTRYOLD create output",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYOLD.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: 12 bytes from /DENTRYOLD.TXT",
+            Duration::from_secs(8),
+            "DENTRYOLD first cat header",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYOLD.TXT\n")?;
+        wait_for_log(
+            &log,
+            "dentry: hit path=/DENTRYOLD.TXT",
+            Duration::from_secs(8),
+            "DENTRYOLD cache hit",
+        )?;
+        send_serial_command(stdin, "mv /DENTRYOLD.TXT /DENTRYNEW.TXT\n")?;
+        wait_for_log(
+            &log,
+            "mv: /DENTRYOLD.TXT -> /DENTRYNEW.TXT",
+            Duration::from_secs(8),
+            "DENTRY rename output",
+        )?;
+        wait_for_log(
+            &log,
+            "dentry: invalidate reason=rename",
+            Duration::from_secs(8),
+            "DENTRY rename invalidation",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYOLD.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: /DENTRYOLD.TXT (not_found)",
+            Duration::from_secs(8),
+            "DENTRYOLD stale path miss",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYNEW.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: 12 bytes from /DENTRYNEW.TXT",
+            Duration::from_secs(8),
+            "DENTRYNEW cat header",
+        )?;
+
+        send_serial_command(stdin, "echo unlink-cache > /DENTRYUNLINK.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/DENTRYUNLINK.TXT",
+            Duration::from_secs(8),
+            "DENTRYUNLINK create output",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYUNLINK.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: 12 bytes from /DENTRYUNLINK.TXT",
+            Duration::from_secs(8),
+            "DENTRYUNLINK first cat header",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYUNLINK.TXT\n")?;
+        wait_for_log(
+            &log,
+            "dentry: hit path=/DENTRYUNLINK.TXT",
+            Duration::from_secs(8),
+            "DENTRYUNLINK cache hit",
+        )?;
+        send_serial_command(stdin, "fm delete /DENTRYUNLINK.TXT\n")?;
+        wait_for_log(
+            &log,
+            "fm: deleted /DENTRYUNLINK.TXT",
+            Duration::from_secs(8),
+            "DENTRYUNLINK delete output",
+        )?;
+        wait_for_log(
+            &log,
+            "dentry: invalidate reason=unlink",
+            Duration::from_secs(8),
+            "DENTRYUNLINK invalidation",
+        )?;
+        send_serial_command(stdin, "cat /DENTRYUNLINK.TXT\n")?;
+        wait_for_log(
+            &log,
+            "cat: /DENTRYUNLINK.TXT (not_found)",
+            Duration::from_secs(8),
+            "DENTRYUNLINK stale path miss",
+        )?;
+
+        send_serial_command(stdin, "echo move-smoke > /old.txt\n")?;
+        wait_for_log(
+            &log,
+            "/old.txt",
+            Duration::from_secs(8),
+            "old file create output",
+        )?;
+        send_serial_command(stdin, "mv /old.txt /new.txt\n")?;
+        wait_for_log(
+            &log,
+            "mv: /old.txt -> /new.txt",
+            Duration::from_secs(8),
+            "mv output",
+        )?;
+        send_serial_command(stdin, "cat /new.txt\n")?;
+        wait_for_log(
+            &log,
+            "/new.txt",
+            Duration::from_secs(8),
+            "cat /new.txt header",
+        )?;
+        wait_for_log(
+            &log,
+            "move-smoke",
+            Duration::from_secs(8),
+            "cat /new.txt payload",
+        )?;
+
+        send_serial_command(stdin, "stat /README.TXT\n")?;
+        wait_for_log(
+            &log,
+            "stat: path=/README.TXT",
+            Duration::from_secs(8),
+            "README stat output",
+        )?;
+        let readme_stat_snapshot = snapshot_log(&log);
+        let Some(readme_stat_line) =
+            last_matching_line(&readme_stat_snapshot, "stat: path=/README.TXT")
+        else {
+            bail!("missing README stat line");
+        };
+        if !readme_stat_line.contains("uid=0") || !readme_stat_line.contains("gid=0") {
+            bail!("expected README stat to report uid=0 gid=0");
+        }
+
+        send_serial_command(stdin, "echo stamp-one > /STAMP.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/STAMP.TXT",
+            Duration::from_secs(8),
+            "STAMP create output",
+        )?;
+        send_serial_command(stdin, "stat /STAMP.TXT\n")?;
+        wait_for_log(
+            &log,
+            "stat: path=/STAMP.TXT",
+            Duration::from_secs(8),
+            "initial STAMP stat",
+        )?;
+        let stamp_stat_snapshot = snapshot_log(&log);
+        let Some(stamp_stat_line_1) =
+            last_matching_line(&stamp_stat_snapshot, "stat: path=/STAMP.TXT")
+        else {
+            bail!("missing initial STAMP stat line");
+        };
+        let Some(stamp_mtime_1) = parse_metric_value(stamp_stat_line_1, "mtime=") else {
+            bail!("missing mtime in initial STAMP stat");
+        };
+        let Some(stamp_atime_1) = parse_metric_value(stamp_stat_line_1, "atime=") else {
+            bail!("missing atime in initial STAMP stat");
+        };
+
+        thread::sleep(Duration::from_millis(60));
+        send_serial_command(stdin, "echo stamp-two > /STAMP.TXT\n")?;
+        wait_for_log(
+            &log,
+            "/STAMP.TXT",
+            Duration::from_secs(8),
+            "STAMP overwrite output",
+        )?;
+        send_serial_command(stdin, "stat /STAMP.TXT\n")?;
+        let stamp_stat_line_2 = wait_for_new_matching_line(
+            &log,
+            "stat: path=/STAMP.TXT",
+            stamp_stat_line_1,
+            Duration::from_secs(8),
+            "second STAMP stat",
+        )?;
+        let Some(stamp_mtime_2) = parse_metric_value(&stamp_stat_line_2, "mtime=") else {
+            bail!("missing mtime in second STAMP stat");
+        };
+        let Some(stamp_atime_2) = parse_metric_value(&stamp_stat_line_2, "atime=") else {
+            bail!("missing atime in second STAMP stat");
+        };
+        if stamp_mtime_2 <= stamp_mtime_1 {
+            bail!(
+                "expected STAMP mtime to increase after write (before={} after={})",
+                stamp_mtime_1,
+                stamp_mtime_2
+            );
+        }
+        if stamp_atime_2 < stamp_atime_1 {
+            bail!("expected STAMP atime to stay monotonic across stats");
+        }
+
+        thread::sleep(Duration::from_millis(60));
+        send_serial_command(stdin, "cat /STAMP.TXT\n")?;
+        wait_for_log(
+            &log,
+            "stamp-two",
+            Duration::from_secs(8),
+            "STAMP cat payload",
+        )?;
+        send_serial_command(stdin, "stat /STAMP.TXT\n")?;
+        let stamp_stat_line_3 = wait_for_new_matching_line(
+            &log,
+            "stat: path=/STAMP.TXT",
+            &stamp_stat_line_2,
+            Duration::from_secs(8),
+            "third STAMP stat",
+        )?;
+        let Some(stamp_atime_3) = parse_metric_value(&stamp_stat_line_3, "atime=") else {
+            bail!("missing atime in third STAMP stat");
+        };
+        if stamp_atime_3 <= stamp_atime_2 {
+            bail!(
+                "expected STAMP atime to increase after read (before={} after={})",
+                stamp_atime_2,
+                stamp_atime_3
+            );
+        }
+
+        send_serial_command(stdin, "chmod 700 /README.TXT\n")?;
+        wait_for_log(
+            &log,
+            "chmod: /README.TXT mode=0o700",
+            Duration::from_secs(8),
+            "chmod README output",
+        )?;
+        send_serial_command(stdin, "stat /README.TXT\n")?;
+        wait_for_log(
+            &log,
+            "mode=0o100700",
+            Duration::from_secs(8),
+            "README chmod stat mode",
+        )?;
+
+        send_serial_command(stdin, "ring3 groundwork\n")?;
+        wait_for_log(
+            &log,
+            "ring3(groundwork):",
+            Duration::from_secs(12),
+            "ring3 groundwork output",
+        )?;
+        let groundwork_snapshot = snapshot_log(&log);
+        let Some(groundwork_line) = last_matching_line(&groundwork_snapshot, "ring3(groundwork):")
+        else {
+            bail!("missing ring3 groundwork line");
+        };
+        let Some(fd_open_readme_rc) = parse_signed_metric_value(groundwork_line, "fd_open_readme=")
+        else {
+            bail!("missing fd_open_readme metric in ring3 groundwork output");
+        };
+        if fd_open_readme_rc != abi_errno::EPERM as i64 {
+            bail!(
+                "expected ring3 README open to fail with EPERM (expected {} got {})",
+                abi_errno::EPERM,
+                fd_open_readme_rc
+            );
+        }
+        let Some(fd_open_tmp_rc) = parse_signed_metric_value(groundwork_line, "fd_open_tmp=")
+        else {
+            bail!("missing fd_open_tmp metric in ring3 groundwork output");
+        };
+        if fd_open_tmp_rc < 0 {
+            bail!("expected ring3 tmp open/create to succeed, got {fd_open_tmp_rc}");
+        }
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 80));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "stat: path=/README.TXT") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "stat: path=/STAMP.TXT") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "dentry: hit path=/DCACHE.TXT") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "dentry: invalidate reason=rename") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "dentry: invalidate reason=unlink") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "ring3(groundwork):") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
 fn smoke_ring3(arch_override: Option<String>) -> Result<()> {
     let arch = resolve_runtime_arch(arch_override)?;
     smoke_ring3_impl(arch)
@@ -2208,13 +2823,14 @@ fn smoke_ring3_run(arch_override: Option<String>) -> Result<()> {
     let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
     let restore_ring3_elf_groundwork = env_truthy(RING3_ELF_GROUNDWORK_ENV);
 
-    build_impl(restore_force_fallback, false, false, Some(true))?;
+    build_impl(restore_force_fallback, false, false, Some(true), false)?;
     let smoke_result = smoke_ring3_run_impl(arch);
     let restore_result = build_impl(
         restore_force_fallback,
         false,
         false,
         Some(restore_ring3_elf_groundwork),
+        false,
     );
     match smoke_result {
         Ok(()) => {
@@ -2414,9 +3030,9 @@ fn smoke_ring3_fault(arch_override: Option<String>) -> Result<()> {
         bail!("smoke-ring3-fault supports only --arch aarch64");
     }
 
-    build_impl(false, true, true, None)?;
+    build_impl(false, true, true, None, false)?;
     let smoke_result = smoke_ring3_fault_impl(arch);
-    let restore_result = build_impl(false, false, false, None);
+    let restore_result = build_impl(false, false, false, None, false);
     match smoke_result {
         Ok(()) => {
             restore_result?;
@@ -3280,6 +3896,50 @@ fn wait_for_log(
     }
 }
 
+fn wait_for_line_after(
+    log: &Arc<Mutex<Vec<u8>>>,
+    marker: &str,
+    expected_line: &str,
+    timeout: Duration,
+    stage: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = snapshot_log(log);
+        if let Some(line) = line_after_matching(&snapshot, marker)
+            && line.trim() == expected_line
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timeout waiting for {stage}: expected `{expected_line}` after `{marker}`");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_new_matching_line(
+    log: &Arc<Mutex<Vec<u8>>>,
+    marker: &str,
+    previous_line: &str,
+    timeout: Duration,
+    stage: &str,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = snapshot_log(log);
+        if let Some(line) = last_matching_line(&snapshot, marker)
+            && line != previous_line
+        {
+            return Ok(line.to_string());
+        }
+        if Instant::now() >= deadline {
+            bail!("timeout waiting for {stage}: expected new line matching `{marker}`");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_status_with_frame_progress(
     log: &Arc<Mutex<Vec<u8>>>,
     min_frames: u64,
@@ -3380,6 +4040,15 @@ fn parse_metric_value(line: &str, key: &str) -> Option<u64> {
         .split(|ch: char| ch.is_whitespace() || ch == ',')
         .next()?;
     value.parse::<u64>().ok()
+}
+
+fn parse_signed_metric_value(line: &str, key: &str) -> Option<i64> {
+    let start = line.find(key)?;
+    let rest = &line[start + key.len()..];
+    let value = rest
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .next()?;
+    value.parse::<i64>().ok()
 }
 
 fn log_tail(log: &str, lines: usize) -> String {
@@ -3501,6 +4170,13 @@ mod tests {
         let parsed = parse_top_level_command(Some("smoke-bin-exec"))
             .expect("smoke-bin-exec should map to top-level command");
         assert!(parsed == TopLevelCommand::SmokeBinExec);
+    }
+
+    #[test]
+    fn top_level_command_supports_fs_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-fs"))
+            .expect("smoke-fs should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeFs);
     }
 
     #[test]

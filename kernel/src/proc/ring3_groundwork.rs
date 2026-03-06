@@ -228,9 +228,9 @@ pub fn current_address_space_token() -> AddressSpaceToken {
     #[cfg(target_arch = "x86_64")]
     {
         let (frame, _) = Cr3::read();
-        return AddressSpaceToken {
+        AddressSpaceToken {
             root_table: frame.start_address().as_u64(),
-        };
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -244,7 +244,7 @@ pub fn current_address_space_token() -> AddressSpaceToken {
                 options(nomem, nostack, preserves_flags)
             );
         }
-        return AddressSpaceToken { root_table: ttbr0 };
+        AddressSpaceToken { root_table: ttbr0 }
     }
 }
 
@@ -264,7 +264,7 @@ pub fn switch_to_address_space(
         unsafe {
             Cr3::write(frame, current_flags);
         }
-        return Ok(current);
+        Ok(current)
     }
 
     #[cfg(target_arch = "aarch64")]

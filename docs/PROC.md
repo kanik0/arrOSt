@@ -55,6 +55,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `/bin/terminal`
 - `cat /proc/self/pid`
 - `cat /proc/mounts`
+- `cat /proc/uptime`
 - `syscalls`
 - `spawn <init|doom>`
 - `wait <pid|any|all>`
@@ -70,9 +71,11 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.
 - `procfs` currently exposes only a minimal synthetic view (`self/pid`, `mounts`, `uptime`) and is not a full `/proc` implementation.
 - External GUI/runtime entries carry an fd table for model consistency, but they do not issue filesystem syscalls yet.
+- Bare command names in shell/GUI terminal can auto-dispatch to filesystem-backed `/bin/*` helpers; those executions still appear through the external scheduler table.
 
 ## Relevant files
 
 - `kernel/src/proc/mod.rs`
+- `kernel/src/fs/procfs.rs`
 - `kernel/src/shell.rs`
 - `crates/arrostd/src/lib.rs`

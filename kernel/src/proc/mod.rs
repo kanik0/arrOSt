@@ -41,11 +41,16 @@ const TASK_CAP_SHELL: u32 = caps::ALL;
 
 struct SchedulerCell(UnsafeCell<Scheduler>);
 
+struct FsIdentityOverrideCell(UnsafeCell<Option<FsIdentity>>);
+
 // SAFETY: access is serialized through `SCHED_LOCK`.
 unsafe impl Sync for SchedulerCell {}
+// SAFETY: scheduler/fs interactions are serialized on the main kernel path.
+unsafe impl Sync for FsIdentityOverrideCell {}
 
 static SCHED_LOCK: SpinLock = SpinLock::new();
 static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(Scheduler::new()));
+static FS_IDENTITY_OVERRIDE: FsIdentityOverrideCell = FsIdentityOverrideCell(UnsafeCell::new(None));
 
 #[derive(Clone, Copy)]
 pub struct ProcInitReport {
@@ -146,6 +151,44 @@ impl ProcessSnapshot {
             external_kind: None,
             tty: None,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct FsIdentity {
+    pub uid: u16,
+    pub gid: u16,
+    pub privileged: bool,
+}
+
+impl FsIdentity {
+    const fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            privileged: true,
+        }
+    }
+
+    const fn user() -> Self {
+        Self {
+            uid: 1000,
+            gid: 1000,
+            privileged: false,
+        }
+    }
+}
+
+fn with_fs_identity_override<R>(identity: FsIdentity, f: impl FnOnce() -> R) -> R {
+    // SAFETY: kernel scheduler/fs interactions are serialized on the main path and
+    // this override is scoped synchronously around a single syscall dispatch.
+    unsafe {
+        let slot = &mut *FS_IDENTITY_OVERRIDE.0.get();
+        let previous = *slot;
+        *slot = Some(identity);
+        let result = f();
+        *slot = previous;
+        result
     }
 }
 
@@ -1754,12 +1797,7 @@ impl Scheduler {
     }
 
     fn alloc_ring3_task_slot(&self) -> Option<usize> {
-        for index in 0..MAX_RING3_TASKS {
-            if self.ring3_tasks[index].is_none() {
-                return Some(index);
-            }
-        }
-        None
+        (0..MAX_RING3_TASKS).find(|&index| self.ring3_tasks[index].is_none())
     }
 
     fn wake_sleeping_ring3_tasks(&mut self, now_ticks: u64) {
@@ -2191,7 +2229,7 @@ impl Scheduler {
             Ok(flags) => flags,
             Err(error) => return error,
         };
-        if path_bytes.is_empty() || path_bytes.iter().any(|byte| *byte == 0) {
+        if path_bytes.is_empty() || path_bytes.contains(&0) {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
         }
@@ -2419,8 +2457,10 @@ impl Scheduler {
             return self.map_ring3_copy_error(error);
         }
 
-        self.with_ring3_fd_table(|scheduler, fd_table| {
-            scheduler.open_with_bytes(fd_table, process.pid, &path[..path_len], flags)
+        with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.open_with_bytes(fd_table, process.pid, &path[..path_len], flags)
+            })
         })
     }
 
@@ -2523,8 +2563,10 @@ impl Scheduler {
         if process.user_range_count == 0 {
             // SAFETY: policy smoke passes shared-address-space pointers.
             let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
-            return self.with_ring3_fd_table(|scheduler, fd_table| {
-                scheduler.fd_read_into(fd_table, 0, out)
+            return with_fs_identity_override(FsIdentity::user(), || {
+                self.with_ring3_fd_table(|scheduler, fd_table| {
+                    scheduler.fd_read_into(fd_table, 0, out)
+                })
             });
         }
 
@@ -2535,8 +2577,10 @@ impl Scheduler {
         }
         bytes.resize(len, 0);
 
-        let read = self.with_ring3_fd_table(|scheduler, fd_table| {
-            scheduler.fd_read_into(fd_table, 0, bytes.as_mut_slice())
+        let read = with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_read_into(fd_table, 0, bytes.as_mut_slice())
+            })
         });
         if read <= 0 {
             return read;
@@ -2602,8 +2646,10 @@ impl Scheduler {
         if process.user_range_count == 0 {
             // SAFETY: policy smoke passes shared-address-space pointers.
             let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
-            return self.with_ring3_fd_table(|scheduler, fd_table| {
-                scheduler.fd_read_into(fd_table, fd, out)
+            return with_fs_identity_override(FsIdentity::user(), || {
+                self.with_ring3_fd_table(|scheduler, fd_table| {
+                    scheduler.fd_read_into(fd_table, fd, out)
+                })
             });
         }
 
@@ -2614,8 +2660,10 @@ impl Scheduler {
         }
         bytes.resize(len, 0);
 
-        let read = self.with_ring3_fd_table(|scheduler, fd_table| {
-            scheduler.fd_read_into(fd_table, fd, bytes.as_mut_slice())
+        let read = with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_read_into(fd_table, fd, bytes.as_mut_slice())
+            })
         });
         if read <= 0 {
             return read;
@@ -2681,8 +2729,10 @@ impl Scheduler {
         if process.user_range_count == 0 {
             // SAFETY: policy smoke passes shared-address-space pointers.
             let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-            return self.with_ring3_fd_table(|scheduler, fd_table| {
-                scheduler.fd_write_from(fd_table, fd, bytes)
+            return with_fs_identity_override(FsIdentity::user(), || {
+                self.with_ring3_fd_table(|scheduler, fd_table| {
+                    scheduler.fd_write_from(fd_table, fd, bytes)
+                })
             });
         }
 
@@ -2701,8 +2751,10 @@ impl Scheduler {
             return self.map_ring3_copy_error(error);
         }
 
-        self.with_ring3_fd_table(|scheduler, fd_table| {
-            scheduler.fd_write_from(fd_table, fd, bytes.as_slice())
+        with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_write_from(fd_table, fd, bytes.as_slice())
+            })
         })
     }
 
@@ -2719,8 +2771,10 @@ impl Scheduler {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EBADF;
         };
-        self.with_ring3_fd_table(|scheduler, fd_table| {
-            scheduler.fd_seek(fd_table, fd, offset as i64, whence)
+        with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| {
+                scheduler.fd_seek(fd_table, fd, offset as i64, whence)
+            })
         })
     }
 
@@ -2759,7 +2813,9 @@ impl Scheduler {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
         }
-        let stat = self.with_ring3_fd_table(|scheduler, fd_table| scheduler.fd_stat(fd_table, fd));
+        let stat = with_fs_identity_override(FsIdentity::user(), || {
+            self.with_ring3_fd_table(|scheduler, fd_table| scheduler.fd_stat(fd_table, fd))
+        });
         let stat = match stat {
             Ok(stat) => stat,
             Err(error) => return error,
@@ -3484,6 +3540,23 @@ impl Scheduler {
         written
     }
 
+    fn fs_identity(&self, current_pid: Option<u32>) -> FsIdentity {
+        let Some(pid) = current_pid else {
+            return FsIdentity::root();
+        };
+
+        if self
+            .ring3_tasks
+            .iter()
+            .flatten()
+            .any(|task| task.pid == pid)
+        {
+            return FsIdentity::user();
+        }
+
+        FsIdentity::root()
+    }
+
     fn kill_process(&mut self, pid: u32) -> isize {
         if pid == 0 {
             return errno::EINVAL;
@@ -3746,7 +3819,8 @@ fn map_fs_error(error: fs::FsError) -> isize {
         fs::FsError::StorageUnavailable | fs::FsError::StorageIo | fs::FsError::DiskCorrupt => {
             errno::ENODEV
         }
-        fs::FsError::ReadOnly => errno::EPERM,
+        fs::FsError::ReadOnly | fs::FsError::PermissionDenied => errno::EPERM,
+        fs::FsError::TooManySymlinks => errno::ELOOP,
         _ => errno::EINVAL,
     }
 }
@@ -4165,6 +4239,16 @@ pub fn exit_external_process_with_code(pid: u32, code: i32) -> bool {
 
 pub fn snapshot_processes(out: &mut [ProcessSnapshot]) -> usize {
     with_scheduler(|scheduler| scheduler.snapshot_processes(out))
+}
+
+pub fn fs_identity(current_pid: Option<u32>) -> FsIdentity {
+    // SAFETY: override is only installed synchronously around ring3 syscall handling.
+    unsafe {
+        if let Some(identity) = *FS_IDENTITY_OVERRIDE.0.get() {
+            return identity;
+        }
+    }
+    with_scheduler(|scheduler| scheduler.fs_identity(current_pid))
 }
 
 pub fn shell_pid() -> Option<u32> {

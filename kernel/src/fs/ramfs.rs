@@ -4,7 +4,11 @@
 // Implements both VfsOps (new inode-based API) and Vfs (old path-based API
 // for backward compatibility with existing callers).
 
-use super::{DirEntry, FileType, FsError, InodeNum, ROOT_INO, Stat, Vfs, VfsDirEntry, VfsOps};
+use super::{
+    DirEntry, FileType, FsError, InodeNum, MAX_OPEN_PATH_BYTES, ROOT_INO, Stat, Vfs, VfsDirEntry,
+    VfsOps,
+};
+use crate::time;
 
 // ── Backward-compatible constants (callers use these for buffer sizing) ──
 
@@ -30,6 +34,7 @@ const MAX_DIR_RECORDS: usize = INODE_DATA_SIZE / DIR_RECORD_SIZE; // 16
 // POSIX-style mode type bits (upper nibble).
 const S_IFREG: u16 = 0o100000;
 const S_IFDIR: u16 = 0o040000;
+const S_IFLNK: u16 = 0o120000;
 
 // Maximum depth for compat flat-listing tree walk.
 const MAX_WALK_DEPTH: usize = 4;
@@ -41,8 +46,13 @@ struct Inode {
     used: bool,
     file_type: FileType,
     mode: u16,
+    uid: u16,
+    gid: u16,
     link_count: u16,
     size: u32,
+    created: u64,
+    modified: u64,
+    accessed: u64,
     /// For regular files: content bytes (up to INODE_DATA_SIZE).
     /// For directories: packed DirRecord entries (DIR_RECORD_SIZE each).
     data: [u8; INODE_DATA_SIZE],
@@ -54,8 +64,13 @@ impl Inode {
             used: false,
             file_type: FileType::Regular,
             mode: 0,
+            uid: 0,
+            gid: 0,
             link_count: 0,
             size: 0,
+            created: 0,
+            modified: 0,
+            accessed: 0,
             data: [0; INODE_DATA_SIZE],
         }
     }
@@ -133,6 +148,7 @@ impl Inode {
         None
     }
 
+    #[allow(dead_code)]
     fn dir_entry_count(&self) -> usize {
         let mut count = 0usize;
         for i in 0..MAX_DIR_RECORDS {
@@ -165,12 +181,18 @@ impl RamFs {
         if self.root_initialized {
             return;
         }
+        let now = current_timestamp();
         let root = &mut self.inodes[ROOT_INO as usize];
         root.used = true;
         root.file_type = FileType::Directory;
         root.mode = S_IFDIR | 0o755;
+        root.uid = 0;
+        root.gid = 0;
         root.link_count = 2;
         root.size = 0;
+        root.created = now;
+        root.modified = now;
+        root.accessed = now;
         root.data.fill(0);
         // `.` -> self
         root.write_dir_record(0, ROOT_INO, b".", FileType::Directory);
@@ -224,6 +246,7 @@ impl RamFs {
         let slot = dir.find_free_dir_slot().ok_or(FsError::NoSpace)?;
         let dir = &mut self.inodes[dir_ino as usize];
         dir.write_dir_record(slot, child_ino, name, ft);
+        dir.modified = current_timestamp();
         Ok(())
     }
 
@@ -236,10 +259,16 @@ impl RamFs {
         };
         let dir = &mut self.inodes[dir_ino as usize];
         dir.clear_dir_record(slot);
+        dir.modified = current_timestamp();
         Ok(ino)
     }
 
-    fn create_directory(&mut self, parent_ino: InodeNum, name: &[u8]) -> Result<InodeNum, FsError> {
+    fn create_directory(
+        &mut self,
+        parent_ino: InodeNum,
+        name: &[u8],
+        mode: u16,
+    ) -> Result<InodeNum, FsError> {
         if name.len() > DIR_RECORD_NAME_MAX {
             return Err(FsError::NameTooLong);
         }
@@ -248,12 +277,18 @@ impl RamFs {
             return Err(FsError::AlreadyExists);
         }
         let ino = self.alloc_inode()?;
+        let now = current_timestamp();
         let inode = &mut self.inodes[ino as usize];
         inode.used = true;
         inode.file_type = FileType::Directory;
-        inode.mode = S_IFDIR | 0o755;
+        inode.mode = S_IFDIR | (mode & 0o777);
+        inode.uid = 0;
+        inode.gid = 0;
         inode.link_count = 2;
         inode.size = 0;
+        inode.created = now;
+        inode.modified = now;
+        inode.accessed = now;
         inode.data.fill(0);
         inode.write_dir_record(0, ino, b".", FileType::Directory);
         inode.write_dir_record(1, parent_ino, b"..", FileType::Directory);
@@ -321,7 +356,8 @@ impl RamFs {
                         }
                         None => {
                             // Auto-create intermediate directory.
-                            current = self.create_directory(current, component.as_bytes())?;
+                            current =
+                                self.create_directory(current, component.as_bytes(), 0o755)?;
                         }
                     }
                 }
@@ -346,6 +382,35 @@ impl RamFs {
             .map(|i| i.size as usize)
             .sum()
     }
+
+    fn touch_accessed_inode(&mut self, ino: InodeNum) -> Result<(), FsError> {
+        if !self.valid_ino(ino) {
+            return Err(FsError::NotFound);
+        }
+        self.inodes[ino as usize].accessed = current_timestamp();
+        Ok(())
+    }
+
+    fn set_dir_parent(&mut self, dir_ino: InodeNum, parent_ino: InodeNum) -> Result<(), FsError> {
+        if !self.valid_ino(dir_ino) || !self.valid_ino(parent_ino) {
+            return Err(FsError::InvalidPath);
+        }
+        let Some(slot) = self.inodes[dir_ino as usize].find_dir_record(b"..") else {
+            return Err(FsError::InvalidPath);
+        };
+        self.inodes[dir_ino as usize].write_dir_record(
+            slot,
+            parent_ino,
+            b"..",
+            FileType::Directory,
+        );
+        self.inodes[dir_ino as usize].modified = current_timestamp();
+        Ok(())
+    }
+}
+
+fn current_timestamp() -> u64 {
+    time::uptime_millis()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -378,12 +443,12 @@ impl VfsOps for RamFs {
             file_type: i.file_type,
             mode: i.mode,
             nlink: i.link_count,
-            uid: 0,
-            gid: 0,
+            uid: i.uid,
+            gid: i.gid,
             size: i.size,
-            created: 0,
-            modified: 0,
-            accessed: 0,
+            created: i.created,
+            modified: i.modified,
+            accessed: i.accessed,
         })
     }
 
@@ -422,7 +487,12 @@ impl VfsOps for RamFs {
         if end > i.size as usize {
             i.size = end as u32;
         }
+        i.modified = current_timestamp();
         Ok(data.len())
+    }
+
+    fn touch_accessed(&mut self, ino: InodeNum) -> Result<(), FsError> {
+        self.touch_accessed_inode(ino)
     }
 
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError> {
@@ -438,7 +508,24 @@ impl VfsOps for RamFs {
             i.data[new_size..i.size as usize].fill(0);
         }
         i.size = new_size as u32;
+        i.modified = current_timestamp();
         Ok(())
+    }
+
+    fn readlink(&self, ino: InodeNum, buf: &mut [u8]) -> Result<usize, FsError> {
+        if !self.valid_ino(ino) {
+            return Err(FsError::NotFound);
+        }
+        let inode = &self.inodes[ino as usize];
+        if inode.file_type != FileType::Symlink {
+            return Err(FsError::InvalidPath);
+        }
+        let size = inode.size as usize;
+        if buf.len() < size {
+            return Err(FsError::BufferTooSmall);
+        }
+        buf[..size].copy_from_slice(&inode.data[..size]);
+        Ok(size)
     }
 
     fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
@@ -455,24 +542,106 @@ impl VfsOps for RamFs {
             return Err(FsError::AlreadyExists);
         }
         let ino = self.alloc_inode()?;
+        let now = current_timestamp();
         let inode = &mut self.inodes[ino as usize];
         inode.used = true;
         inode.file_type = FileType::Regular;
         inode.mode = S_IFREG | (mode & 0o777);
+        inode.uid = 0;
+        inode.gid = 0;
         inode.link_count = 1;
         inode.size = 0;
+        inode.created = now;
+        inode.modified = now;
+        inode.accessed = now;
         self.add_dir_entry(parent, ino, name, FileType::Regular)?;
         Ok(ino)
     }
 
-    fn mkdir(&mut self, parent: InodeNum, name: &[u8], _mode: u16) -> Result<InodeNum, FsError> {
+    fn chmod(&mut self, ino: InodeNum, mode: u16) -> Result<(), FsError> {
+        if !self.valid_ino(ino) {
+            return Err(FsError::NotFound);
+        }
+        let inode = &mut self.inodes[ino as usize];
+        let type_bits = inode.mode & !0o777;
+        inode.mode = type_bits | (mode & 0o777);
+        inode.modified = current_timestamp();
+        Ok(())
+    }
+
+    fn mkdir(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError> {
         if !self.valid_ino(parent) {
             return Err(FsError::InvalidPath);
         }
         if self.inodes[parent as usize].file_type != FileType::Directory {
             return Err(FsError::NotADirectory);
         }
-        self.create_directory(parent, name)
+        self.create_directory(parent, name, mode)
+    }
+
+    fn link(&mut self, parent: InodeNum, name: &[u8], target: InodeNum) -> Result<(), FsError> {
+        if !self.valid_ino(parent) || !self.valid_ino(target) {
+            return Err(FsError::InvalidPath);
+        }
+        if self.inodes[parent as usize].file_type != FileType::Directory {
+            return Err(FsError::NotADirectory);
+        }
+        if self.inodes[target as usize].file_type == FileType::Directory {
+            return Err(FsError::IsADirectory);
+        }
+        if name.is_empty() || name.len() > DIR_RECORD_NAME_MAX {
+            return Err(FsError::NameTooLong);
+        }
+        if self.lookup_in_dir(parent, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        let file_type = self.inodes[target as usize].file_type;
+        self.add_dir_entry(parent, target, name, file_type)?;
+        self.inodes[target as usize].link_count =
+            self.inodes[target as usize].link_count.saturating_add(1);
+        self.inodes[target as usize].modified = current_timestamp();
+        Ok(())
+    }
+
+    fn symlink(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<InodeNum, FsError> {
+        if !self.valid_ino(parent) {
+            return Err(FsError::InvalidPath);
+        }
+        if self.inodes[parent as usize].file_type != FileType::Directory {
+            return Err(FsError::NotADirectory);
+        }
+        if name.is_empty() || name.len() > DIR_RECORD_NAME_MAX {
+            return Err(FsError::NameTooLong);
+        }
+        if target.is_empty() || target.len() > MAX_OPEN_PATH_BYTES || target.len() > INODE_DATA_SIZE
+        {
+            return Err(FsError::InvalidPath);
+        }
+        if self.lookup_in_dir(parent, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let ino = self.alloc_inode()?;
+        let now = current_timestamp();
+        let inode = &mut self.inodes[ino as usize];
+        inode.used = true;
+        inode.file_type = FileType::Symlink;
+        inode.mode = S_IFLNK | 0o777;
+        inode.uid = 0;
+        inode.gid = 0;
+        inode.link_count = 1;
+        inode.size = target.len() as u32;
+        inode.created = now;
+        inode.modified = now;
+        inode.accessed = now;
+        inode.data[..target.len()].copy_from_slice(target);
+        self.add_dir_entry(parent, ino, name, FileType::Symlink)?;
+        Ok(ino)
     }
 
     fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError> {
@@ -485,12 +654,18 @@ impl VfsOps for RamFs {
             return Err(FsError::IsADirectory);
         }
         self.remove_dir_entry(parent, name)?;
-        let inode = &mut self.inodes[ino as usize];
-        inode.link_count = inode.link_count.saturating_sub(1);
-        if inode.link_count == 0 {
-            inode.used = false;
-            inode.data.fill(0);
-            inode.size = 0;
+        let should_free = {
+            let inode = &mut self.inodes[ino as usize];
+            inode.link_count = inode.link_count.saturating_sub(1);
+            if inode.link_count == 0 {
+                true
+            } else {
+                inode.modified = current_timestamp();
+                false
+            }
+        };
+        if should_free {
+            self.inodes[ino as usize] = Inode::empty();
         }
         Ok(())
     }
@@ -510,12 +685,49 @@ impl VfsOps for RamFs {
             return Err(FsError::DirectoryNotEmpty);
         }
         self.remove_dir_entry(parent, name)?;
-        let inode = &mut self.inodes[ino as usize];
-        inode.used = false;
-        inode.data.fill(0);
+        self.inodes[ino as usize] = Inode::empty();
         // Decrement parent link count (for removed `..` reference).
         self.inodes[parent as usize].link_count =
             self.inodes[parent as usize].link_count.saturating_sub(1);
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        old_parent: InodeNum,
+        old_name: &[u8],
+        new_parent: InodeNum,
+        new_name: &[u8],
+    ) -> Result<(), FsError> {
+        if !self.valid_ino(old_parent) || !self.valid_ino(new_parent) {
+            return Err(FsError::InvalidPath);
+        }
+        if old_name.is_empty() || new_name.is_empty() || new_name.len() > DIR_RECORD_NAME_MAX {
+            return Err(FsError::NameTooLong);
+        }
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+        if self.lookup_in_dir(new_parent, new_name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let ino = self
+            .lookup_in_dir(old_parent, old_name)
+            .ok_or(FsError::NotFound)?;
+        let file_type = self.inodes[ino as usize].file_type;
+        self.remove_dir_entry(old_parent, old_name)?;
+        self.add_dir_entry(new_parent, ino, new_name, file_type)?;
+        if file_type == FileType::Directory && old_parent != new_parent {
+            self.set_dir_parent(ino, new_parent)?;
+            self.inodes[old_parent as usize].link_count = self.inodes[old_parent as usize]
+                .link_count
+                .saturating_sub(1);
+            self.inodes[new_parent as usize].link_count = self.inodes[new_parent as usize]
+                .link_count
+                .saturating_add(1);
+        }
+        self.inodes[ino as usize].modified = current_timestamp();
         Ok(())
     }
 

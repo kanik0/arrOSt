@@ -27,11 +27,7 @@ impl JournalEntry {
 enum JournalHeader {
     Empty,
     Invalid,
-    Valid {
-        seq: u32,
-        count: usize,
-        targets: [u32; MAX_JOURNAL_ENTRIES],
-    },
+    Valid { seq: u32, count: usize },
 }
 
 pub struct Journal {
@@ -159,9 +155,10 @@ impl Journal {
     pub fn replay(&mut self, journal_start: u64, journal_sectors: u64) -> Result<usize, FsError> {
         let capacity = usable_entries(journal_sectors);
         let mut header_sector = [0u8; storage::SECTOR_SIZE];
+        let mut targets = [0u32; MAX_JOURNAL_ENTRIES];
         storage::read_sector(journal_start, &mut header_sector).map_err(|_| FsError::StorageIo)?;
 
-        match decode_header(&header_sector, capacity) {
+        match decode_header(&header_sector, capacity, &mut targets) {
             JournalHeader::Empty => {
                 self.poisoned = false;
                 Ok(0)
@@ -171,16 +168,12 @@ impl Journal {
                 self.poisoned = false;
                 Ok(0)
             }
-            JournalHeader::Valid {
-                seq,
-                count,
-                targets,
-            } => {
+            JournalHeader::Valid { seq, count } => {
                 let mut payload = [0u8; storage::SECTOR_SIZE];
-                for idx in 0..count {
+                for (idx, target) in targets.iter().take(count).enumerate() {
                     storage::read_sector(journal_start + 1 + idx as u64, &mut payload)
                         .map_err(|_| FsError::StorageIo)?;
-                    storage::write_sector(targets[idx] as u64, &payload)
+                    storage::write_sector((*target).into(), &payload)
                         .map_err(|_| FsError::StorageIo)?;
                 }
                 self.clear_header(journal_start)?;
@@ -222,7 +215,11 @@ fn encode_header(
     out
 }
 
-fn decode_header(buf: &[u8; storage::SECTOR_SIZE], capacity: usize) -> JournalHeader {
+fn decode_header(
+    buf: &[u8; storage::SECTOR_SIZE],
+    capacity: usize,
+    targets: &mut [u32; MAX_JOURNAL_ENTRIES],
+) -> JournalHeader {
     if buf.iter().all(|byte| *byte == 0) {
         return JournalHeader::Empty;
     }
@@ -236,7 +233,6 @@ fn decode_header(buf: &[u8; storage::SECTOR_SIZE], capacity: usize) -> JournalHe
         return JournalHeader::Invalid;
     }
 
-    let mut targets = [0u32; MAX_JOURNAL_ENTRIES];
     for (idx, target) in targets.iter_mut().take(count).enumerate() {
         let off = HEADER_FIXED_BYTES + idx * 4;
         *target = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
@@ -245,7 +241,6 @@ fn decode_header(buf: &[u8; storage::SECTOR_SIZE], capacity: usize) -> JournalHe
     JournalHeader::Valid {
         seq: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
         count,
-        targets,
     }
 }
 

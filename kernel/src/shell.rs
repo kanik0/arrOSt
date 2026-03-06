@@ -32,6 +32,8 @@ const SERIAL_BIN_ECHO: &str = "/bin/echo";
 const SERIAL_BIN_FM: &str = "/bin/fm";
 const SERIAL_BIN_DOOM: &str = "/bin/doom";
 const SERIAL_BIN_TERMINAL: &str = "/bin/terminal";
+const SERIAL_BIN_LINK: &str = "/bin/link";
+const SERIAL_BIN_SYMLINK: &str = "/bin/symlink";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -72,15 +74,21 @@ impl HeldCaptureKey {
 struct ShellState {
     line: [u8; MAX_LINE_LEN],
     len: usize,
+    cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
+    cwd_len: usize,
     doom_capture: bool,
     held_serial_capture_keys: [HeldCaptureKey; SERIAL_CAPTURE_HELD_KEYS],
 }
 
 impl ShellState {
     const fn new() -> Self {
+        let mut cwd = [0; fs::MAX_OPEN_PATH_BYTES];
+        cwd[0] = b'/';
         Self {
             line: [0; MAX_LINE_LEN],
             len: 0,
+            cwd,
+            cwd_len: 1,
             doom_capture: false,
             held_serial_capture_keys: [HeldCaptureKey::inactive(); SERIAL_CAPTURE_HELD_KEYS],
         }
@@ -88,6 +96,22 @@ impl ShellState {
 
     fn clear(&mut self) {
         self.len = 0;
+    }
+
+    fn cwd(&self) -> &str {
+        str::from_utf8(&self.cwd[..self.cwd_len]).unwrap_or("/")
+    }
+
+    fn set_cwd(&mut self, path: &str) {
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(fs::MAX_OPEN_PATH_BYTES);
+        self.cwd[..len].copy_from_slice(&bytes[..len]);
+        self.cwd[len..].fill(0);
+        self.cwd_len = len;
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<String, fs::FsError> {
+        fs::resolve_path_from(self.cwd(), path)
     }
 
     fn release_all_serial_capture_keys(&mut self) {
@@ -164,7 +188,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, ls [<path>], cat, echo >, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -310,14 +334,54 @@ fn run_command(shell: &mut ShellState) {
             return;
         }
     };
-    let input = input_owned.as_str();
+    let normalized_input = normalize_shell_bin_command(input_owned.as_str());
+    let input = normalized_input.as_str();
+
+    if is_missing_shell_bin_command(input) {
+        serial::write_fmt(format_args!("unknown command: {input}\n"));
+        return;
+    }
+
+    if input == "pwd" {
+        serial::write_fmt(format_args!("{}\n", shell.cwd()));
+        return;
+    }
+    if input == "cd" {
+        shell.set_cwd("/");
+        refresh_file_manager_list_view();
+        return;
+    }
+    if let Some(path) = input.strip_prefix("cd ") {
+        let path = path.trim();
+        if path.is_empty() {
+            serial::write_line("usage: cd <dir>");
+            return;
+        }
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("cd: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        match fs::stat_path(&resolved, proc::shell_pid()) {
+            Ok(stat) if stat.file_type == fs::FileType::Directory => {
+                shell.set_cwd(&resolved);
+                refresh_file_manager_list_view();
+            }
+            Ok(_) => serial::write_fmt(format_args!("cd: {} (not_a_directory)\n", path)),
+            Err(err) => serial::write_fmt(format_args!("cd: {} ({})\n", path, err.as_str())),
+        }
+        return;
+    }
 
     if input == "ls /bin" || input == "/bin/ls /bin" {
-        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_bin_dir_listing());
+        with_shell_bin_process(SERIAL_BIN_LS, run_shell_bin_dir_listing);
         return;
     }
     if input == "ls" || input == SERIAL_BIN_LS {
-        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command("/"));
+        let cwd = String::from(shell.cwd());
+        with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&cwd, pid));
         return;
     }
     if let Some(path) = input
@@ -329,7 +393,14 @@ fn run_command(shell: &mut ShellState) {
             serial::write_line("usage: ls [<path>]");
             return;
         }
-        with_shell_bin_process(SERIAL_BIN_LS, |_pid| run_shell_ls_command(path));
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("ls: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&resolved, pid));
         return;
     }
 
@@ -346,12 +417,28 @@ fn run_command(shell: &mut ShellState) {
             serial::write_line("usage: cat <file>");
             return;
         }
-        with_shell_bin_process(SERIAL_BIN_CAT, |pid| fs::cat_to_serial_for_pid(path, pid));
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("cat: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        with_shell_bin_process(SERIAL_BIN_CAT, |pid| {
+            fs::cat_to_serial_for_pid(&resolved, pid)
+        });
         return;
     }
 
     if let Some((text, path)) = parse_echo_redirect(input) {
-        with_shell_bin_process(SERIAL_BIN_ECHO, |_pid| fs::write_from_echo(path, text));
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("echo: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        with_shell_bin_process(SERIAL_BIN_ECHO, |_pid| fs::write_from_echo(&resolved, text));
         refresh_file_manager_list_view();
         return;
     }
@@ -361,6 +448,168 @@ fn run_command(shell: &mut ShellState) {
         || input == "/bin/echo"
     {
         serial::write_line("usage: echo <text> > <file>");
+        return;
+    }
+
+    if input == "stat" {
+        serial::write_line("usage: stat <path>");
+        return;
+    }
+    if let Some(path) = input.strip_prefix("stat ") {
+        let path = path.trim();
+        if path.is_empty() {
+            serial::write_line("usage: stat <path>");
+            return;
+        }
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("stat: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        fs::stat_path_to_serial(&resolved, proc::shell_pid());
+        return;
+    }
+
+    if input == "mkdir" {
+        serial::write_line("usage: mkdir <dir>");
+        return;
+    }
+    if let Some(path) = input.strip_prefix("mkdir ") {
+        let path = path.trim();
+        if path.is_empty() {
+            serial::write_line("usage: mkdir <dir>");
+            return;
+        }
+        let resolved = match shell.resolve_path(path) {
+            Ok(path) => path,
+            Err(err) => {
+                serial::write_fmt(format_args!("mkdir: {} ({})\n", path, err.as_str()));
+                return;
+            }
+        };
+        fs::mkdir_dir_to_serial(&resolved, 0o755, proc::shell_pid());
+        refresh_file_manager_list_view();
+        return;
+    }
+
+    if input == "mv" {
+        serial::write_line("usage: mv <src> <dst>");
+        return;
+    }
+    if let Some(rest) = input.strip_prefix("mv ") {
+        match parse_two_args(rest) {
+            Some((source, destination)) => {
+                let source = match shell.resolve_path(source) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!("mv: {} ({})\n", source, err.as_str()));
+                        return;
+                    }
+                };
+                let destination = match shell.resolve_path(destination) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!("mv: {} ({})\n", destination, err.as_str()));
+                        return;
+                    }
+                };
+                fs::rename_file_to_serial(&source, &destination, proc::shell_pid());
+                refresh_file_manager_list_view();
+            }
+            None => serial::write_line("usage: mv <src> <dst>"),
+        }
+        return;
+    }
+
+    if input == "chmod" {
+        serial::write_line("usage: chmod <mode> <path>");
+        return;
+    }
+    if let Some(rest) = input.strip_prefix("chmod ") {
+        match parse_two_args(rest) {
+            Some((mode_text, path)) => {
+                let Some(mode) = parse_mode(mode_text) else {
+                    serial::write_line("usage: chmod <mode> <path>");
+                    return;
+                };
+                let resolved = match shell.resolve_path(path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!("chmod: {} ({})\n", path, err.as_str()));
+                        return;
+                    }
+                };
+                fs::chmod_file_to_serial(&resolved, mode, proc::shell_pid());
+                refresh_file_manager_list_view();
+            }
+            None => serial::write_line("usage: chmod <mode> <path>"),
+        }
+        return;
+    }
+
+    if input == SERIAL_BIN_LINK {
+        serial::write_line("usage: link <src> <dst>");
+        return;
+    }
+    if let Some(rest) = input.strip_prefix("/bin/link ") {
+        match parse_two_args(rest) {
+            Some((source, destination)) => {
+                let source = match shell.resolve_path(source) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!("link: {} ({})\n", source, err.as_str()));
+                        return;
+                    }
+                };
+                let destination = match shell.resolve_path(destination) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!(
+                            "link: {} ({})\n",
+                            destination,
+                            err.as_str()
+                        ));
+                        return;
+                    }
+                };
+                with_shell_bin_process(SERIAL_BIN_LINK, |pid| {
+                    let _ = pid;
+                    fs::link_file_to_serial(&source, &destination);
+                    refresh_file_manager_list_view();
+                });
+            }
+            None => serial::write_line("usage: link <src> <dst>"),
+        }
+        return;
+    }
+
+    if input == SERIAL_BIN_SYMLINK {
+        serial::write_line("usage: symlink <target> <linkpath>");
+        return;
+    }
+    if let Some(rest) = input.strip_prefix("/bin/symlink ") {
+        match parse_two_args(rest) {
+            Some((target, link_path)) => {
+                let link_path = match shell.resolve_path(link_path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        serial::write_fmt(format_args!(
+                            "symlink: {} ({})\n",
+                            link_path,
+                            err.as_str()
+                        ));
+                        return;
+                    }
+                };
+                with_shell_bin_process(SERIAL_BIN_SYMLINK, |_pid| {
+                    fs::symlink_file_to_serial(target, &link_path);
+                    refresh_file_manager_list_view();
+                });
+            }
+            None => serial::write_line("usage: symlink <target> <linkpath>"),
+        }
         return;
     }
 
@@ -596,14 +845,14 @@ fn run_command(shell: &mut ShellState) {
         doom::render_ui_status();
         return;
     }
-    if handle_file_manager_command(input) {
+    if handle_file_manager_command(shell, input) {
         return;
     }
 
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid> | syscalls | terminal | ls [<path>] | cat <file> | echo <text> > <file> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath>",
             );
         }
         "version" => {
@@ -1105,24 +1354,23 @@ fn run_shell_ps_command() {
     proc::log_process_table();
 }
 
-fn run_shell_ls_command(path: &str) {
-    fs::list_dir_to_serial(path, None);
+fn run_shell_ls_command(path: &str, current_pid: Option<u32>) {
+    fs::list_dir_to_serial(path, current_pid);
     refresh_file_manager_list_view();
 }
 
-fn run_shell_bin_dir_listing() {
-    let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-    let count = fs::list_entries(&mut entries);
-    let listed = entries
-        .iter()
-        .take(count)
-        .filter(|entry| entry.name().starts_with("bin/"))
-        .count();
-    serial::write_fmt(format_args!("ls: entries={}\n", listed));
-    for entry in entries.iter().take(count) {
-        if let Some(name) = entry.name().strip_prefix("bin/") {
-            serial::write_fmt(format_args!("/bin/{} (exec)\n", name));
+fn run_shell_bin_dir_listing(current_pid: Option<u32>) {
+    let mut entries = [fs::VfsDirEntry::empty(); 16];
+    let count = match fs::list_dir("/bin", &mut entries, current_pid) {
+        Ok(count) => count,
+        Err(err) => {
+            serial::write_fmt(format_args!("ls: /bin ({})\n", err.as_str()));
+            return;
         }
+    };
+    serial::write_fmt(format_args!("ls: entries={} path=/bin\n", count));
+    for entry in entries.iter().take(count) {
+        serial::write_fmt(format_args!("/bin/{} (exec)\n", entry.name_str()));
     }
 }
 
@@ -1211,15 +1459,56 @@ fn run_shell_doom_stop_command(shell: &mut ShellState) {
     doom::render_ui_status();
 }
 
-fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
-    let left = if input.starts_with("echo ") {
-        input
-    } else if input.starts_with("/bin/echo ") {
-        input
-    } else {
+fn current_shell_cwd() -> String {
+    // SAFETY: shell state is accessed on the main loop thread.
+    let shell = unsafe { &*SHELL_STATE.0.get() };
+    String::from(shell.cwd())
+}
+
+fn parse_mode(input: &str) -> Option<u16> {
+    let trimmed = input.trim();
+    let mode = u16::from_str_radix(trimmed, 8).ok()?;
+    if mode > 0o777 {
         return None;
+    }
+    Some(mode)
+}
+
+fn normalize_shell_bin_command(input: &str) -> String {
+    let Some(bin) = fs::resolve_bin_command(input) else {
+        return String::from(input);
     };
-    let (left, right) = left.split_once('>')?;
+    if bin.explicit_path || !fs::file_exists(bin.path) || !should_auto_dispatch_shell_bin(bin) {
+        return String::from(input);
+    }
+
+    let mut normalized = String::from(bin.path);
+    if !bin.args.is_empty() {
+        normalized.push(' ');
+        normalized.push_str(bin.args);
+    }
+    normalized
+}
+
+fn is_missing_shell_bin_command(input: &str) -> bool {
+    let Some(bin) = fs::resolve_bin_command(input) else {
+        return false;
+    };
+    (bin.explicit_path || should_auto_dispatch_shell_bin(bin)) && !fs::file_exists(bin.path)
+}
+
+fn should_auto_dispatch_shell_bin(bin: fs::BinCommand<'_>) -> bool {
+    match bin.path {
+        SERIAL_BIN_DOOM => matches!(bin.args, "" | "status" | "play" | "run" | "stop"),
+        _ => true,
+    }
+}
+
+fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
+    if !(input.starts_with("echo ") || input.starts_with("/bin/echo ")) {
+        return None;
+    }
+    let (left, right) = input.split_once('>')?;
     let text = left
         .strip_prefix("echo ")
         .or_else(|| left.strip_prefix("/bin/echo "))?
@@ -1229,6 +1518,16 @@ fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((text, path))
+}
+
+fn parse_two_args(input: &str) -> Option<(&str, &str)> {
+    let mut parts = input.trim().splitn(3, ' ');
+    let first = parts.next()?.trim();
+    let second = parts.next()?.trim();
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    Some((first, second))
 }
 
 fn parse_udp_send(input: &str) -> Option<(&str, u16, &str)> {
@@ -1294,13 +1593,16 @@ fn parse_file_manager_copy(input: &str) -> Option<(&str, &str)> {
     Some((source, destination))
 }
 
-fn handle_file_manager_command(input: &str) -> bool {
+fn handle_file_manager_command(shell: &ShellState, input: &str) -> bool {
     match input {
         "fm" | "fm list" | "/bin/fm" | "/bin/fm list" => {
             with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
-                fs::list_to_serial();
-                refresh_file_manager_list_view();
+                run_shell_ls_command(shell.cwd(), proc::shell_pid());
             });
+            true
+        }
+        "fm cd" | "/bin/fm cd" => {
+            serial::write_line("usage: fm cd <dir>");
             true
         }
         "fm open" | "/bin/fm open" => {
@@ -1317,6 +1619,44 @@ fn handle_file_manager_command(input: &str) -> bool {
         }
         _ => {
             if let Some(path) = input
+                .strip_prefix("fm cd ")
+                .or_else(|| input.strip_prefix("/bin/fm cd "))
+            {
+                let path = path.trim();
+                if path.is_empty() {
+                    serial::write_line("usage: fm cd <dir>");
+                } else {
+                    match shell.resolve_path(path) {
+                        Ok(resolved) => refresh_file_manager_list_view_for_path(&resolved),
+                        Err(err) => {
+                            serial::write_fmt(format_args!("fm: cd {} ({})\n", path, err.as_str()))
+                        }
+                    }
+                }
+                return true;
+            }
+
+            if let Some(path) = input
+                .strip_prefix("fm list ")
+                .or_else(|| input.strip_prefix("/bin/fm list "))
+            {
+                let path = path.trim();
+                if path.is_empty() {
+                    serial::write_line("usage: fm list [<path>]");
+                } else {
+                    match shell.resolve_path(path) {
+                        Ok(resolved) => refresh_file_manager_list_view_for_path(&resolved),
+                        Err(err) => serial::write_fmt(format_args!(
+                            "fm: list {} ({})\n",
+                            path,
+                            err.as_str()
+                        )),
+                    }
+                }
+                return true;
+            }
+
+            if let Some(path) = input
                 .strip_prefix("fm open ")
                 .or_else(|| input.strip_prefix("/bin/fm open "))
             {
@@ -1324,27 +1664,38 @@ fn handle_file_manager_command(input: &str) -> bool {
                 if path.is_empty() {
                     serial::write_line("usage: fm open <file>");
                 } else {
+                    let resolved = match shell.resolve_path(path) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            serial::write_fmt(format_args!(
+                                "fm: open {} ({})\n",
+                                path,
+                                err.as_str()
+                            ));
+                            return true;
+                        }
+                    };
                     with_shell_bin_process(SERIAL_BIN_FM, |pid| {
                         let mut buffer = [0u8; fs::MAX_FILE_BYTES];
                         let result = match pid {
                             Some(wrapper_pid) => {
-                                fs::read_file_for_pid(path, &mut buffer, Some(wrapper_pid))
+                                fs::read_file_for_pid(&resolved, &mut buffer, Some(wrapper_pid))
                             }
-                            None => fs::read_file(path, &mut buffer),
+                            None => fs::read_file(&resolved, &mut buffer),
                         };
                         match result {
                             Ok(len) => {
                                 match pid {
                                     Some(wrapper_pid) => {
-                                        fs::cat_to_serial_for_pid(path, Some(wrapper_pid));
+                                        fs::cat_to_serial_for_pid(&resolved, Some(wrapper_pid));
                                     }
-                                    None => fs::cat_to_serial(path),
+                                    None => fs::cat_to_serial(&resolved),
                                 }
-                                refresh_file_manager_preview_view(path, &buffer[..len]);
+                                refresh_file_manager_preview_view(&resolved, &buffer[..len]);
                             }
                             Err(err) => serial::write_fmt(format_args!(
                                 "fm: open {} ({})\n",
-                                path,
+                                resolved,
                                 err.as_str()
                             )),
                         }
@@ -1359,8 +1710,30 @@ fn handle_file_manager_command(input: &str) -> bool {
             {
                 match parse_file_manager_copy(rest) {
                     Some((source, destination)) => {
+                        let source = match shell.resolve_path(source) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                serial::write_fmt(format_args!(
+                                    "fm: copy {} ({})\n",
+                                    source,
+                                    err.as_str()
+                                ));
+                                return true;
+                            }
+                        };
+                        let destination = match shell.resolve_path(destination) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                serial::write_fmt(format_args!(
+                                    "fm: copy {} ({})\n",
+                                    destination,
+                                    err.as_str()
+                                ));
+                                return true;
+                            }
+                        };
                         with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
-                            fs::copy_file_to_serial(source, destination);
+                            fs::copy_file_to_serial(&source, &destination);
                             refresh_file_manager_list_view();
                         });
                     }
@@ -1377,8 +1750,19 @@ fn handle_file_manager_command(input: &str) -> bool {
                 if path.is_empty() {
                     serial::write_line("usage: fm delete <file>");
                 } else {
+                    let resolved = match shell.resolve_path(path) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            serial::write_fmt(format_args!(
+                                "fm: delete {} ({})\n",
+                                path,
+                                err.as_str()
+                            ));
+                            return true;
+                        }
+                    };
                     with_shell_bin_process(SERIAL_BIN_FM, |_pid| {
-                        fs::delete_file_to_serial(path);
+                        fs::delete_file_to_serial(&resolved);
                         refresh_file_manager_list_view();
                     });
                 }
@@ -1391,18 +1775,34 @@ fn handle_file_manager_command(input: &str) -> bool {
 }
 
 fn refresh_file_manager_list_view() {
-    let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-    let count = fs::list_entries(&mut entries);
+    let cwd = current_shell_cwd();
+    refresh_file_manager_list_view_for_path(&cwd);
+}
 
+fn refresh_file_manager_list_view_for_path(path: &str) {
+    let mut entries = [fs::VfsDirEntry::empty(); 16];
     let mut view = String::new();
-    let _ = writeln!(view, "FILES ({count})");
-    let _ = writeln!(view, "name               size");
-    for entry in entries.iter().take(count).take(FILE_MANAGER_LIST_LINES) {
-        let _ = writeln!(view, "{} {}b", entry.name(), entry.size());
+    match fs::list_dir(path, &mut entries, proc::shell_pid()) {
+        Ok(count) => {
+            let _ = writeln!(view, "FILES {} ({count})", path.trim());
+            let _ = writeln!(view, "name");
+            for entry in entries.iter().take(count).take(FILE_MANAGER_LIST_LINES) {
+                let suffix = if matches!(entry.file_type, fs::FileType::Directory) {
+                    "/"
+                } else {
+                    ""
+                };
+                let _ = writeln!(view, "{}{}", entry.name_str(), suffix);
+            }
+            if count == 0 {
+                let _ = writeln!(view, "<empty>");
+            }
+        }
+        Err(err) => {
+            let _ = writeln!(view, "FILES {} ({})", path.trim(), err.as_str());
+        }
     }
-    if count == 0 {
-        let _ = writeln!(view, "<empty>");
-    }
+    let _ = writeln!(view, "fm cd <dir>");
     let _ = writeln!(view, "fm open <file>");
     let _ = writeln!(view, "fm copy <src> <dst>");
     let _ = writeln!(view, "fm delete <file>");

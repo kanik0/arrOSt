@@ -10,10 +10,12 @@
 use super::bitmap::{self, Bitmap};
 use super::journal::Journal;
 use super::{
-    DirEntry, FileType, FsError, InodeNum, MAX_VNAME_LEN, ROOT_INO, Stat, Vfs, VfsDirEntry, VfsOps,
+    DirEntry, FileType, FsError, InodeNum, MAX_OPEN_PATH_BYTES, MAX_VNAME_LEN, ROOT_INO, Stat, Vfs,
+    VfsDirEntry, VfsOps,
 };
 use crate::serial;
 use crate::storage;
+use crate::time;
 
 // ── On-disk layout constants ────────────────────────────────────────────
 
@@ -115,6 +117,10 @@ pub struct DiskFsV2 {
     tx_bitmap_dirty: bool,
 }
 
+fn current_timestamp() -> u64 {
+    time::uptime_millis()
+}
+
 impl DiskFsV2 {
     pub const fn new() -> Self {
         Self {
@@ -191,10 +197,6 @@ impl DiskFsV2 {
             return Err(FsError::StorageUnavailable);
         }
         self.with_metadata_tx(|_| Ok(()))
-    }
-
-    pub fn is_mounted(&self) -> bool {
-        self.mounted
     }
 
     fn with_metadata_tx<R>(
@@ -505,6 +507,7 @@ impl DiskFsV2 {
 
     fn init_root_dir(&mut self) -> Result<(), FsError> {
         let ino = ROOT_INO as usize;
+        let now = current_timestamp();
         self.inodes[ino] = DiskInode {
             mode: MODE_TYPE_DIR | 0o755,
             uid: 0,
@@ -512,9 +515,9 @@ impl DiskFsV2 {
             link_count: 2, // . and parent (..)
             size_bytes: 0,
             block_count: 0,
-            created: 0,
-            modified: 0,
-            accessed: 0,
+            created: now,
+            modified: now,
+            accessed: now,
             direct: [0; DIRECT_BLOCKS],
             indirect: 0,
             flags: 0,
@@ -592,6 +595,7 @@ impl DiskFsV2 {
             self.read_block(blk, &mut buf)?;
             if let Some(new_buf) = try_insert_entry(&mut buf, name, child_ino, ft, needed) {
                 self.write_block_metadata(blk, &new_buf)?;
+                self.inodes[parent as usize].modified = current_timestamp();
                 return Ok(());
             }
         }
@@ -605,6 +609,7 @@ impl DiskFsV2 {
         let _ = pack_dir_entry(&mut new_block, 0, child_ino, name, ft, true)?;
         self.write_block_metadata(blk, &new_block)?;
         self.inodes[parent as usize].size_bytes = (new_logical + 1) * storage::SECTOR_SIZE as u32;
+        self.inodes[parent as usize].modified = current_timestamp();
         Ok(())
     }
 
@@ -638,6 +643,7 @@ impl DiskFsV2 {
                             buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
                         }
                         self.write_block_metadata(blk, &buf)?;
+                        self.inodes[parent as usize].modified = current_timestamp();
                         return Ok(entry_ino);
                     }
                 }
@@ -648,7 +654,40 @@ impl DiskFsV2 {
         Err(FsError::NotFound)
     }
 
+    fn set_dir_parent(&mut self, dir_ino: u32, parent_ino: u32) -> Result<(), FsError> {
+        let inode = &self.inodes[dir_ino as usize];
+        if inode.file_type() != FileType::Directory {
+            return Err(FsError::NotADirectory);
+        }
+
+        let blocks = inode.block_count;
+        let mut buf = [0u8; storage::SECTOR_SIZE];
+        for b in 0..blocks {
+            let blk = self.inode_block(dir_ino, b)?;
+            self.read_block(blk, &mut buf)?;
+            let mut off = 0usize;
+            while off + DIR_ENTRY_HEADER <= storage::SECTOR_SIZE {
+                let (entry_ino, rec_len, name_len, _ftype) = parse_dir_entry_header(&buf, off);
+                if rec_len == 0 {
+                    break;
+                }
+                if entry_ino != 0 && name_len == 2 {
+                    let entry_name = &buf[off + DIR_ENTRY_HEADER..off + DIR_ENTRY_HEADER + 2];
+                    if entry_name == b".." {
+                        buf[off..off + 4].copy_from_slice(&parent_ino.to_le_bytes());
+                        self.write_block_metadata(blk, &buf)?;
+                        self.inodes[dir_ino as usize].modified = current_timestamp();
+                        return Ok(());
+                    }
+                }
+                off += rec_len as usize;
+            }
+        }
+        Err(FsError::InvalidPath)
+    }
+
     /// Check if directory `ino` is empty (only . and .. entries).
+    #[allow(dead_code)]
     fn dir_is_empty(&self, ino: u32) -> Result<bool, FsError> {
         let inode = &self.inodes[ino as usize];
         let blocks = inode.block_count;
@@ -747,6 +786,7 @@ impl DiskFsV2 {
         if new_end > self.inodes[ino as usize].size_bytes {
             self.inodes[ino as usize].size_bytes = new_end;
         }
+        self.inodes[ino as usize].modified = current_timestamp();
         self.flush_one_inode(ino)?;
         Ok(data.len())
     }
@@ -781,6 +821,7 @@ impl DiskFsV2 {
     }
 
     /// Resolve parent directory, return (parent_ino, file_name_bytes).
+    #[allow(dead_code)]
     fn resolve_parent<'a>(&self, path: &'a [u8]) -> Result<(u32, &'a [u8]), FsError> {
         // Find last `/`.
         let mut last_slash = None;
@@ -838,7 +879,7 @@ impl VfsOps for DiskFsV2 {
         Ok(Stat {
             ino,
             file_type: i.file_type(),
-            mode: i.mode & MODE_PERM_MASK,
+            mode: i.mode,
             nlink: i.link_count,
             uid: i.uid,
             gid: i.gid,
@@ -865,6 +906,32 @@ impl VfsOps for DiskFsV2 {
         self.with_metadata_tx(|fs| fs.write_inode_data(ino, offset, data))
     }
 
+    fn readlink(&self, ino: InodeNum, buf: &mut [u8]) -> Result<usize, FsError> {
+        let idx = ino as usize;
+        if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
+            return Err(FsError::NotFound);
+        }
+        if self.inodes[idx].file_type() != FileType::Symlink {
+            return Err(FsError::InvalidPath);
+        }
+        let size = self.inodes[idx].size_bytes as usize;
+        if buf.len() < size {
+            return Err(FsError::BufferTooSmall);
+        }
+        self.read_inode_data(ino, 0, &mut buf[..size])
+    }
+
+    fn touch_accessed(&mut self, ino: InodeNum) -> Result<(), FsError> {
+        let idx = ino as usize;
+        if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
+            return Err(FsError::NotFound);
+        }
+        self.with_metadata_tx(|fs| {
+            fs.inodes[idx].accessed = current_timestamp();
+            fs.flush_one_inode(ino)
+        })
+    }
+
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError> {
         let idx = ino as usize;
         if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
@@ -873,6 +940,20 @@ impl VfsOps for DiskFsV2 {
         self.with_metadata_tx(|fs| {
             // Simple truncate: just update size. Block reclamation deferred.
             fs.inodes[idx].size_bytes = size;
+            fs.inodes[idx].modified = current_timestamp();
+            fs.flush_one_inode(ino)
+        })
+    }
+
+    fn chmod(&mut self, ino: InodeNum, mode: u16) -> Result<(), FsError> {
+        let idx = ino as usize;
+        if idx >= INODE_COUNT as usize || self.inodes[idx].is_free() {
+            return Err(FsError::NotFound);
+        }
+        self.with_metadata_tx(|fs| {
+            let type_bits = fs.inodes[idx].mode & MODE_TYPE_MASK;
+            fs.inodes[idx].mode = type_bits | (mode & MODE_PERM_MASK);
+            fs.inodes[idx].modified = current_timestamp();
             fs.flush_one_inode(ino)
         })
     }
@@ -886,6 +967,7 @@ impl VfsOps for DiskFsV2 {
                 return Err(FsError::AlreadyExists);
             }
             let ino = fs.alloc_inode()?;
+            let now = current_timestamp();
             fs.inodes[ino as usize] = DiskInode {
                 mode: MODE_TYPE_REG | (mode & MODE_PERM_MASK),
                 uid: 0,
@@ -893,9 +975,9 @@ impl VfsOps for DiskFsV2 {
                 link_count: 1,
                 size_bytes: 0,
                 block_count: 0,
-                created: 0,
-                modified: 0,
-                accessed: 0,
+                created: now,
+                modified: now,
+                accessed: now,
                 direct: [0; DIRECT_BLOCKS],
                 indirect: 0,
                 flags: 0,
@@ -916,6 +998,7 @@ impl VfsOps for DiskFsV2 {
                 return Err(FsError::AlreadyExists);
             }
             let ino = fs.alloc_inode()?;
+            let now = current_timestamp();
             fs.inodes[ino as usize] = DiskInode {
                 mode: MODE_TYPE_DIR | (mode & MODE_PERM_MASK),
                 uid: 0,
@@ -923,9 +1006,9 @@ impl VfsOps for DiskFsV2 {
                 link_count: 2,
                 size_bytes: 0,
                 block_count: 0,
-                created: 0,
-                modified: 0,
-                accessed: 0,
+                created: now,
+                modified: now,
+                accessed: now,
                 direct: [0; DIRECT_BLOCKS],
                 indirect: 0,
                 flags: 0,
@@ -946,8 +1029,75 @@ impl VfsOps for DiskFsV2 {
             fs.dir_add_entry(parent, name, ino, FileType::Directory)?;
             fs.inodes[parent as usize].link_count =
                 fs.inodes[parent as usize].link_count.saturating_add(1);
+            fs.inodes[parent as usize].modified = current_timestamp();
 
             fs.flush_one_inode(ino)?;
+            fs.flush_one_inode(parent)?;
+            Ok(ino)
+        })
+    }
+
+    fn link(&mut self, parent: InodeNum, name: &[u8], target: InodeNum) -> Result<(), FsError> {
+        self.with_metadata_tx(|fs| {
+            if name.len() > MAX_VNAME_LEN || name.is_empty() {
+                return Err(FsError::NameTooLong);
+            }
+            if fs.dir_lookup(parent, name).is_ok() {
+                return Err(FsError::AlreadyExists);
+            }
+            let target_idx = target as usize;
+            if target_idx >= INODE_COUNT as usize || fs.inodes[target_idx].is_free() {
+                return Err(FsError::NotFound);
+            }
+            let file_type = fs.inodes[target_idx].file_type();
+            if file_type == FileType::Directory {
+                return Err(FsError::IsADirectory);
+            }
+
+            fs.dir_add_entry(parent, name, target, file_type)?;
+            fs.inodes[target_idx].link_count = fs.inodes[target_idx].link_count.saturating_add(1);
+            fs.inodes[target_idx].modified = current_timestamp();
+            fs.flush_one_inode(parent)?;
+            fs.flush_one_inode(target)?;
+            Ok(())
+        })
+    }
+
+    fn symlink(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<InodeNum, FsError> {
+        self.with_metadata_tx(|fs| {
+            if name.len() > MAX_VNAME_LEN || name.is_empty() {
+                return Err(FsError::NameTooLong);
+            }
+            if target.is_empty() || target.len() > MAX_OPEN_PATH_BYTES {
+                return Err(FsError::InvalidPath);
+            }
+            if fs.dir_lookup(parent, name).is_ok() {
+                return Err(FsError::AlreadyExists);
+            }
+
+            let ino = fs.alloc_inode()?;
+            let now = current_timestamp();
+            fs.inodes[ino as usize] = DiskInode {
+                mode: MODE_TYPE_LNK | 0o777,
+                uid: 0,
+                gid: 0,
+                link_count: 1,
+                size_bytes: 0,
+                block_count: 0,
+                created: now,
+                modified: now,
+                accessed: now,
+                direct: [0; DIRECT_BLOCKS],
+                indirect: 0,
+                flags: 0,
+            };
+            let _ = fs.write_inode_data(ino, 0, target)?;
+            fs.dir_add_entry(parent, name, ino, FileType::Symlink)?;
             fs.flush_one_inode(parent)?;
             Ok(ino)
         })
@@ -960,9 +1110,17 @@ impl VfsOps for DiskFsV2 {
                 return Err(FsError::IsADirectory);
             }
             fs.dir_remove_entry(parent, name)?;
-            let inode = &mut fs.inodes[child_ino as usize];
-            inode.link_count = inode.link_count.saturating_sub(1);
-            if inode.link_count == 0 {
+            let should_free = {
+                let inode = &mut fs.inodes[child_ino as usize];
+                inode.link_count = inode.link_count.saturating_sub(1);
+                if inode.link_count == 0 {
+                    true
+                } else {
+                    inode.modified = current_timestamp();
+                    false
+                }
+            };
+            if should_free {
                 fs.free_inode(child_ino);
             }
             fs.flush_one_inode(parent)?;
@@ -985,8 +1143,52 @@ impl VfsOps for DiskFsV2 {
             fs.dir_remove_entry(parent, name)?;
             fs.inodes[parent as usize].link_count =
                 fs.inodes[parent as usize].link_count.saturating_sub(1);
+            fs.inodes[parent as usize].modified = current_timestamp();
             fs.free_inode(child_ino);
             fs.flush_one_inode(parent)?;
+            if child_ino < INODE_COUNT {
+                fs.flush_one_inode(child_ino)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn rename(
+        &mut self,
+        old_parent: InodeNum,
+        old_name: &[u8],
+        new_parent: InodeNum,
+        new_name: &[u8],
+    ) -> Result<(), FsError> {
+        self.with_metadata_tx(|fs| {
+            if old_name.is_empty() || new_name.is_empty() || new_name.len() > MAX_VNAME_LEN {
+                return Err(FsError::NameTooLong);
+            }
+            if old_parent == new_parent && old_name == new_name {
+                return Ok(());
+            }
+            if fs.dir_lookup(new_parent, new_name).is_ok() {
+                return Err(FsError::AlreadyExists);
+            }
+
+            let (child_ino, file_type) = fs.dir_lookup(old_parent, old_name)?;
+            fs.dir_remove_entry(old_parent, old_name)?;
+            fs.dir_add_entry(new_parent, new_name, child_ino, file_type)?;
+            if file_type == FileType::Directory && old_parent != new_parent {
+                fs.set_dir_parent(child_ino, new_parent)?;
+                fs.inodes[old_parent as usize].link_count =
+                    fs.inodes[old_parent as usize].link_count.saturating_sub(1);
+                fs.inodes[new_parent as usize].link_count =
+                    fs.inodes[new_parent as usize].link_count.saturating_add(1);
+                fs.inodes[old_parent as usize].modified = current_timestamp();
+                fs.inodes[new_parent as usize].modified = current_timestamp();
+            }
+            fs.inodes[child_ino as usize].modified = current_timestamp();
+            fs.flush_one_inode(old_parent)?;
+            if old_parent != new_parent {
+                fs.flush_one_inode(new_parent)?;
+            }
+            fs.flush_one_inode(child_ino)?;
             Ok(())
         })
     }

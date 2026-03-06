@@ -81,6 +81,7 @@ Current mapped set used by runtime paths:
 - `EMFILE = -24`
 - `ENOSPC = -28`
 - `ENOSYS = -38`
+- `ELOOP = -40`
 - `EMSGSIZE = -90`
 - `EPROTONOSUPPORT = -93`
 - `EAFNOSUPPORT = -97`
@@ -99,11 +100,20 @@ Additional shared request/metadata contract for filesystem syscalls:
 
 - `FileStat`
 
+`FileStat` carries inode number, file type, mode, link count, owner ids, size, and `created`/`modified`/`accessed` timestamps.
+
 ## Filesystem constants
 
 - Open flags: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`
 - Seek constants: `SEEK_SET`, `SEEK_CUR`, `SEEK_END`
 - File types: `FILE_TYPE_REGULAR`, `FILE_TYPE_DIRECTORY`, `FILE_TYPE_SYMLINK`, `FILE_TYPE_CHAR`
+
+Filesystem syscall behavior is mediated by the mount-aware VFS:
+
+- `open`/`fread`/`fwrite`/`fstat` operate on inode-backed descriptors plus synthetic `procfs` files.
+- `dup`/`dup2` alias an existing open file description and preserve the shared offset/flags model of the per-process fd table.
+- Path walks now follow symlinks up to 8 hops and return `ELOOP` on loops or excessive depth.
+- Permission enforcement uses inode `uid`/`gid`/`mode`; current ring-3 runtime is treated as `uid=1000 gid=1000`.
 
 ## Status
 

@@ -79,6 +79,8 @@ const TERMINAL_BIN_ECHO: &str = "/bin/echo";
 const TERMINAL_BIN_FM: &str = "/bin/fm";
 const TERMINAL_BIN_DOOM: &str = "/bin/doom";
 const TERMINAL_BIN_TERMINAL: &str = "/bin/terminal";
+const TERMINAL_BIN_LINK: &str = "/bin/link";
+const TERMINAL_BIN_SYMLINK: &str = "/bin/symlink";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -315,20 +317,42 @@ struct TerminalProcess {
     tty: u32,
     line: [u8; TERMINAL_LINE_MAX],
     line_len: usize,
+    cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
+    cwd_len: usize,
 }
 
 impl TerminalProcess {
     const fn new(pid: u32, tty: u32) -> Self {
+        let mut cwd = [0; fs::MAX_OPEN_PATH_BYTES];
+        cwd[0] = b'/';
         Self {
             pid,
             tty,
             line: [0; TERMINAL_LINE_MAX],
             line_len: 0,
+            cwd,
+            cwd_len: 1,
         }
     }
 
     fn clear_line(&mut self) {
         self.line_len = 0;
+    }
+
+    fn cwd(&self) -> &str {
+        str::from_utf8(&self.cwd[..self.cwd_len]).unwrap_or("/")
+    }
+
+    fn set_cwd(&mut self, path: &str) {
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(fs::MAX_OPEN_PATH_BYTES);
+        self.cwd[..len].copy_from_slice(&bytes[..len]);
+        self.cwd[len..].fill(0);
+        self.cwd_len = len;
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<String, fs::FsError> {
+        fs::resolve_path_from(self.cwd(), path)
     }
 }
 
@@ -691,6 +715,8 @@ struct GfxState {
     windows: [UiWindow; WINDOW_COUNT],
     window_order: [usize; WINDOW_COUNT],
     terminal_processes: [Option<TerminalProcess>; TERMINAL_WINDOW_COUNT],
+    file_manager_path: [u8; fs::MAX_OPEN_PATH_BYTES],
+    file_manager_path_len: usize,
     focused_window: usize,
     apps_menu_open: bool,
     system_menu_open: bool,
@@ -729,6 +755,8 @@ struct GfxState {
 
 impl GfxState {
     const fn placeholder() -> Self {
+        let mut file_manager_path = [0; fs::MAX_OPEN_PATH_BYTES];
+        file_manager_path[0] = b'/';
         Self {
             backend: "none",
             buffer_ptr: core::ptr::null_mut(),
@@ -751,6 +779,8 @@ impl GfxState {
             ); WINDOW_COUNT],
             window_order: DEFAULT_WINDOW_ORDER,
             terminal_processes: [None; TERMINAL_WINDOW_COUNT],
+            file_manager_path,
+            file_manager_path_len: 1,
             focused_window: FILE_MANAGER_WINDOW_INDEX,
             apps_menu_open: false,
             system_menu_open: false,
@@ -825,6 +855,9 @@ impl GfxState {
         ); WINDOW_COUNT];
         self.window_order = DEFAULT_WINDOW_ORDER;
         self.terminal_processes = [None; TERMINAL_WINDOW_COUNT];
+        self.file_manager_path = [0; fs::MAX_OPEN_PATH_BYTES];
+        self.file_manager_path[0] = b'/';
+        self.file_manager_path_len = 1;
         self.focused_window = FILE_MANAGER_WINDOW_INDEX;
         self.apps_menu_open = false;
         self.system_menu_open = false;
@@ -914,11 +947,12 @@ impl GfxState {
     }
 
     fn seed_content(&mut self) {
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm list\n");
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm open <file>\n");
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm copy <src> <dst>\n");
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("fm delete <file>\n");
-        self.windows[FILE_MANAGER_WINDOW_INDEX].append_text("\nUse taskbar Apps/System menu.\n");
+        // Early framebuffer init runs before heap setup, so seed the file-manager
+        // pane with static text and let shell/fs init populate the live listing later.
+        self.set_window_text(
+            FILE_MANAGER_WINDOW_INDEX,
+            "FILES /\nloading...\nfm cd <dir>\nfm open <file>\nfm copy <src> <dst>\nfm delete <file>\n",
+        );
     }
 
     fn try_enable_backbuffer(&mut self) -> bool {
@@ -1105,6 +1139,43 @@ impl GfxState {
         self.terminal_processes[slot].as_ref()
     }
 
+    fn terminal_process_for_window_mut(&mut self, index: usize) -> Option<&mut TerminalProcess> {
+        let slot = Self::terminal_slot_for_window(index)?;
+        self.terminal_processes[slot].as_mut()
+    }
+
+    fn terminal_cwd(&self, index: usize) -> Option<&str> {
+        self.terminal_process_for_window(index)
+            .map(TerminalProcess::cwd)
+    }
+
+    fn resolve_terminal_path(&self, index: usize, path: &str) -> Result<String, fs::FsError> {
+        let process = self
+            .terminal_process_for_window(index)
+            .ok_or(fs::FsError::InvalidPath)?;
+        process.resolve_path(path)
+    }
+
+    fn set_terminal_cwd(&mut self, index: usize, path: &str) -> bool {
+        let Some(process) = self.terminal_process_for_window_mut(index) else {
+            return false;
+        };
+        process.set_cwd(path);
+        true
+    }
+
+    fn file_manager_path(&self) -> &str {
+        str::from_utf8(&self.file_manager_path[..self.file_manager_path_len]).unwrap_or("/")
+    }
+
+    fn set_file_manager_path(&mut self, path: &str) {
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(fs::MAX_OPEN_PATH_BYTES);
+        self.file_manager_path[..len].copy_from_slice(&bytes[..len]);
+        self.file_manager_path[len..].fill(0);
+        self.file_manager_path_len = len;
+    }
+
     fn focused_terminal_window(&self) -> Option<usize> {
         if self
             .terminal_process_for_window(self.focused_window)
@@ -1276,7 +1347,7 @@ impl GfxState {
         self.push_terminal_text(window_index, "ARR0ST terminal online\n");
         self.push_terminal_text(
             window_index,
-            "help | apps | pid | tty | clear | terminal | doom play | doom stop | exit\n",
+            "help | apps | pid | tty | pwd | cd | clear | terminal | ls | cat | stat | chmod | mkdir | mv | doom play | doom stop | exit\n",
         );
         self.push_terminal_text(
             window_index,
@@ -1537,19 +1608,23 @@ impl GfxState {
     }
 
     fn run_terminal_bin_dir_listing(&mut self, index: usize) {
-        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-        let count = fs::list_entries(&mut entries);
-        let listed = entries
-            .iter()
-            .take(count)
-            .filter(|entry| entry.name().starts_with("bin/"))
-            .count();
-        let mut text = String::new();
-        let _ = writeln!(text, "ls: entries={}", listed);
-        for entry in entries.iter().take(count) {
-            if let Some(name) = entry.name().strip_prefix("bin/") {
-                let _ = writeln!(text, "/bin/{} (exec)", name);
+        let mut entries = [fs::VfsDirEntry::empty(); 16];
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        let count = match fs::list_dir("/bin", &mut entries, current_pid) {
+            Ok(count) => count,
+            Err(err) => {
+                let mut line = String::new();
+                let _ = writeln!(line, "ls: /bin ({})", err.as_str());
+                self.push_terminal_text(index, &line);
+                return;
             }
+        };
+        let mut text = String::new();
+        let _ = writeln!(text, "ls: entries={} path=/bin", count);
+        for entry in entries.iter().take(count) {
+            let _ = writeln!(text, "/bin/{} (exec)", entry.name_str());
         }
         self.push_terminal_text(index, &text);
     }
@@ -1585,7 +1660,10 @@ impl GfxState {
 
     fn run_terminal_cat_command(&mut self, index: usize, path: &str) {
         let mut data = [0u8; fs::MAX_FILE_BYTES];
-        match fs::read_file(path, &mut data) {
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        match fs::read_file_for_pid(path, &mut data, current_pid) {
             Ok(len) => {
                 let mut header = String::new();
                 let _ = writeln!(header, "cat: {} bytes from {}", len, path);
@@ -1619,13 +1697,74 @@ impl GfxState {
         self.refresh_file_manager_list_view();
     }
 
+    fn run_terminal_link_command(&mut self, index: usize, source: &str, destination: &str) {
+        let mut line = String::new();
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        match fs::link_file_for_pid(source, destination, current_pid) {
+            Ok(()) => {
+                let _ = writeln!(line, "link: {} -> {}", source.trim(), destination.trim());
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    line,
+                    "link: {} -> {} ({})",
+                    source.trim(),
+                    destination.trim(),
+                    err.as_str()
+                );
+            }
+        }
+        self.push_terminal_text(index, &line);
+        self.refresh_file_manager_list_view();
+    }
+
+    fn run_terminal_symlink_command(&mut self, index: usize, target: &str, link_path: &str) {
+        let mut line = String::new();
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        match fs::symlink_file_for_pid(target, link_path, current_pid) {
+            Ok(()) => {
+                let _ = writeln!(line, "symlink: {} -> {}", link_path.trim(), target.trim());
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    line,
+                    "symlink: {} -> {} ({})",
+                    link_path.trim(),
+                    target.trim(),
+                    err.as_str()
+                );
+            }
+        }
+        self.push_terminal_text(index, &line);
+        self.refresh_file_manager_list_view();
+    }
+
     fn run_terminal_fm_list_command(&mut self, index: usize) {
-        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-        let count = fs::list_entries(&mut entries);
+        let path = String::from(self.file_manager_path());
+        let mut entries = [fs::VfsDirEntry::empty(); 16];
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
         let mut text = String::new();
-        let _ = writeln!(text, "fm: entries={count}");
-        for entry in entries.iter().take(count) {
-            let _ = writeln!(text, "{} ({} bytes)", entry.name(), entry.size());
+        match fs::list_dir(&path, &mut entries, current_pid) {
+            Ok(count) => {
+                let _ = writeln!(text, "fm: entries={} path={}", count, path);
+                for entry in entries.iter().take(count) {
+                    let suffix = if matches!(entry.file_type, fs::FileType::Directory) {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    let _ = writeln!(text, "{}{}", entry.name_str(), suffix);
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(text, "fm: list {} ({})", path, err.as_str());
+            }
         }
         self.push_terminal_text(index, &text);
         self.refresh_file_manager_list_view();
@@ -1633,7 +1772,10 @@ impl GfxState {
 
     fn run_terminal_fm_open_command(&mut self, index: usize, path: &str) {
         let mut buffer = [0u8; fs::MAX_FILE_BYTES];
-        match fs::read_file(path, &mut buffer) {
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        match fs::read_file_for_pid(path, &mut buffer, current_pid) {
             Ok(len) => {
                 let mut header = String::new();
                 let _ = writeln!(header, "fm: open {} ({} bytes)", path, len);
@@ -1681,7 +1823,10 @@ impl GfxState {
     }
 
     fn run_terminal_fm_delete_command(&mut self, index: usize, path: &str) {
-        match fs::delete_file(path) {
+        let current_pid = self
+            .terminal_process_for_window(index)
+            .map(|process| process.pid);
+        match fs::delete_file_for_pid(path, current_pid) {
             Ok(()) => {
                 let mut line = String::new();
                 let _ = writeln!(line, "fm: deleted {}", path.trim());
@@ -1815,11 +1960,17 @@ impl GfxState {
         if command.is_empty() {
             return true;
         }
+        let normalized_command = normalize_terminal_bin_command(command);
+        let command = normalized_command.as_str();
+        if is_missing_terminal_bin_command(command) {
+            self.push_terminal_text(index, "unknown command\n");
+            return true;
+        }
 
         if command == "help" {
             self.push_terminal_text(
                 index,
-                "help: help version ticks uptime pid tty clear terminal ls [<path>] cat echo > fm doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal)\n",
+                "help: help version ticks uptime pid tty pwd cd clear terminal ls [<path>] cat echo > stat chmod mkdir mv link symlink fm [list|cd|open|copy|delete] doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal link symlink)\n",
             );
             return true;
         }
@@ -1861,6 +2012,54 @@ impl GfxState {
                     self.push_terminal_text(index, tty_text);
                 }
                 self.push_terminal_text(index, "\n");
+            }
+            return true;
+        }
+        if command == "pwd" {
+            let cwd = self.terminal_cwd(index).unwrap_or("/");
+            let mut line = String::new();
+            let _ = writeln!(line, "{cwd}");
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if command == "cd" {
+            let changed = self.set_terminal_cwd(index, "/");
+            if changed {
+                self.push_terminal_text(index, "cd: /\n");
+            }
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("cd ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: cd <dir>\n");
+                return true;
+            }
+            let resolved = match self.resolve_terminal_path(index, path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "cd: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            match fs::stat_path(
+                &resolved,
+                self.terminal_process_for_window(index).map(|p| p.pid),
+            ) {
+                Ok(stat) if stat.file_type == fs::FileType::Directory => {
+                    self.set_terminal_cwd(index, &resolved);
+                    let mut line = String::new();
+                    let _ = writeln!(line, "cd: {}", resolved);
+                    self.push_terminal_text(index, &line);
+                }
+                Ok(_) => self.push_terminal_text(index, "cd: not_a_directory\n"),
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "cd: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                }
             }
             return true;
         }
@@ -2392,6 +2591,162 @@ impl GfxState {
             return true;
         }
 
+        if command == "stat" {
+            self.push_terminal_text(index, "usage: stat <path>\n");
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("stat ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: stat <path>\n");
+                return true;
+            }
+            let resolved = match self.resolve_terminal_path(index, path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "stat: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            match fs::describe_stat(
+                &resolved,
+                self.terminal_process_for_window(index)
+                    .map(|process| process.pid),
+            ) {
+                Ok(line) => {
+                    self.push_terminal_text(index, &line);
+                    self.push_terminal_text(index, "\n");
+                }
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "stat: {} ({})", resolved, err.as_str());
+                    self.push_terminal_text(index, &line);
+                }
+            }
+            return true;
+        }
+
+        if command == "mkdir" {
+            self.push_terminal_text(index, "usage: mkdir <dir>\n");
+            return true;
+        }
+        if let Some(path) = command.strip_prefix("mkdir ") {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: mkdir <dir>\n");
+                return true;
+            }
+            let resolved = match self.resolve_terminal_path(index, path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "mkdir: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let current_pid = self
+                .terminal_process_for_window(index)
+                .map(|process| process.pid);
+            let mut line = String::new();
+            match fs::mkdir_dir(&resolved, 0o755, current_pid) {
+                Ok(()) => {
+                    let _ = writeln!(line, "mkdir: {} mode={:#o}", resolved, 0o755);
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "mkdir: {} ({})", resolved, err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+
+        if command == "mv" {
+            self.push_terminal_text(index, "usage: mv <src> <dst>\n");
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("mv ") {
+            let Some((source, destination)) = parse_file_manager_copy(rest) else {
+                self.push_terminal_text(index, "usage: mv <src> <dst>\n");
+                return true;
+            };
+            let source = match self.resolve_terminal_path(index, source) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "mv: {} ({})", source, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let destination = match self.resolve_terminal_path(index, destination) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "mv: {} ({})", destination, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let current_pid = self
+                .terminal_process_for_window(index)
+                .map(|process| process.pid);
+            let mut line = String::new();
+            match fs::rename_file(&source, &destination, current_pid) {
+                Ok(()) => {
+                    let _ = writeln!(line, "mv: {} -> {}", source, destination);
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "mv: {} -> {} ({})", source, destination, err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+
+        if command == "chmod" {
+            self.push_terminal_text(index, "usage: chmod <mode> <path>\n");
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("chmod ") {
+            let Some((mode_text, path)) = parse_file_manager_copy(rest) else {
+                self.push_terminal_text(index, "usage: chmod <mode> <path>\n");
+                return true;
+            };
+            let Some(mode) = parse_mode(mode_text) else {
+                self.push_terminal_text(index, "usage: chmod <mode> <path>\n");
+                return true;
+            };
+            let resolved = match self.resolve_terminal_path(index, path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "chmod: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let current_pid = self
+                .terminal_process_for_window(index)
+                .map(|process| process.pid);
+            let mut line = String::new();
+            match fs::chmod_file(&resolved, mode, current_pid) {
+                Ok(()) => {
+                    let _ = writeln!(line, "chmod: {} mode={:#o}", resolved, mode);
+                }
+                Err(err) => {
+                    let _ = writeln!(line, "chmod: {} ({})", resolved, err.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
+            self.refresh_file_manager_list_view();
+            return true;
+        }
+
         if command == "ls /bin" || command == "/bin/ls /bin" {
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
                 state.run_terminal_bin_dir_listing(index);
@@ -2401,10 +2756,11 @@ impl GfxState {
             return true;
         }
         if command == "ls" || command == TERMINAL_BIN_LS {
+            let cwd = String::from(self.terminal_cwd(index).unwrap_or("/"));
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                state.run_terminal_ls_command(index, "/");
+                state.run_terminal_ls_command(index, &cwd);
             }) {
-                self.run_terminal_ls_command(index, "/");
+                self.run_terminal_ls_command(index, &cwd);
             }
             return true;
         }
@@ -2415,10 +2771,21 @@ impl GfxState {
             let path = path.trim();
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: ls [<path>]\n");
-            } else if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                state.run_terminal_ls_command(index, path);
-            }) {
-                self.run_terminal_ls_command(index, path);
+            } else {
+                let resolved = match self.resolve_terminal_path(index, path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let mut line = String::new();
+                        let _ = writeln!(line, "ls: {} ({})", path, err.as_str());
+                        self.push_terminal_text(index, &line);
+                        return true;
+                    }
+                };
+                if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
+                    state.run_terminal_ls_command(index, &resolved);
+                }) {
+                    self.run_terminal_ls_command(index, &resolved);
+                }
             }
             return true;
         }
@@ -2434,19 +2801,37 @@ impl GfxState {
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: cat <file>\n");
             } else {
+                let resolved = match self.resolve_terminal_path(index, path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let mut line = String::new();
+                        let _ = writeln!(line, "cat: {} ({})", path, err.as_str());
+                        self.push_terminal_text(index, &line);
+                        return true;
+                    }
+                };
                 if !self.with_terminal_bin_process(index, TERMINAL_BIN_CAT, |state| {
-                    state.run_terminal_cat_command(index, path);
+                    state.run_terminal_cat_command(index, &resolved);
                 }) {
-                    self.run_terminal_cat_command(index, path);
+                    self.run_terminal_cat_command(index, &resolved);
                 }
             }
             return true;
         }
         if let Some((text, path)) = parse_echo_redirect(command) {
+            let resolved = match self.resolve_terminal_path(index, path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "echo: {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_ECHO, |state| {
-                state.run_terminal_echo_redirect_command(index, text, path);
+                state.run_terminal_echo_redirect_command(index, text, &resolved);
             }) {
-                self.run_terminal_echo_redirect_command(index, text, path);
+                self.run_terminal_echo_redirect_command(index, text, &resolved);
             }
             return true;
         }
@@ -2468,6 +2853,67 @@ impl GfxState {
             return true;
         }
 
+        if command == TERMINAL_BIN_LINK {
+            self.push_terminal_text(index, "usage: link <src> <dst>\n");
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("/bin/link ") {
+            let Some((source, destination)) = parse_file_manager_copy(rest) else {
+                self.push_terminal_text(index, "usage: link <src> <dst>\n");
+                return true;
+            };
+            let source = match self.resolve_terminal_path(index, source) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "link: {} ({})", source, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let destination = match self.resolve_terminal_path(index, destination) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "link: {} ({})", destination, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LINK, |state| {
+                state.run_terminal_link_command(index, &source, &destination);
+            }) {
+                self.run_terminal_link_command(index, &source, &destination);
+            }
+            return true;
+        }
+
+        if command == TERMINAL_BIN_SYMLINK {
+            self.push_terminal_text(index, "usage: symlink <target> <linkpath>\n");
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("/bin/symlink ") {
+            let Some((target, link_path)) = parse_file_manager_copy(rest) else {
+                self.push_terminal_text(index, "usage: symlink <target> <linkpath>\n");
+                return true;
+            };
+            let link_path = match self.resolve_terminal_path(index, link_path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "symlink: {} ({})", link_path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_SYMLINK, |state| {
+                state.run_terminal_symlink_command(index, target, &link_path);
+            }) {
+                self.run_terminal_symlink_command(index, target, &link_path);
+            }
+            return true;
+        }
+
         if command == "fm"
             || command == "fm list"
             || command == TERMINAL_BIN_FM
@@ -2478,6 +2924,10 @@ impl GfxState {
             }) {
                 self.run_terminal_fm_list_command(index);
             }
+            return true;
+        }
+        if command == "fm cd" || command == "/bin/fm cd" {
+            self.push_terminal_text(index, "usage: fm cd <dir>\n");
             return true;
         }
         if command == "fm open" || command == "/bin/fm open" {
@@ -2493,6 +2943,57 @@ impl GfxState {
             return true;
         }
         if let Some(path) = command
+            .strip_prefix("fm cd ")
+            .or_else(|| command.strip_prefix("/bin/fm cd "))
+        {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: fm cd <dir>\n");
+                return true;
+            }
+            let resolved = match fs::resolve_path_from(self.file_manager_path(), path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "fm: cd {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            self.set_file_manager_path(&resolved);
+            self.refresh_file_manager_list_view();
+            let mut line = String::new();
+            let _ = writeln!(line, "fm: cd {}", resolved);
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if let Some(path) = command
+            .strip_prefix("fm list ")
+            .or_else(|| command.strip_prefix("/bin/fm list "))
+        {
+            let path = path.trim();
+            if path.is_empty() {
+                self.push_terminal_text(index, "usage: fm list [<path>]\n");
+                return true;
+            }
+            let resolved = match fs::resolve_path_from(self.file_manager_path(), path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "fm: list {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            self.set_file_manager_path(&resolved);
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
+                state.run_terminal_fm_list_command(index);
+            }) {
+                self.run_terminal_fm_list_command(index);
+            }
+            return true;
+        }
+        if let Some(path) = command
             .strip_prefix("fm open ")
             .or_else(|| command.strip_prefix("/bin/fm open "))
         {
@@ -2501,10 +3002,19 @@ impl GfxState {
                 self.push_terminal_text(index, "usage: fm open <file>\n");
                 return true;
             }
+            let resolved = match fs::resolve_path_from(self.file_manager_path(), path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "fm: open {} ({})", path, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
-                state.run_terminal_fm_open_command(index, path);
+                state.run_terminal_fm_open_command(index, &resolved);
             }) {
-                self.run_terminal_fm_open_command(index, path);
+                self.run_terminal_fm_open_command(index, &resolved);
             }
             return true;
         }
@@ -2516,10 +3026,28 @@ impl GfxState {
                 self.push_terminal_text(index, "usage: fm copy <src> <dst>\n");
                 return true;
             };
+            let source = match fs::resolve_path_from(self.file_manager_path(), source) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "fm: copy {} ({})", source, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
+            let destination = match fs::resolve_path_from(self.file_manager_path(), destination) {
+                Ok(path) => path,
+                Err(err) => {
+                    let mut line = String::new();
+                    let _ = writeln!(line, "fm: copy {} ({})", destination, err.as_str());
+                    self.push_terminal_text(index, &line);
+                    return true;
+                }
+            };
             if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
-                state.run_terminal_fm_copy_command(index, source, destination);
+                state.run_terminal_fm_copy_command(index, &source, &destination);
             }) {
-                self.run_terminal_fm_copy_command(index, source, destination);
+                self.run_terminal_fm_copy_command(index, &source, &destination);
             }
             return true;
         }
@@ -2531,10 +3059,19 @@ impl GfxState {
             if path.is_empty() {
                 self.push_terminal_text(index, "usage: fm delete <file>\n");
             } else {
+                let resolved = match fs::resolve_path_from(self.file_manager_path(), path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let mut line = String::new();
+                        let _ = writeln!(line, "fm: delete {} ({})", path, err.as_str());
+                        self.push_terminal_text(index, &line);
+                        return true;
+                    }
+                };
                 if !self.with_terminal_bin_process(index, TERMINAL_BIN_FM, |state| {
-                    state.run_terminal_fm_delete_command(index, path);
+                    state.run_terminal_fm_delete_command(index, &resolved);
                 }) {
-                    self.run_terminal_fm_delete_command(index, path);
+                    self.run_terminal_fm_delete_command(index, &resolved);
                 }
             }
             return true;
@@ -3004,18 +3541,30 @@ impl GfxState {
     }
 
     fn refresh_file_manager_list_view(&mut self) {
-        let mut entries = [fs::DirEntry::empty(); fs::MAX_FILES];
-        let count = fs::list_entries(&mut entries);
-
+        let path = String::from(self.file_manager_path());
+        let mut entries = [fs::VfsDirEntry::empty(); 16];
         let mut view = String::new();
-        let _ = writeln!(view, "FILES ({count})");
-        let _ = writeln!(view, "name               size");
-        for entry in entries.iter().take(count).take(FILE_MANAGER_LIST_LINES) {
-            let _ = writeln!(view, "{} {}b", entry.name(), entry.size());
+        match fs::list_dir(&path, &mut entries, proc::shell_pid()) {
+            Ok(count) => {
+                let _ = writeln!(view, "FILES {} ({count})", path);
+                let _ = writeln!(view, "name");
+                for entry in entries.iter().take(count).take(FILE_MANAGER_LIST_LINES) {
+                    let suffix = if matches!(entry.file_type, fs::FileType::Directory) {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    let _ = writeln!(view, "{}{}", entry.name_str(), suffix);
+                }
+                if count == 0 {
+                    let _ = writeln!(view, "<empty>");
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(view, "FILES {} ({})", path, err.as_str());
+            }
         }
-        if count == 0 {
-            let _ = writeln!(view, "<empty>");
-        }
+        let _ = writeln!(view, "fm cd <dir>");
         let _ = writeln!(view, "fm open <file>");
         let _ = writeln!(view, "fm copy <src> <dst>");
         let _ = writeln!(view, "fm delete <file>");
@@ -4432,11 +4981,11 @@ impl GfxState {
     }
 
     fn draw_chrome_char(&mut self, x: usize, y: usize, byte: u8, fg: Color, bg: Option<Color>) {
-        self.draw_glyph_cell(x, y, byte, fg, bg, CHROME_CHAR_W, CHROME_CHAR_H);
+        self.draw_glyph_cell(x, y, byte, fg, bg, (CHROME_CHAR_W, CHROME_CHAR_H));
     }
 
     fn draw_content_char(&mut self, x: usize, y: usize, byte: u8, fg: Color, bg: Option<Color>) {
-        self.draw_glyph_cell(x, y, byte, fg, bg, CONTENT_CHAR_W, CONTENT_CHAR_H);
+        self.draw_glyph_cell(x, y, byte, fg, bg, (CONTENT_CHAR_W, CONTENT_CHAR_H));
     }
 
     fn draw_glyph_cell(
@@ -4446,9 +4995,9 @@ impl GfxState {
         byte: u8,
         fg: Color,
         bg: Option<Color>,
-        cell_w: usize,
-        cell_h: usize,
+        cell_size: (usize, usize),
     ) {
+        let (cell_w, cell_h) = cell_size;
         let glyph = glyph_alpha(byte);
         for row in 0..cell_h {
             for col in 0..cell_w {
@@ -4902,12 +5451,50 @@ fn with_state_mut<T>(f: impl FnOnce(&mut GfxState) -> T) -> Option<T> {
     }
 }
 
+fn normalize_terminal_bin_command(command: &str) -> String {
+    let Some(bin) = fs::resolve_bin_command(command) else {
+        return String::from(command);
+    };
+    if bin.explicit_path || !fs::file_exists(bin.path) || !should_auto_dispatch_terminal_bin(bin) {
+        return String::from(command);
+    }
+
+    let mut normalized = String::from(bin.path);
+    if !bin.args.is_empty() {
+        normalized.push(' ');
+        normalized.push_str(bin.args);
+    }
+    normalized
+}
+
+fn is_missing_terminal_bin_command(command: &str) -> bool {
+    let Some(bin) = fs::resolve_bin_command(command) else {
+        return false;
+    };
+    (bin.explicit_path || should_auto_dispatch_terminal_bin(bin)) && !fs::file_exists(bin.path)
+}
+
+fn should_auto_dispatch_terminal_bin(bin: fs::BinCommand<'_>) -> bool {
+    match bin.path {
+        TERMINAL_BIN_DOOM => matches!(bin.args, "" | "status" | "play" | "run" | "stop"),
+        _ => true,
+    }
+}
+
 fn parse_pid(text: &str) -> Option<u32> {
     let pid = text.trim().parse::<u32>().ok()?;
     if pid == 0 {
         return None;
     }
     Some(pid)
+}
+
+fn parse_mode(text: &str) -> Option<u16> {
+    let mode = u16::from_str_radix(text.trim(), 8).ok()?;
+    if mode > 0o777 {
+        return None;
+    }
+    Some(mode)
 }
 
 fn map_external_exit_code(code: i32) -> i32 {
@@ -4918,14 +5505,10 @@ fn map_external_exit_code(code: i32) -> i32 {
 }
 
 fn parse_echo_redirect(input: &str) -> Option<(&str, &str)> {
-    let left = if input.starts_with("echo ") {
-        input
-    } else if input.starts_with("/bin/echo ") {
-        input
-    } else {
+    if !(input.starts_with("echo ") || input.starts_with("/bin/echo ")) {
         return None;
-    };
-    let (left, right) = left.split_once('>')?;
+    }
+    let (left, right) = input.split_once('>')?;
     let text = left
         .strip_prefix("echo ")
         .or_else(|| left.strip_prefix("/bin/echo "))?

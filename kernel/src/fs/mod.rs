@@ -4,6 +4,7 @@
 // M2: DiskFsV2 inode-based on-disk format with automatic v1→v2 migration.
 
 mod bitmap;
+mod dentry;
 mod diskfs_v1;
 mod diskfs_v2;
 mod fd;
@@ -14,25 +15,28 @@ mod procfs;
 mod ramfs;
 mod tmpfs;
 
-use crate::proc;
+use crate::proc::{self, FsIdentity};
 use crate::serial;
 use crate::storage;
-use arrostd::syscall::{O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC};
+use alloc::string::String;
+use arrostd::syscall::{O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY};
 use core::cell::UnsafeCell;
+use core::fmt::Write;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
+use dentry::{CachedResolution, DentryCache};
 use diskfs_v1::DiskFs as DiskFsV1;
 use diskfs_v2::DiskFsV2;
 pub(crate) use fd::FdTarget;
 pub use fd::{FdTable, MAX_FDS};
 pub use mount::MAX_PATH_BYTES as MAX_OPEN_PATH_BYTES;
-use mount::{MOUNTS, MountKind, canonicalize, resolve_mount};
+use mount::{CanonicalPath, MOUNTS, MountKind, canonicalize, resolve_mount};
 use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 8] = [
+pub const BIN_EXEC_PATHS: [&str; 10] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -41,7 +45,43 @@ pub const BIN_EXEC_PATHS: [&str; 8] = [
     "/bin/fm",
     "/bin/doom",
     "/bin/terminal",
+    "/bin/link",
+    "/bin/symlink",
 ];
+
+pub const MAX_SYMLINK_DEPTH: usize = 8;
+
+#[derive(Clone, Copy)]
+pub struct BinCommand<'a> {
+    pub path: &'static str,
+    pub args: &'a str,
+    pub explicit_path: bool,
+}
+
+pub fn resolve_bin_command(input: &str) -> Option<BinCommand<'_>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    let (command, args) = match input.find(char::is_whitespace) {
+        Some(index) => (input[..index].trim(), input[index..].trim_start()),
+        None => (input, ""),
+    };
+    let explicit_path = command.starts_with("/bin/");
+    let path = bin_exec_path_for_token(command)?;
+    Some(BinCommand {
+        path,
+        args,
+        explicit_path,
+    })
+}
+
+fn bin_exec_path_for_token(token: &str) -> Option<&'static str> {
+    BIN_EXEC_PATHS
+        .into_iter()
+        .find(|&path| path == token || path.strip_prefix("/bin/") == Some(token))
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // New VFS types (M1)
@@ -116,11 +156,29 @@ pub trait VfsOps {
     fn stat(&self, ino: InodeNum) -> Result<Stat, FsError>;
     fn read_data(&self, ino: InodeNum, offset: u32, buf: &mut [u8]) -> Result<usize, FsError>;
     fn write_data(&mut self, ino: InodeNum, offset: u32, data: &[u8]) -> Result<usize, FsError>;
+    fn readlink(&self, ino: InodeNum, buf: &mut [u8]) -> Result<usize, FsError>;
+    fn touch_accessed(&mut self, ino: InodeNum) -> Result<(), FsError>;
     fn truncate(&mut self, ino: InodeNum, size: u32) -> Result<(), FsError>;
+    fn chmod(&mut self, ino: InodeNum, mode: u16) -> Result<(), FsError>;
     fn create(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError>;
     fn mkdir(&mut self, parent: InodeNum, name: &[u8], mode: u16) -> Result<InodeNum, FsError>;
+    fn link(&mut self, parent: InodeNum, name: &[u8], target: InodeNum) -> Result<(), FsError>;
+    fn symlink(
+        &mut self,
+        parent: InodeNum,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<InodeNum, FsError>;
     fn unlink(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
+    #[allow(dead_code)]
     fn rmdir(&mut self, parent: InodeNum, name: &[u8]) -> Result<(), FsError>;
+    fn rename(
+        &mut self,
+        old_parent: InodeNum,
+        old_name: &[u8],
+        new_parent: InodeNum,
+        new_name: &[u8],
+    ) -> Result<(), FsError>;
     fn readdir(
         &self,
         ino: InodeNum,
@@ -160,9 +218,12 @@ pub enum FsError {
     // New variants (M1)
     NotADirectory,
     IsADirectory,
+    #[allow(dead_code)]
     DirectoryNotEmpty,
     AlreadyExists,
     ReadOnly,
+    PermissionDenied,
+    TooManySymlinks,
 }
 
 impl FsError {
@@ -183,6 +244,8 @@ impl FsError {
             Self::DirectoryNotEmpty => "directory_not_empty",
             Self::AlreadyExists => "already_exists",
             Self::ReadOnly => "read_only",
+            Self::PermissionDenied => "permission_denied",
+            Self::TooManySymlinks => "eloop",
         }
     }
 }
@@ -217,10 +280,6 @@ impl DirEntry {
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("<invalid-name>")
     }
-
-    pub const fn size(&self) -> usize {
-        self.size
-    }
 }
 
 /// Legacy path-based VFS trait. DiskFs and the new RamFs both implement this.
@@ -228,6 +287,7 @@ pub trait Vfs {
     fn list(&self, out: &mut [DirEntry]) -> usize;
     fn read(&self, path: &str, out: &mut [u8]) -> Result<usize, FsError>;
     fn write(&mut self, path: &str, data: &[u8]) -> Result<usize, FsError>;
+    #[allow(dead_code)]
     fn delete(&mut self, path: &str) -> Result<(), FsError>;
     fn file_count(&self) -> usize;
     fn used_bytes(&self) -> usize;
@@ -259,6 +319,7 @@ struct FsState {
     diskfs_v2: DiskFsV2,
     procfs: ProcFs,
     tmpfs: TmpFs,
+    dentry_cache: UnsafeCell<DentryCache>,
 }
 
 impl FsState {
@@ -271,6 +332,7 @@ impl FsState {
             diskfs_v2: DiskFsV2::new(),
             procfs: ProcFs::new(),
             tmpfs: TmpFs::new(),
+            dentry_cache: UnsafeCell::new(DentryCache::new()),
         }
     }
 
@@ -406,18 +468,130 @@ impl FsState {
         }
     }
 
-    fn stat_path(&self, path: &str, current_pid: Option<u32>) -> Result<Stat, FsError> {
-        let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
+    fn dentry_cache(&self) -> &DentryCache {
+        // SAFETY: `FS_LOCK` serializes all filesystem access, including cache reads.
+        unsafe { &*self.dentry_cache.get() }
+    }
+
+    fn with_dentry_cache_mut<R>(&self, f: impl FnOnce(&mut DentryCache) -> R) -> R {
+        // SAFETY: `FS_LOCK` serializes all filesystem access, including cache writes.
+        unsafe { f(&mut *self.dentry_cache.get()) }
+    }
+
+    fn invalidate_dentry_cache(&self) {
+        self.with_dentry_cache_mut(|cache| cache.invalidate_all());
+    }
+
+    fn inode_stat(&self, node: ResolvedInode) -> Result<Stat, FsError> {
+        match node.mount {
             MountKind::Root => match self.backend {
-                FsBackend::RamFs => stat_local_path(&self.ramfs, resolved.local_path()),
-                FsBackend::DiskFsV2 => stat_local_path(&self.diskfs_v2, resolved.local_path()),
+                FsBackend::RamFs => self.ramfs.stat(node.ino),
+                FsBackend::DiskFsV2 => self.diskfs_v2.stat(node.ino),
             },
-            MountKind::Proc => self
-                .procfs
-                .stat_path(resolved.local_path(), self.procfs_context(current_pid)),
-            MountKind::Tmp => stat_local_path(&self.tmpfs, resolved.local_path()),
+            MountKind::Tmp => self.tmpfs.stat(node.ino),
+            MountKind::Proc => Err(FsError::InvalidPath),
+        }
+    }
+
+    fn inode_touch_accessed(&mut self, node: ResolvedInode) -> Result<(), FsError> {
+        match node.mount {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => self.ramfs.touch_accessed(node.ino),
+                FsBackend::DiskFsV2 => self.diskfs_v2.touch_accessed(node.ino),
+            },
+            MountKind::Tmp => self.tmpfs.touch_accessed(node.ino),
+            MountKind::Proc => Err(FsError::InvalidPath),
+        }
+    }
+
+    fn inode_chmod(&mut self, node: ResolvedInode, mode: u16) -> Result<(), FsError> {
+        match node.mount {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => self.ramfs.chmod(node.ino, mode),
+                FsBackend::DiskFsV2 => self.diskfs_v2.chmod(node.ino, mode),
+            },
+            MountKind::Tmp => self.tmpfs.chmod(node.ino, mode),
+            MountKind::Proc => Err(FsError::InvalidPath),
+        }
+    }
+
+    fn resolve_canonical_path(
+        &self,
+        canonical: CanonicalPath,
+        follow_final: bool,
+        depth: usize,
+    ) -> Result<ResolvedPath, FsError> {
+        if depth > MAX_SYMLINK_DEPTH {
+            return Err(FsError::TooManySymlinks);
+        }
+
+        if let Some(cached) = self.dentry_cache().lookup(canonical.as_str(), follow_final) {
+            trace_dentry_hit(canonical.as_str(), cached);
+            return Ok(match cached {
+                CachedResolution::Inode { mount, ino } => {
+                    ResolvedPath::Inode(ResolvedInode { mount, ino })
+                }
+                CachedResolution::Proc => ResolvedPath::Proc(canonical),
+            });
+        }
+
+        let resolved = resolve_mount(&canonical);
+        let path = match resolved.kind {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => resolve_backend_mount_path(
+                    self,
+                    &self.ramfs,
+                    MountKind::Root,
+                    resolved.local_path(),
+                    follow_final,
+                    depth,
+                ),
+                FsBackend::DiskFsV2 => resolve_backend_mount_path(
+                    self,
+                    &self.diskfs_v2,
+                    MountKind::Root,
+                    resolved.local_path(),
+                    follow_final,
+                    depth,
+                ),
+            },
+            MountKind::Proc => Ok(ResolvedPath::Proc(canonical)),
+            MountKind::Tmp => resolve_backend_mount_path(
+                self,
+                &self.tmpfs,
+                MountKind::Tmp,
+                resolved.local_path(),
+                follow_final,
+                depth,
+            ),
+        }?;
+
+        let cached = match path {
+            ResolvedPath::Inode(node) => CachedResolution::Inode {
+                mount: node.mount,
+                ino: node.ino,
+            },
+            ResolvedPath::Proc(_) => CachedResolution::Proc,
+        };
+        self.with_dentry_cache_mut(|cache| {
+            cache.insert(canonical.as_str(), follow_final, cached);
+        });
+        Ok(path)
+    }
+
+    fn resolve_path(&self, path: &str, follow_final: bool) -> Result<ResolvedPath, FsError> {
+        let canonical = canonicalize(path)?;
+        self.resolve_canonical_path(canonical, follow_final, 0)
+    }
+
+    fn stat_path(&self, path: &str, current_pid: Option<u32>) -> Result<Stat, FsError> {
+        match self.resolve_path(path, true)? {
+            ResolvedPath::Inode(node) => self.inode_stat(node),
+            ResolvedPath::Proc(canonical) => {
+                let resolved = resolve_mount(&canonical);
+                self.procfs
+                    .stat_path(resolved.local_path(), self.procfs_context(current_pid))
+            }
         }
     }
 
@@ -427,72 +601,292 @@ impl FsState {
         out: &mut [VfsDirEntry],
         current_pid: Option<u32>,
     ) -> Result<usize, FsError> {
-        let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
-            MountKind::Root => match self.backend {
-                FsBackend::RamFs => list_local_dir(&self.ramfs, resolved.local_path(), out),
-                FsBackend::DiskFsV2 => list_local_dir(&self.diskfs_v2, resolved.local_path(), out),
-            },
-            MountKind::Proc => {
+        let identity = proc::fs_identity(current_pid);
+        match self.resolve_path(path, true)? {
+            ResolvedPath::Inode(node) => {
+                let stat = self.inode_stat(node)?;
+                require_inode_permission(identity, &stat, 0o4)?;
+                match node.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => list_inode_dir(&self.ramfs, node.ino, out),
+                        FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, node.ino, out),
+                    },
+                    MountKind::Tmp => list_inode_dir(&self.tmpfs, node.ino, out),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }
+            }
+            ResolvedPath::Proc(canonical) => {
+                let resolved = resolve_mount(&canonical);
                 self.procfs
                     .readdir(resolved.local_path(), self.procfs_context(current_pid), out)
             }
-            MountKind::Tmp => list_local_dir(&self.tmpfs, resolved.local_path(), out),
         }
     }
 
     fn read_path(
-        &self,
+        &mut self,
         path: &str,
         out: &mut [u8],
         current_pid: Option<u32>,
     ) -> Result<usize, FsError> {
-        let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
-            MountKind::Root => match self.backend {
-                FsBackend::RamFs => {
-                    read_backend_path(&self.ramfs, &self.ramfs, resolved.local_path(), out)
-                }
-                FsBackend::DiskFsV2 => {
-                    read_backend_path(&self.diskfs_v2, &self.diskfs_v2, resolved.local_path(), out)
-                }
-            },
-            MountKind::Proc => {
+        let identity = proc::fs_identity(current_pid);
+        match self.resolve_path(path, true)? {
+            ResolvedPath::Inode(node) => {
+                let stat = self.inode_stat(node)?;
+                require_inode_permission(identity, &stat, 0o4)?;
+                let read = match node.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => read_inode_file(&self.ramfs, node.ino, 0, out),
+                        FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, node.ino, 0, out),
+                    },
+                    MountKind::Tmp => read_inode_file(&self.tmpfs, node.ino, 0, out),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }?;
+                self.inode_touch_accessed(node)?;
+                Ok(read)
+            }
+            ResolvedPath::Proc(canonical) => {
+                let resolved = resolve_mount(&canonical);
                 self.procfs
                     .read_file(resolved.local_path(), self.procfs_context(current_pid), out)
-            }
-            MountKind::Tmp => {
-                read_backend_path(&self.tmpfs, &self.tmpfs, resolved.local_path(), out)
             }
         }
     }
 
     fn write_path(&mut self, path: &str, data: &[u8]) -> Result<usize, FsError> {
+        let file = self.open_path(path, None, O_WRONLY | O_CREAT | O_TRUNC)?;
+        self.write_open_file(file, 0, data)
+    }
+
+    fn delete_path(&mut self, path: &str, current_pid: Option<u32>) -> Result<(), FsError> {
         let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
-            MountKind::Root => match self.backend {
-                FsBackend::RamFs => self.ramfs.write(resolved.local_path(), data),
-                FsBackend::DiskFsV2 => self.diskfs_v2.write(resolved.local_path(), data),
-            },
-            MountKind::Proc => Err(FsError::ReadOnly),
-            MountKind::Tmp => self.tmpfs.write(resolved.local_path(), data),
+        let (parent_path, name) = split_parent_path(canonical.as_str())?;
+        let identity = proc::fs_identity(current_pid);
+        let result = match self.resolve_path(parent_path, true)? {
+            ResolvedPath::Inode(node) => {
+                let parent_stat = self.inode_stat(node)?;
+                require_inode_permission(identity, &parent_stat, 0o2)?;
+                match node.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => self.ramfs.unlink(node.ino, name.as_bytes()),
+                        FsBackend::DiskFsV2 => self.diskfs_v2.unlink(node.ino, name.as_bytes()),
+                    },
+                    MountKind::Tmp => self.tmpfs.unlink(node.ino, name.as_bytes()),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("unlink");
+        }
+        result
+    }
+
+    fn link_path(
+        &mut self,
+        source: &str,
+        destination: &str,
+        current_pid: Option<u32>,
+    ) -> Result<(), FsError> {
+        let identity = proc::fs_identity(current_pid);
+        let source = match self.resolve_path(source, false)? {
+            ResolvedPath::Inode(node) => node,
+            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+        };
+        let source_stat = self.inode_stat(source)?;
+        if source_stat.file_type == FileType::Directory {
+            return Err(FsError::IsADirectory);
+        }
+
+        let canonical = canonicalize(destination)?;
+        let (parent_path, name) = split_parent_path(canonical.as_str())?;
+        let result = match self.resolve_path(parent_path, true)? {
+            ResolvedPath::Inode(parent) => {
+                if parent.mount != source.mount {
+                    return Err(FsError::InvalidPath);
+                }
+                let parent_stat = self.inode_stat(parent)?;
+                require_inode_permission(identity, &parent_stat, 0o2)?;
+                match parent.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => {
+                            self.ramfs.link(parent.ino, name.as_bytes(), source.ino)
+                        }
+                        FsBackend::DiskFsV2 => {
+                            self.diskfs_v2.link(parent.ino, name.as_bytes(), source.ino)
+                        }
+                    },
+                    MountKind::Tmp => self.tmpfs.link(parent.ino, name.as_bytes(), source.ino),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("link");
+        }
+        result
+    }
+
+    fn symlink_path(
+        &mut self,
+        target: &str,
+        link_path: &str,
+        current_pid: Option<u32>,
+    ) -> Result<(), FsError> {
+        let canonical = canonicalize(link_path)?;
+        let (parent_path, name) = split_parent_path(canonical.as_str())?;
+        let identity = proc::fs_identity(current_pid);
+        let result = match self.resolve_path(parent_path, true)? {
+            ResolvedPath::Inode(parent) => {
+                let parent_stat = self.inode_stat(parent)?;
+                require_inode_permission(identity, &parent_stat, 0o2)?;
+                match parent.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => {
+                            self.ramfs
+                                .symlink(parent.ino, name.as_bytes(), target.as_bytes())
+                        }
+                        FsBackend::DiskFsV2 => {
+                            self.diskfs_v2
+                                .symlink(parent.ino, name.as_bytes(), target.as_bytes())
+                        }
+                    }
+                    .map(|_| ()),
+                    MountKind::Tmp => self
+                        .tmpfs
+                        .symlink(parent.ino, name.as_bytes(), target.as_bytes())
+                        .map(|_| ()),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("symlink");
+        }
+        result
+    }
+
+    fn mkdir_path(
+        &mut self,
+        path: &str,
+        mode: u16,
+        current_pid: Option<u32>,
+    ) -> Result<(), FsError> {
+        let canonical = canonicalize(path)?;
+        let (parent_path, name) = split_parent_path(canonical.as_str())?;
+        let identity = proc::fs_identity(current_pid);
+        let result = match self.resolve_path(parent_path, true)? {
+            ResolvedPath::Inode(parent) => {
+                let parent_stat = self.inode_stat(parent)?;
+                require_inode_permission(identity, &parent_stat, 0o2)?;
+                match parent.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => self.ramfs.mkdir(parent.ino, name.as_bytes(), mode),
+                        FsBackend::DiskFsV2 => {
+                            self.diskfs_v2.mkdir(parent.ino, name.as_bytes(), mode)
+                        }
+                    }
+                    .map(|_| ()),
+                    MountKind::Tmp => self
+                        .tmpfs
+                        .mkdir(parent.ino, name.as_bytes(), mode)
+                        .map(|_| ()),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("mkdir");
+        }
+        result
+    }
+
+    fn chmod_path(
+        &mut self,
+        path: &str,
+        mode: u16,
+        current_pid: Option<u32>,
+    ) -> Result<(), FsError> {
+        let identity = proc::fs_identity(current_pid);
+        match self.resolve_path(path, true)? {
+            ResolvedPath::Inode(node) => {
+                let stat = self.inode_stat(node)?;
+                require_owner(identity, &stat)?;
+                self.inode_chmod(node, mode)
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
         }
     }
 
-    fn delete_path(&mut self, path: &str) -> Result<(), FsError> {
-        let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
-            MountKind::Root => match self.backend {
-                FsBackend::RamFs => self.ramfs.delete(resolved.local_path()),
-                FsBackend::DiskFsV2 => self.diskfs_v2.delete(resolved.local_path()),
-            },
-            MountKind::Proc => Err(FsError::ReadOnly),
-            MountKind::Tmp => self.tmpfs.delete(resolved.local_path()),
+    fn rename_path(
+        &mut self,
+        source: &str,
+        destination: &str,
+        current_pid: Option<u32>,
+    ) -> Result<(), FsError> {
+        let source_canonical = canonicalize(source)?;
+        let destination_canonical = canonicalize(destination)?;
+        if source_canonical.as_str() == destination_canonical.as_str() {
+            return Ok(());
         }
+
+        let (old_parent_path, old_name) = split_parent_path(source_canonical.as_str())?;
+        let (new_parent_path, new_name) = split_parent_path(destination_canonical.as_str())?;
+        let identity = proc::fs_identity(current_pid);
+
+        let old_parent = match self.resolve_path(old_parent_path, true)? {
+            ResolvedPath::Inode(node) => node,
+            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+        };
+        let new_parent = match self.resolve_path(new_parent_path, true)? {
+            ResolvedPath::Inode(node) => node,
+            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+        };
+        if old_parent.mount != new_parent.mount {
+            return Err(FsError::InvalidPath);
+        }
+
+        let old_parent_stat = self.inode_stat(old_parent)?;
+        require_inode_permission(identity, &old_parent_stat, 0o2)?;
+        let new_parent_stat = self.inode_stat(new_parent)?;
+        require_inode_permission(identity, &new_parent_stat, 0o2)?;
+
+        let result = match old_parent.mount {
+            MountKind::Root => match self.backend {
+                FsBackend::RamFs => self.ramfs.rename(
+                    old_parent.ino,
+                    old_name.as_bytes(),
+                    new_parent.ino,
+                    new_name.as_bytes(),
+                ),
+                FsBackend::DiskFsV2 => self.diskfs_v2.rename(
+                    old_parent.ino,
+                    old_name.as_bytes(),
+                    new_parent.ino,
+                    new_name.as_bytes(),
+                ),
+            },
+            MountKind::Tmp => self.tmpfs.rename(
+                old_parent.ino,
+                old_name.as_bytes(),
+                new_parent.ino,
+                new_name.as_bytes(),
+            ),
+            MountKind::Proc => Err(FsError::InvalidPath),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("rename");
+        }
+        result
     }
 
     fn open_path(
@@ -501,51 +895,102 @@ impl FsState {
         current_pid: Option<u32>,
         flags: u32,
     ) -> Result<OpenFile, FsError> {
-        let canonical = canonicalize(path)?;
-        let resolved = resolve_mount(&canonical);
-        match resolved.kind {
-            MountKind::Root => match self.backend {
-                FsBackend::RamFs => open_local_file(
-                    &mut self.ramfs,
-                    resolved.local_path(),
-                    flags,
-                    MountKind::Root,
-                ),
-                FsBackend::DiskFsV2 => open_local_file(
-                    &mut self.diskfs_v2,
-                    resolved.local_path(),
-                    flags,
-                    MountKind::Root,
-                ),
-            },
-            MountKind::Proc => self
-                .procfs
-                .open_file(resolved.local_path(), self.procfs_context(current_pid))
-                .map(OpenFile::Proc),
-            MountKind::Tmp => open_local_file(
-                &mut self.tmpfs,
-                resolved.local_path(),
-                flags,
-                MountKind::Tmp,
-            ),
+        let identity = proc::fs_identity(current_pid);
+        let access = flags & O_ACCMODE;
+        if access > arrostd::syscall::O_RDWR {
+            return Err(FsError::InvalidPath);
+        }
+        if (flags & O_TRUNC) != 0 && access == O_RDONLY {
+            return Err(FsError::InvalidPath);
+        }
+
+        match self.resolve_path(path, true) {
+            Ok(ResolvedPath::Inode(node)) => {
+                let stat = self.inode_stat(node)?;
+                if stat.file_type == FileType::Directory {
+                    return Err(FsError::IsADirectory);
+                }
+                let required = match access {
+                    O_RDONLY => 0o4,
+                    O_WRONLY => 0o2,
+                    _ => 0o6,
+                };
+                require_inode_permission(identity, &stat, required)?;
+                if (flags & O_TRUNC) != 0 {
+                    match node.mount {
+                        MountKind::Root => match self.backend {
+                            FsBackend::RamFs => self.ramfs.truncate(node.ino, 0)?,
+                            FsBackend::DiskFsV2 => self.diskfs_v2.truncate(node.ino, 0)?,
+                        },
+                        MountKind::Tmp => self.tmpfs.truncate(node.ino, 0)?,
+                        MountKind::Proc => return Err(FsError::InvalidPath),
+                    }
+                }
+                Ok(OpenFile::File {
+                    mount: node.mount,
+                    ino: node.ino,
+                })
+            }
+            Ok(ResolvedPath::Proc(canonical)) => {
+                let resolved = resolve_mount(&canonical);
+                self.procfs
+                    .open_file(resolved.local_path(), self.procfs_context(current_pid))
+                    .map(OpenFile::Proc)
+            }
+            Err(FsError::NotFound) if (flags & O_CREAT) != 0 => {
+                let canonical = canonicalize(path)?;
+                let (parent_path, name) = split_parent_path(canonical.as_str())?;
+                match self.resolve_path(parent_path, true)? {
+                    ResolvedPath::Inode(parent) => {
+                        let parent_stat = self.inode_stat(parent)?;
+                        require_inode_permission(identity, &parent_stat, 0o2)?;
+                        let ino = match parent.mount {
+                            MountKind::Root => match self.backend {
+                                FsBackend::RamFs => {
+                                    self.ramfs.create(parent.ino, name.as_bytes(), 0o644)?
+                                }
+                                FsBackend::DiskFsV2 => {
+                                    self.diskfs_v2.create(parent.ino, name.as_bytes(), 0o644)?
+                                }
+                            },
+                            MountKind::Tmp => {
+                                self.tmpfs.create(parent.ino, name.as_bytes(), 0o644)?
+                            }
+                            MountKind::Proc => return Err(FsError::InvalidPath),
+                        };
+                        self.invalidate_dentry_cache();
+                        trace_dentry_invalidate("create");
+                        Ok(OpenFile::File {
+                            mount: parent.mount,
+                            ino,
+                        })
+                    }
+                    ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
     fn read_open_file(
-        &self,
+        &mut self,
         file: OpenFile,
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize, FsError> {
         match file {
-            OpenFile::File { mount, ino } => match mount {
-                MountKind::Root => match self.backend {
-                    FsBackend::RamFs => read_inode_file(&self.ramfs, ino, offset, out),
-                    FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, ino, offset, out),
-                },
-                MountKind::Tmp => read_inode_file(&self.tmpfs, ino, offset, out),
-                MountKind::Proc => Err(FsError::InvalidPath),
-            },
+            OpenFile::File { mount, ino } => {
+                let read = match mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => read_inode_file(&self.ramfs, ino, offset, out),
+                        FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, ino, offset, out),
+                    },
+                    MountKind::Tmp => read_inode_file(&self.tmpfs, ino, offset, out),
+                    MountKind::Proc => Err(FsError::InvalidPath),
+                }?;
+                self.inode_touch_accessed(ResolvedInode { mount, ino })?;
+                Ok(read)
+            }
             OpenFile::Proc(file) => {
                 self.procfs
                     .read_open_file(file, self.root_backend_name(), offset, out)
@@ -633,19 +1078,6 @@ pub fn init() -> FsInitReport {
     with_fs_mut(|state| state.init())
 }
 
-pub fn list_to_serial() {
-    let mut entries = [DirEntry::empty(); MAX_FILES];
-    let count = list_entries(&mut entries);
-    serial::write_fmt(format_args!("ls: entries={count}\n"));
-    for entry in entries.iter().take(count) {
-        serial::write_fmt(format_args!("{} ({} bytes)\n", entry.name(), entry.size()));
-    }
-}
-
-pub fn list_entries(out: &mut [DirEntry]) -> usize {
-    with_vfs(|vfs| vfs.list(out))
-}
-
 pub fn file_exists(path: &str) -> bool {
     stat_path(path, proc::shell_pid()).is_ok()
 }
@@ -682,7 +1114,7 @@ pub fn read_file_for_pid(
     out: &mut [u8],
     current_pid: Option<u32>,
 ) -> Result<usize, FsError> {
-    with_fs(|state| state.read_path(path, out, current_pid))
+    with_fs_mut(|state| state.read_path(path, out, current_pid))
 }
 
 pub fn write_from_echo(path: &str, text: &str) {
@@ -724,7 +1156,91 @@ pub fn copy_file_to_serial(source: &str, destination: &str) {
 }
 
 pub fn delete_file(path: &str) -> Result<(), FsError> {
-    with_fs_mut(|state| state.delete_path(path))
+    delete_file_for_pid(path, proc::shell_pid())
+}
+
+pub fn link_file(source: &str, destination: &str) -> Result<(), FsError> {
+    link_file_for_pid(source, destination, proc::shell_pid())
+}
+
+pub fn symlink_file(target: &str, link_path: &str) -> Result<(), FsError> {
+    symlink_file_for_pid(target, link_path, proc::shell_pid())
+}
+
+pub fn delete_file_for_pid(path: &str, current_pid: Option<u32>) -> Result<(), FsError> {
+    with_fs_mut(|state| state.delete_path(path, current_pid))
+}
+
+pub fn link_file_for_pid(
+    source: &str,
+    destination: &str,
+    current_pid: Option<u32>,
+) -> Result<(), FsError> {
+    with_fs_mut(|state| state.link_path(source, destination, current_pid))
+}
+
+pub fn symlink_file_for_pid(
+    target: &str,
+    link_path: &str,
+    current_pid: Option<u32>,
+) -> Result<(), FsError> {
+    with_fs_mut(|state| state.symlink_path(target, link_path, current_pid))
+}
+
+pub fn mkdir_dir(path: &str, mode: u16, current_pid: Option<u32>) -> Result<(), FsError> {
+    with_fs_mut(|state| state.mkdir_path(path, mode, current_pid))
+}
+
+pub fn rename_file(
+    source: &str,
+    destination: &str,
+    current_pid: Option<u32>,
+) -> Result<(), FsError> {
+    with_fs_mut(|state| state.rename_path(source, destination, current_pid))
+}
+
+pub fn chmod_file(path: &str, mode: u16, current_pid: Option<u32>) -> Result<(), FsError> {
+    with_fs_mut(|state| state.chmod_path(path, mode, current_pid))
+}
+
+pub fn resolve_path_from(cwd: &str, path: &str) -> Result<String, FsError> {
+    let trimmed = path.trim();
+    let joined = if trimmed.is_empty() {
+        String::from(cwd)
+    } else if trimmed.starts_with('/') {
+        String::from(trimmed)
+    } else if cwd == "/" {
+        let mut combined = String::from("/");
+        combined.push_str(trimmed);
+        combined
+    } else {
+        let mut combined = String::from(cwd.trim_end_matches('/'));
+        combined.push('/');
+        combined.push_str(trimmed);
+        combined
+    };
+    Ok(String::from(canonicalize(&joined)?.as_str()))
+}
+
+pub fn describe_stat(path: &str, current_pid: Option<u32>) -> Result<String, FsError> {
+    let stat = stat_path(path, current_pid)?;
+    let mut line = String::new();
+    let _ = write!(
+        line,
+        "stat: path={} ino={} type={} mode={:#o} uid={} gid={} nlink={} size={} atime={} mtime={} ctime={}",
+        path.trim(),
+        stat.ino,
+        file_type_name(stat.file_type),
+        stat.mode,
+        stat.uid,
+        stat.gid,
+        stat.nlink,
+        stat.size,
+        stat.accessed,
+        stat.modified,
+        stat.created
+    );
+    Ok(line)
 }
 
 pub(crate) fn open_file(
@@ -742,7 +1258,7 @@ pub(crate) fn read_open_file(
     offset: u64,
     out: &mut [u8],
 ) -> Result<usize, FsError> {
-    with_fs(|state| state.read_open_file(file, offset, out))
+    with_fs_mut(|state| state.read_open_file(file, offset, out))
 }
 
 pub(crate) fn write_open_file(file: OpenFile, offset: u64, data: &[u8]) -> Result<usize, FsError> {
@@ -761,6 +1277,75 @@ pub fn delete_file_to_serial(path: &str) {
             path.trim(),
             err.as_str()
         )),
+    }
+}
+
+pub fn link_file_to_serial(source: &str, destination: &str) {
+    match link_file(source, destination) {
+        Ok(()) => serial::write_fmt(format_args!(
+            "link: {} -> {}\n",
+            source.trim(),
+            destination.trim()
+        )),
+        Err(err) => serial::write_fmt(format_args!(
+            "link: {} -> {} ({})\n",
+            source.trim(),
+            destination.trim(),
+            err.as_str()
+        )),
+    }
+}
+
+pub fn symlink_file_to_serial(target: &str, link_path: &str) {
+    match symlink_file(target, link_path) {
+        Ok(()) => serial::write_fmt(format_args!(
+            "symlink: {} -> {}\n",
+            link_path.trim(),
+            target.trim()
+        )),
+        Err(err) => serial::write_fmt(format_args!(
+            "symlink: {} -> {} ({})\n",
+            link_path.trim(),
+            target.trim(),
+            err.as_str()
+        )),
+    }
+}
+
+pub fn mkdir_dir_to_serial(path: &str, mode: u16, current_pid: Option<u32>) {
+    match mkdir_dir(path, mode, current_pid) {
+        Ok(()) => serial::write_fmt(format_args!("mkdir: {} mode={:#o}\n", path.trim(), mode)),
+        Err(err) => serial::write_fmt(format_args!("mkdir: {} ({})\n", path.trim(), err.as_str())),
+    }
+}
+
+pub fn rename_file_to_serial(source: &str, destination: &str, current_pid: Option<u32>) {
+    match rename_file(source, destination, current_pid) {
+        Ok(()) => serial::write_fmt(format_args!(
+            "mv: {} -> {}\n",
+            source.trim(),
+            destination.trim()
+        )),
+        Err(err) => serial::write_fmt(format_args!(
+            "mv: {} -> {} ({})\n",
+            source.trim(),
+            destination.trim(),
+            err.as_str()
+        )),
+    }
+}
+
+pub fn chmod_file_to_serial(path: &str, mode: u16, current_pid: Option<u32>) {
+    match chmod_file(path, mode, current_pid) {
+        Ok(()) => serial::write_fmt(format_args!("chmod: {} mode={:#o}\n", path.trim(), mode)),
+        Err(err) => serial::write_fmt(format_args!("chmod: {} ({})\n", path.trim(), err.as_str())),
+    }
+}
+
+pub fn stat_path_to_serial(path: &str, current_pid: Option<u32>) {
+    match describe_stat(path, current_pid) {
+        Ok(line) => serial::write_fmt(format_args!("{line}\n")),
+        Err(err) => serial::write_fmt(format_args!("stat: {} ({})\n", path.trim(), err.as_str())),
     }
 }
 
@@ -787,7 +1372,12 @@ pub fn sync_to_disk() -> Result<(), FsError> {
 
 pub fn reload_from_disk() -> Result<(), FsError> {
     with_fs_mut(|state| match state.backend {
-        FsBackend::DiskFsV2 => state.diskfs_v2.remount(),
+        FsBackend::DiskFsV2 => {
+            state.diskfs_v2.remount()?;
+            state.invalidate_dentry_cache();
+            trace_dentry_invalidate("reload");
+            Ok(())
+        }
         FsBackend::RamFs => Err(FsError::StorageUnavailable),
     })
 }
@@ -844,18 +1434,6 @@ pub fn list_dir_to_serial(path: &str, current_pid: Option<u32>) {
 // Internal dispatch and locking
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn with_vfs<R>(f: impl FnOnce(&dyn Vfs) -> R) -> R {
-    let _guard = FS_LOCK.lock();
-    // SAFETY: `FS_LOCK` serializes access to global filesystem state.
-    unsafe {
-        let state = &*FS_STATE.0.get();
-        match state.backend {
-            FsBackend::RamFs => f(&state.ramfs),
-            FsBackend::DiskFsV2 => f(&state.diskfs_v2),
-        }
-    }
-}
-
 fn with_fs<R>(f: impl FnOnce(&FsState) -> R) -> R {
     let _guard = FS_LOCK.lock();
     // SAFETY: `FS_LOCK` serializes access to global filesystem state.
@@ -868,38 +1446,38 @@ fn with_fs_mut<R>(f: impl FnOnce(&mut FsState) -> R) -> R {
     unsafe { f(&mut *FS_STATE.0.get()) }
 }
 
-fn resolve_local_path(vfs: &dyn VfsOps, local_path: &str) -> Result<InodeNum, FsError> {
-    let trimmed = local_path.trim_matches('/');
-    let mut current = vfs.root_inode();
-    if trimmed.is_empty() {
-        return Ok(current);
-    }
-
-    for component in trimmed.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            current = vfs.lookup(current, b"..")?;
-            continue;
-        }
-        current = vfs.lookup(current, component.as_bytes())?;
-    }
-
-    Ok(current)
+#[derive(Clone, Copy)]
+struct ResolvedInode {
+    mount: MountKind,
+    ino: InodeNum,
 }
 
-fn stat_local_path(vfs: &dyn VfsOps, local_path: &str) -> Result<Stat, FsError> {
-    let ino = resolve_local_path(vfs, local_path)?;
-    vfs.stat(ino)
+#[derive(Clone, Copy)]
+enum ResolvedPath {
+    Inode(ResolvedInode),
+    Proc(CanonicalPath),
 }
 
-fn list_local_dir(
+fn split_parent_path(path: &str) -> Result<(&str, &str), FsError> {
+    if path == "/" {
+        return Err(FsError::IsADirectory);
+    }
+    let Some(index) = path.rfind('/') else {
+        return Err(FsError::InvalidPath);
+    };
+    let parent = if index == 0 { "/" } else { &path[..index] };
+    let name = &path[index + 1..];
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(FsError::InvalidPath);
+    }
+    Ok((parent, name))
+}
+
+fn list_inode_dir(
     vfs: &dyn VfsOps,
-    local_path: &str,
+    ino: InodeNum,
     out: &mut [VfsDirEntry],
 ) -> Result<usize, FsError> {
-    let ino = resolve_local_path(vfs, local_path)?;
     if vfs.stat(ino)?.file_type != FileType::Directory {
         return Err(FsError::NotADirectory);
     }
@@ -928,77 +1506,172 @@ fn list_local_dir(
     Ok(written)
 }
 
-fn read_backend_path(
-    vfs: &dyn Vfs,
-    vfs_ops: &dyn VfsOps,
-    local_path: &str,
-    out: &mut [u8],
-) -> Result<usize, FsError> {
-    if local_path.trim_matches('/').is_empty() {
-        return Err(FsError::IsADirectory);
-    }
-    if stat_local_path(vfs_ops, local_path)?.file_type == FileType::Directory {
-        return Err(FsError::IsADirectory);
-    }
-    vfs.read(local_path, out)
-}
-
-fn open_local_file(
-    vfs: &mut dyn VfsOps,
-    local_path: &str,
-    flags: u32,
-    mount: MountKind,
-) -> Result<OpenFile, FsError> {
-    let access = flags & O_ACCMODE;
-    if access > arrostd::syscall::O_RDWR {
-        return Err(FsError::InvalidPath);
-    }
-    if (flags & O_TRUNC) != 0 && access == O_RDONLY {
-        return Err(FsError::InvalidPath);
-    }
-
-    match resolve_local_path(vfs, local_path) {
-        Ok(ino) => {
-            let stat = vfs.stat(ino)?;
-            if stat.file_type == FileType::Directory {
-                return Err(FsError::IsADirectory);
-            }
-            if (flags & O_TRUNC) != 0 {
-                vfs.truncate(ino, 0)?;
-            }
-            Ok(OpenFile::File { mount, ino })
-        }
-        Err(FsError::NotFound) if (flags & O_CREAT) != 0 => {
-            let (parent, name) = resolve_parent_local_path(vfs, local_path)?;
-            let ino = vfs.create(parent, name.as_bytes(), 0o644)?;
-            Ok(OpenFile::File { mount, ino })
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn resolve_parent_local_path<'a>(
+fn resolve_backend_mount_path(
+    state: &FsState,
     vfs: &dyn VfsOps,
-    local_path: &'a str,
-) -> Result<(InodeNum, &'a str), FsError> {
+    mount: MountKind,
+    local_path: &str,
+    follow_final: bool,
+    depth: usize,
+) -> Result<ResolvedPath, FsError> {
     let trimmed = local_path.trim_matches('/');
+    let mut current = vfs.root_inode();
     if trimmed.is_empty() {
-        return Err(FsError::IsADirectory);
+        return Ok(ResolvedPath::Inode(ResolvedInode {
+            mount,
+            ino: current,
+        }));
     }
 
-    let (parent_path, name) = match trimmed.rfind('/') {
-        Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
-        None => ("", trimmed),
-    };
-    if name.is_empty() || name == "." || name == ".." {
+    let mut components = [""; 16];
+    let mut count = 0usize;
+    for component in trimmed.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if count >= components.len() {
+            return Err(FsError::InvalidPath);
+        }
+        components[count] = component;
+        count += 1;
+    }
+
+    for index in 0..count {
+        let child = vfs.lookup(current, components[index].as_bytes())?;
+        let stat = vfs.stat(child)?;
+        let is_final = index + 1 == count;
+        if stat.file_type == FileType::Symlink && (!is_final || follow_final) {
+            let redirected = build_symlink_redirect_path(
+                vfs,
+                mount,
+                child,
+                &components[..index],
+                &components[index + 1..count],
+            )?;
+            return state.resolve_canonical_path(redirected, follow_final, depth + 1);
+        }
+        current = child;
+    }
+
+    Ok(ResolvedPath::Inode(ResolvedInode {
+        mount,
+        ino: current,
+    }))
+}
+
+fn build_symlink_redirect_path(
+    vfs: &dyn VfsOps,
+    mount: MountKind,
+    symlink_ino: InodeNum,
+    parent_components: &[&str],
+    remainder: &[&str],
+) -> Result<CanonicalPath, FsError> {
+    let mut target_buf = [0u8; MAX_OPEN_PATH_BYTES];
+    let target_len = vfs.readlink(symlink_ino, &mut target_buf)?;
+    let target =
+        core::str::from_utf8(&target_buf[..target_len]).map_err(|_| FsError::InvalidPath)?;
+    if target.is_empty() {
         return Err(FsError::InvalidPath);
     }
 
-    let parent = resolve_local_path(vfs, parent_path)?;
-    if vfs.stat(parent)?.file_type != FileType::Directory {
-        return Err(FsError::NotADirectory);
+    let mut redirected = String::new();
+    if target.starts_with('/') {
+        redirected.push_str(target);
+    } else {
+        redirected.push_str(mount.path());
+        for component in parent_components {
+            append_path_component(&mut redirected, component)?;
+        }
+        if !redirected.ends_with('/') {
+            redirected.push('/');
+        }
+        redirected.push_str(target);
     }
-    Ok((parent, name))
+    if redirected.len() > MAX_OPEN_PATH_BYTES {
+        return Err(FsError::InvalidPath);
+    }
+    for component in remainder {
+        append_path_component(&mut redirected, component)?;
+    }
+    canonicalize(&redirected)
+}
+
+fn append_path_component(path: &mut String, component: &str) -> Result<(), FsError> {
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(component);
+    if path.len() > MAX_OPEN_PATH_BYTES {
+        return Err(FsError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn file_type_name(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::Regular => "file",
+        FileType::Directory => "dir",
+        FileType::Symlink => "symlink",
+    }
+}
+
+fn trace_dentry_hit(path: &str, cached: CachedResolution) {
+    if !DentryCache::trace_enabled() {
+        return;
+    }
+
+    match cached {
+        CachedResolution::Inode { mount, ino } => serial::write_fmt(format_args!(
+            "dentry: hit path={} mount={} ino={}\n",
+            path,
+            mount.path(),
+            ino
+        )),
+        CachedResolution::Proc => {
+            serial::write_fmt(format_args!("dentry: hit path={} mount=/proc\n", path))
+        }
+    }
+}
+
+fn trace_dentry_invalidate(reason: &str) {
+    if !DentryCache::trace_enabled() {
+        return;
+    }
+
+    serial::write_fmt(format_args!("dentry: invalidate reason={}\n", reason));
+}
+
+fn require_inode_permission(
+    identity: FsIdentity,
+    stat: &Stat,
+    required_bits: u16,
+) -> Result<(), FsError> {
+    if identity.privileged {
+        return Ok(());
+    }
+
+    let perm_mode = stat.mode & 0o777;
+    let class_bits = if identity.uid == stat.uid {
+        (perm_mode >> 6) & 0o7
+    } else if identity.gid == stat.gid {
+        (perm_mode >> 3) & 0o7
+    } else {
+        perm_mode & 0o7
+    };
+
+    if (class_bits & required_bits) == required_bits {
+        Ok(())
+    } else {
+        Err(FsError::PermissionDenied)
+    }
+}
+
+fn require_owner(identity: FsIdentity, stat: &Stat) -> Result<(), FsError> {
+    if identity.privileged || identity.uid == stat.uid {
+        Ok(())
+    } else {
+        Err(FsError::PermissionDenied)
+    }
 }
 
 fn read_inode_file(

@@ -172,21 +172,11 @@ impl FdTable {
     }
 
     fn alloc_fd_slot(&self) -> Option<usize> {
-        for index in 0..MAX_FDS {
-            if self.fd_slots[index].is_none() {
-                return Some(index);
-            }
-        }
-        None
+        (0..MAX_FDS).find(|&index| self.fd_slots[index].is_none())
     }
 
     fn alloc_description_slot(&self) -> Option<usize> {
-        for index in 0..MAX_FILE_DESCRIPTIONS {
-            if !self.descriptions[index].used {
-                return Some(index);
-            }
-        }
-        None
+        (0..MAX_FILE_DESCRIPTIONS).find(|&index| !self.descriptions[index].used)
     }
 
     fn release_description(&mut self, desc_index: usize) {
