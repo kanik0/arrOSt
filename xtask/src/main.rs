@@ -3796,6 +3796,14 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom status post-capture",
         )?;
+        // The doom status line is very long (~500 bytes); wait for its final field so the
+        // snapshot captures the complete line and parse_metric_value can find dg_key=.
+        wait_for_log(
+            &log,
+            "last_key=",
+            Duration::from_secs(4),
+            "doom status line complete post-capture",
+        )?;
         let capture_snapshot = snapshot_log(&log);
         let Some(capture_status_line) =
             last_matching_line(&capture_snapshot, "doom: app=doom engine=")
