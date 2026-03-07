@@ -87,6 +87,7 @@ kernel/                     Rust no_std kernel crate
       tmpfs.rs              Volatile /tmp filesystem
       procfs.rs             Synthetic /proc filesystem
       fd.rs                 Per-process file descriptor table
+      pipe.rs               Kernel pipe IPC (global table, 4 KiB circular buffers)
       dentry.rs             Dentry cache
       bitmap.rs             Block bitmap allocator
       migrate.rs            diskfs-v1 -> v2 migration
@@ -166,7 +167,15 @@ Three scheduler tables coexist:
 ### Syscall ABI (revision 5)
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
-- Numbers: write(1) read(2) exit(3) yield(4) sleep(5) socket(6) sendto(7) recvfrom(8) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14) open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22) bind(47) listen(48) accept(49) connect(50) send(51) recv(52)
+- Numbers:
+  - core: write(1) read(2) exit(3) yield(4) sleep(5) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14)
+  - filesystem: open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22)
+  - directory/path: mkdir(25) rmdir(26) unlink(27) rename(28) link(29) symlink(30) readlink(31) getcwd(32) chdir(33) getdents(34)
+  - process identity: getppid(35) getuid(36) getgid(37) kill(38)
+  - signal stubs (ENOSYS): sigaction(39) sigreturn(40)
+  - memory stubs (ENOSYS): mmap(41) munmap(42) mprotect(43) brk(44)
+  - ipc: pipe(45) pipe2(46)
+  - networking: socket(6) sendto(7) recvfrom(8) bind(47) listen(48) accept(49) connect(50) send(51) recv(52)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -247,9 +256,15 @@ Three scheduler tables coexist:
 **Summary**: PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) now preempt ring-3 processes at any instruction boundary. Naked ISR (x86_64) / full-save EL0 IRQ vector (aarch64) capture all GPRs; saved to static frame; restored on rescheduling. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`).
 
 ### M15: Extended Syscall Surface
-**Status**: Planned
-**Limitation**: "The syscall surface is intentionally small and not POSIX-complete."
-**Goal**: Expand the syscall ABI toward a broader POSIX-like subset (signals, pipes, mmap, ioctl, stat variants, directory ops).
+**Status**: Implemented
+**Summary**: Added 22 new syscalls (numbers 25–46) across four phases:
+- Phase A1 (directory ops): `mkdir` `rmdir` `unlink` `rename` `link` `symlink` `readlink` `getcwd` `chdir` `getdents`
+- Phase A2 (process identity): `getppid` `getuid` `getgid` `kill`
+- Phase A3 (memory, stubs): `mmap` `munmap` `mprotect` `brk` → return `ENOSYS`
+- Phase A4 (signal stubs): `sigaction` `sigreturn` → return `ENOSYS`
+- Phase A4 (pipe IPC): `pipe` `pipe2` with 8-slot global table, 4 KiB circular buffers, fd integration
+- Shell prompt upgraded from `arrost> ` to `user@arrost /path> ` (serial + GUI terminal)
+**Remaining**: Phase B signal infrastructure (delivery, frames, masking); full mmap/VMA layer.
 
 ### M16: Extended ProcFS
 **Status**: Planned

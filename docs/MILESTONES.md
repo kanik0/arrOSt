@@ -336,90 +336,73 @@ Currently, ring-3 processes only yield control back to the kernel when they make
 
 ## M15: Extended Syscall Surface
 
-**Status**: Planned
+**Status**: Implemented
 **Limitation**: The syscall surface is intentionally small and not POSIX-complete.
 **Goal**: Expand the syscall ABI toward a broader POSIX-like subset.
 
-### Dependencies
-- M12 (VFS-backed ELF launch groundwork) for running `/bin/*` user binaries; a future true `exec` family still needs separate syscall work.
-- M13 (fork) for `fork`/`wait` family.
-- M14 (timer preemption) for signals.
+### Delivered
 
-### Implementation Plan
+#### Phase A1: Directory and path syscalls (25–34)
 
-#### Phase A: Core POSIX-like Syscalls
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 25 | `mkdir` | `(path, mode) -> 0 or -errno` | VFS `create_dir` |
+| 26 | `rmdir` | `(path) -> 0 or -errno` | VFS `remove_dir` |
+| 27 | `unlink` | `(path) -> 0 or -errno` | VFS `unlink` |
+| 28 | `rename` | `(old_path, new_path) -> 0 or -errno` | VFS `rename` |
+| 29 | `link` | `(old_path, new_path) -> 0 or -errno` | VFS `link` |
+| 30 | `symlink` | `(target, linkpath) -> 0 or -errno` | VFS `symlink` |
+| 31 | `readlink` | `(path, buf, bufsize) -> bytes or -errno` | VFS `readlink` |
+| 32 | `getcwd` | `(buf, bufsize) -> bytes or -errno` | per-process CWD |
+| 33 | `chdir` | `(path) -> 0 or -errno` | per-process CWD update |
+| 34 | `getdents` | `(fd, buf, bufsize) -> bytes or -errno` | `readdir_open_file` in `fs/mod.rs` |
 
-##### Step A1: File and directory syscalls
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`, `kernel/src/fs/mod.rs`
+#### Phase A2: Process identity (35–40)
 
-Add the following syscalls:
+| Number | Name | Notes |
+|--------|------|-------|
+| 35 | `getppid` | returns parent PID from `Ring3ProcessContext` |
+| 36 | `getuid` | returns stub uid=0 |
+| 37 | `getgid` | returns stub gid=0 |
+| 38 | `kill` | sends `SIGKILL`/`SIGTERM` to a ring-3 process (marks it `exited`) |
+| 39 | `sigaction` | stub → `ENOSYS` |
+| 40 | `sigreturn` | stub → `ENOSYS` |
 
-| Number | Name | Signature | Description |
-|--------|------|-----------|-------------|
-| 25 | `mkdir` | `(path, mode) -> 0 or -errno` | Create directory |
-| 26 | `rmdir` | `(path) -> 0 or -errno` | Remove empty directory |
-| 27 | `unlink` | `(path) -> 0 or -errno` | Remove file/hard link |
-| 28 | `rename` | `(old_path, new_path) -> 0 or -errno` | Rename/move file |
-| 29 | `link` | `(old_path, new_path) -> 0 or -errno` | Create hard link |
-| 30 | `symlink` | `(target, linkpath) -> 0 or -errno` | Create symbolic link |
-| 31 | `readlink` | `(path, buf, bufsize) -> bytes_read or -errno` | Read symlink target |
-| 32 | `getcwd` | `(buf, bufsize) -> bytes_written or -errno` | Get current working directory |
-| 33 | `chdir` | `(path) -> 0 or -errno` | Change working directory |
-| 34 | `getdents` | `(fd, buf, bufsize) -> bytes_read or -errno` | Read directory entries |
+#### Phase A3: Memory stubs (41–44)
 
-For each syscall:
-1. Add the syscall number constant in `crates/arrostd/src/lib.rs`.
-2. Add the handler function in `kernel/src/proc/mod.rs` (dispatch).
-3. Implement the handler using existing VFS operations in `kernel/src/fs/mod.rs`.
-4. Copy user pointers via `copy_from_user`/`copy_to_user`.
-5. Return `-errno` on failure.
+| Number | Name | Notes |
+|--------|------|-------|
+| 41 | `mmap` | stub → `ENOSYS` |
+| 42 | `munmap` | stub → `ENOSYS` |
+| 43 | `mprotect` | stub → `ENOSYS` |
+| 44 | `brk` | stub → `ENOSYS` |
 
-##### Step A2: Process syscalls
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`
+#### Phase A4: Pipe IPC (45–46)
+**Files created**: `kernel/src/fs/pipe.rs`, `kernel/src/fs/fd.rs` (`PipeRead`/`PipeWrite` variants)
 
-| Number | Name | Signature | Description |
-|--------|------|-----------|-------------|
-| 35 | `getppid` | `() -> pid` | Get parent PID |
-| 36 | `getuid` | `() -> uid` | Get user ID |
-| 37 | `getgid` | `() -> gid` | Get group ID |
-| 38 | `kill` | `(pid, signal) -> 0 or -errno` | Send signal to process |
-| 39 | `sigaction` | `(signum, act, oldact) -> 0 or -errno` | Set signal handler |
-| 40 | `sigreturn` | `() -> (never)` | Return from signal handler |
+| Number | Name | Notes |
+|--------|------|-------|
+| 45 | `pipe` | allocates a pipe slot, writes two fds (read, write) to user buf |
+| 46 | `pipe2` | same as `pipe`; `O_CLOEXEC` flag accepted, others ignored |
 
-##### Step A3: Memory syscalls
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`, `kernel/src/mem/vma.rs`
+Pipe implementation: 8-slot global table, 4 KiB circular buffers, ref-counted ends.
+`fread` on read end returns EOF when write end is closed and buffer is empty.
+`fwrite` on write end returns `EAGAIN` when buffer is full.
 
-| Number | Name | Signature | Description |
-|--------|------|-----------|-------------|
-| 41 | `mmap` | `(addr, len, prot, flags, fd, offset) -> addr or -errno` | Map memory |
-| 42 | `munmap` | `(addr, len) -> 0 or -errno` | Unmap memory |
-| 43 | `mprotect` | `(addr, len, prot) -> 0 or -errno` | Change page permissions |
-| 44 | `brk` | `(addr) -> new_brk or -errno` | Set program break |
+#### Shell prompt (bonus)
+Serial and GUI terminal prompts upgraded from hardcoded `arrost> ` to context-aware `user@arrost /path> `.
+**Files modified**: `kernel/src/shell.rs`, `kernel/src/gfx/mod.rs`.
 
-##### Step A4: Pipe and IPC
-**Files to create**: `kernel/src/fs/pipe.rs`
+### Remaining (Phase B: Signal Infrastructure)
 
-| Number | Name | Signature | Description |
-|--------|------|-----------|-------------|
-| 45 | `pipe` | `(pipefd[2]) -> 0 or -errno` | Create pipe |
-| 46 | `pipe2` | `(pipefd[2], flags) -> 0 or -errno` | Create pipe with flags |
-
-Pipe implementation:
-1. Allocate a kernel buffer (e.g., 4096 bytes circular buffer).
-2. Create two fd entries: one for read end, one for write end.
-3. `fwrite` on write end appends to buffer; blocks (returns `EAGAIN`) if full.
-4. `fread` on read end consumes from buffer; returns 0 (EOF) when write end is closed and buffer is empty.
-
-#### Phase B: Signal Infrastructure
-
-##### Step B1: Per-process signal state
+#### Step B1: Per-process signal state
 **Files to create**: `kernel/src/proc/signal.rs`
 
 1. Define signal numbers: `SIGKILL=9`, `SIGTERM=15`, `SIGSEGV=11`, `SIGCHLD=17`, `SIGSTOP=19`, `SIGCONT=18`, `SIGUSR1=10`, `SIGUSR2=12`.
 2. Per-process: `pending_signals: u64` (bitmask), `signal_handlers: [SignalAction; 32]`, `signal_mask: u64`.
 3. `SignalAction`: `Default`, `Ignore`, `Handler(user_fn_addr)`.
 
-##### Step B2: Signal delivery
+#### Step B2: Signal delivery
 **Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/arch/*/interrupts.rs`
 
 1. Before returning to user mode (in syscall exit or preemption resume), check `pending_signals`.
@@ -429,14 +412,15 @@ Pipe implementation:
    - Set up a return trampoline that calls `sigreturn`.
 3. `sigreturn` restores the saved register state and resumes normal execution.
 
-#### Testing
-1. Add smoke tests for each new syscall.
-2. Test pipe: process A writes, process B reads.
-3. Test signals: parent sends SIGUSR1 to child, child's handler runs.
-4. Run all existing smoke tests for regression.
+#### Step B3: Full mmap/VMA layer
+Replace `mmap`/`munmap`/`mprotect`/`brk` stubs with a VMA manager backed by the per-process page table.
+**Files to create**: `kernel/src/mem/vma.rs`
 
-#### Documentation
-**Files to update**: `docs/SYSCALLS.md`, `docs/PROC.md`, `README.md`
+#### Validation targets (once Phase B is done)
+1. Smoke test pipe: process A writes, process B reads.
+2. Smoke test signals: parent sends SIGUSR1 to child, child's handler runs.
+3. Run all existing smoke tests for regression.
+4. **Files to update**: `docs/SYSCALLS.md`, `docs/PROC.md`, `README.md`
 
 ---
 
