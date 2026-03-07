@@ -53,6 +53,9 @@ const MAX_TX_FRAME: usize = 1536;
 const UDP_MAILBOX_CAP: usize = 512;
 const CURL_HTTP_BUF: usize = 2048;
 const CURL_WAIT_TICKS: u64 = 300;
+const MAX_TCP_CONNS: usize = 4;
+const TCP_RX_BUF: usize = 2048;
+const TCP_CONNECT_TICKS: u64 = 400;
 const DHCP_WAIT_TICKS: u64 = 400;
 
 const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
@@ -417,6 +420,88 @@ impl PendingHttpCurl {
     }
 }
 
+// ── TCP state machine ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+enum TcpState {
+    Closed,
+    SynSent,
+    Established,
+    FinWait1,
+    CloseWait,
+    Closing,
+    LastAck,
+    Reset,
+}
+
+impl TcpState {
+    #[allow(dead_code)]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "CLOSED",
+            Self::SynSent => "SYN_SENT",
+            Self::Established => "ESTABLISHED",
+            Self::FinWait1 => "FIN_WAIT_1",
+            Self::CloseWait => "CLOSE_WAIT",
+            Self::Closing => "CLOSING",
+            Self::LastAck => "LAST_ACK",
+            Self::Reset => "RESET",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TcpConn {
+    state: TcpState,
+    dst_mac: [u8; 6],
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_port: u16,
+    seq_next: u32,
+    ack_next: u32,
+    rx_buf: [u8; TCP_RX_BUF],
+    rx_len: usize,
+    fin_received: bool,
+}
+
+impl TcpConn {
+    const fn empty() -> Self {
+        Self {
+            state: TcpState::Closed,
+            dst_mac: [0; 6],
+            remote_ip: [0; 4],
+            remote_port: 0,
+            local_port: 0,
+            seq_next: 0,
+            ack_next: 0,
+            rx_buf: [0; TCP_RX_BUF],
+            rx_len: 0,
+            fin_received: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    fn is_active(&self) -> bool {
+        !matches!(self.state, TcpState::Closed | TcpState::Reset)
+    }
+}
+
+/// Public snapshot of one TCP connection for shell/netstat reporting.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct TcpConnInfo {
+    pub idx: u8,
+    pub state: &'static str,
+    pub local_port: u16,
+    pub remote_ip: [u8; 4],
+    pub remote_port: u16,
+    pub rx_bytes: usize,
+}
+
 #[derive(Clone, Copy)]
 pub struct NetInitReport {
     pub backend: &'static str,
@@ -563,6 +648,7 @@ struct NetState {
     stats: NetStats,
     last_udp: LastUdp,
     udp_mailbox: UdpMailbox,
+    tcp_conns: [TcpConn; MAX_TCP_CONNS],
     pending_http: PendingHttpCurl,
     dhcp_xid: u32,
     dhcp_offer: DhcpOffer,
@@ -602,6 +688,7 @@ impl NetState {
             stats: NetStats::new(),
             last_udp: LastUdp::empty(),
             udp_mailbox: UdpMailbox::empty(),
+            tcp_conns: [TcpConn::empty(); MAX_TCP_CONNS],
             pending_http: PendingHttpCurl::empty(),
             dhcp_xid: 0,
             dhcp_offer: DhcpOffer::empty(),
@@ -1122,6 +1209,22 @@ impl NetState {
         let flags = u16::from(payload[13]) & 0x3f;
         let data = &payload[data_offset..];
 
+        // Try to match a general TCP connection first.
+        for idx in 0..MAX_TCP_CONNS {
+            if !self.tcp_conns[idx].is_active() {
+                continue;
+            }
+            if self.tcp_conns[idx].remote_ip != src_ip
+                || self.tcp_conns[idx].remote_port != src_port
+                || self.tcp_conns[idx].local_port != dst_port
+            {
+                continue;
+            }
+            self.handle_tcp_conn(idx, seq, ack, flags, data);
+            return Ok(());
+        }
+
+        // Fall back to the legacy pending_http path.
         if !self.pending_http.active
             || self.pending_http.remote_ip != src_ip
             || self.pending_http.remote_port != src_port
@@ -1199,6 +1302,259 @@ impl NetState {
             self.pending_http.finished = true;
         }
         Ok(())
+    }
+
+    /// Process an incoming TCP segment for a general connection in `tcp_conns`.
+    fn handle_tcp_conn(&mut self, idx: usize, seq: u32, ack: u32, flags: u16, data: &[u8]) {
+        let conn = &self.tcp_conns[idx];
+        match conn.state {
+            TcpState::SynSent => {
+                if (flags & TCP_FLAG_RST) != 0 {
+                    self.tcp_conns[idx].state = TcpState::Reset;
+                    return;
+                }
+                if (flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)
+                    && ack == self.tcp_conns[idx].seq_next
+                {
+                    // Three-way handshake: received SYN-ACK, send ACK.
+                    self.tcp_conns[idx].ack_next = seq.wrapping_add(1);
+                    let seq_n = self.tcp_conns[idx].seq_next;
+                    let ack_n = self.tcp_conns[idx].ack_next;
+                    let _ = self.send_tcp_segment_for_conn(idx, seq_n, ack_n, TCP_FLAG_ACK, &[]);
+                    self.tcp_conns[idx].state = TcpState::Established;
+                }
+            }
+            TcpState::Established | TcpState::CloseWait => {
+                if (flags & TCP_FLAG_RST) != 0 {
+                    self.tcp_conns[idx].state = TcpState::Reset;
+                    return;
+                }
+                // Receive in-order data.
+                if !data.is_empty() && seq == self.tcp_conns[idx].ack_next {
+                    let conn = &mut self.tcp_conns[idx];
+                    let available = TCP_RX_BUF.saturating_sub(conn.rx_len);
+                    let copy_len = data.len().min(available);
+                    let start = conn.rx_len;
+                    conn.rx_buf[start..start + copy_len].copy_from_slice(&data[..copy_len]);
+                    conn.rx_len = start + copy_len;
+                    conn.ack_next = conn.ack_next.wrapping_add(data.len() as u32);
+                }
+                // Send ACK.
+                let seq_n = self.tcp_conns[idx].seq_next;
+                let ack_n = self.tcp_conns[idx].ack_next;
+                let _ = self.send_tcp_segment_for_conn(idx, seq_n, ack_n, TCP_FLAG_ACK, &[]);
+
+                if (flags & TCP_FLAG_FIN) != 0 {
+                    let conn = &mut self.tcp_conns[idx];
+                    conn.ack_next = conn.ack_next.wrapping_add(1);
+                    conn.fin_received = true;
+                    // Send ACK for FIN.
+                    let seq_n = conn.seq_next;
+                    let ack_n = conn.ack_next;
+                    let _ = self.send_tcp_segment_for_conn(idx, seq_n, ack_n, TCP_FLAG_ACK, &[]);
+                    if self.tcp_conns[idx].state == TcpState::Established {
+                        self.tcp_conns[idx].state = TcpState::CloseWait;
+                    }
+                }
+            }
+            TcpState::FinWait1 => {
+                if (flags & TCP_FLAG_ACK) != 0 && ack == self.tcp_conns[idx].seq_next {
+                    if (flags & TCP_FLAG_FIN) != 0 {
+                        // Simultaneous close.
+                        let conn = &mut self.tcp_conns[idx];
+                        conn.ack_next = seq.wrapping_add(1);
+                        let sn = conn.seq_next;
+                        let an = conn.ack_next;
+                        let _ = self.send_tcp_segment_for_conn(idx, sn, an, TCP_FLAG_ACK, &[]);
+                        self.tcp_conns[idx].state = TcpState::Closed;
+                    } else {
+                        // FIN ACKed - transition to time_wait (treat as closed).
+                        self.tcp_conns[idx].state = TcpState::Closed;
+                    }
+                } else if (flags & TCP_FLAG_FIN) != 0 {
+                    // Peer closed first.
+                    let conn = &mut self.tcp_conns[idx];
+                    conn.ack_next = seq.wrapping_add(1);
+                    let sn = conn.seq_next;
+                    let an = conn.ack_next;
+                    let _ = self.send_tcp_segment_for_conn(idx, sn, an, TCP_FLAG_ACK, &[]);
+                    self.tcp_conns[idx].state = TcpState::Closing;
+                }
+            }
+            TcpState::Closing | TcpState::LastAck => {
+                if (flags & TCP_FLAG_ACK) != 0 {
+                    self.tcp_conns[idx].state = TcpState::Closed;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn alloc_tcp_conn(&mut self) -> Option<usize> {
+        (0..MAX_TCP_CONNS).find(|&i| !self.tcp_conns[i].is_active())
+    }
+
+    /// Send a TCP segment for connection `idx`.
+    fn send_tcp_segment_for_conn(
+        &mut self,
+        idx: usize,
+        seq: u32,
+        ack: u32,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
+        if payload.len() > MAX_TX_FRAME.saturating_sub(40) {
+            return Err(NetError::FrameTooLarge);
+        }
+        let conn = &self.tcp_conns[idx];
+        let dst_mac = conn.dst_mac;
+        let remote_ip = conn.remote_ip;
+        let remote_port = conn.remote_port;
+        let local_port = conn.local_port;
+        let src_ip = self.ipv4;
+
+        let mut segment = [0u8; MAX_TX_FRAME];
+        segment[0..2].copy_from_slice(&local_port.to_be_bytes());
+        segment[2..4].copy_from_slice(&remote_port.to_be_bytes());
+        segment[4..8].copy_from_slice(&seq.to_be_bytes());
+        segment[8..12].copy_from_slice(&ack.to_be_bytes());
+        segment[12] = 5u8 << 4;
+        segment[13] = (flags & 0x3f) as u8;
+        segment[14..16].copy_from_slice(&4096u16.to_be_bytes());
+        segment[16..18].copy_from_slice(&0u16.to_be_bytes());
+        segment[18..20].copy_from_slice(&0u16.to_be_bytes());
+        segment[20..20 + payload.len()].copy_from_slice(payload);
+        let tcp_len = 20 + payload.len();
+        let checksum = tcp_checksum(src_ip, remote_ip, &segment[..tcp_len]);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+        self.send_ipv4_packet_with_src(
+            dst_mac,
+            remote_ip,
+            src_ip,
+            IP_PROTO_TCP,
+            &segment[..tcp_len],
+        )
+    }
+
+    /// Blocking connect: allocate a conn slot, send SYN, wait for ESTABLISHED.
+    /// Returns conn index on success.
+    fn tcp_connect_blocking(
+        &mut self,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        local_port: u16,
+    ) -> Result<u8, NetError> {
+        let idx = self.alloc_tcp_conn().ok_or(NetError::QueueUnavailable)?;
+
+        let next_hop = self.select_next_hop(dst_ip);
+        let dst_mac = self.resolve_arp(next_hop)?;
+        let initial_seq = self.make_dhcp_xid().wrapping_add(0x7abc_0000);
+
+        self.tcp_conns[idx].clear();
+        self.tcp_conns[idx].state = TcpState::SynSent;
+        self.tcp_conns[idx].dst_mac = dst_mac;
+        self.tcp_conns[idx].remote_ip = dst_ip;
+        self.tcp_conns[idx].remote_port = dst_port;
+        self.tcp_conns[idx].local_port = local_port;
+        self.tcp_conns[idx].seq_next = initial_seq;
+
+        // Send SYN.
+        self.send_tcp_segment_for_conn(idx, initial_seq, 0, TCP_FLAG_SYN, &[])?;
+        self.tcp_conns[idx].seq_next = initial_seq.wrapping_add(1);
+
+        let start = time::ticks();
+        while time::ticks().saturating_sub(start) < TCP_CONNECT_TICKS {
+            self.poll();
+            match self.tcp_conns[idx].state {
+                TcpState::Established => return Ok(idx as u8),
+                TcpState::Reset => {
+                    self.tcp_conns[idx].clear();
+                    return Err(NetError::IoTimeout);
+                }
+                _ => {}
+            }
+            core::hint::spin_loop();
+        }
+        self.tcp_conns[idx].clear();
+        Err(NetError::IoTimeout)
+    }
+
+    fn tcp_send_data(&mut self, idx: u8, data: &[u8]) -> Result<usize, NetError> {
+        let i = idx as usize;
+        if i >= MAX_TCP_CONNS || self.tcp_conns[i].state != TcpState::Established {
+            return Err(NetError::NotReady);
+        }
+        let max_payload = MAX_TX_FRAME.saturating_sub(40);
+        let send_len = data.len().min(max_payload);
+        let seq = self.tcp_conns[i].seq_next;
+        let ack = self.tcp_conns[i].ack_next;
+        self.send_tcp_segment_for_conn(
+            i,
+            seq,
+            ack,
+            TCP_FLAG_ACK | TCP_FLAG_PSH,
+            &data[..send_len],
+        )?;
+        self.tcp_conns[i].seq_next = seq.wrapping_add(send_len as u32);
+        Ok(send_len)
+    }
+
+    fn tcp_recv_data(&mut self, idx: u8, buf: &mut [u8]) -> Result<usize, NetError> {
+        let i = idx as usize;
+        if i >= MAX_TCP_CONNS || !self.tcp_conns[i].is_active() {
+            return Err(NetError::NotReady);
+        }
+        // Poll for incoming data.
+        self.poll();
+        let conn = &mut self.tcp_conns[i];
+        if conn.rx_len == 0 {
+            return Ok(0);
+        }
+        let copy_len = conn.rx_len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&conn.rx_buf[..copy_len]);
+        // Shift remaining data.
+        conn.rx_buf.copy_within(copy_len..conn.rx_len, 0);
+        conn.rx_len -= copy_len;
+        Ok(copy_len)
+    }
+
+    fn tcp_close_conn(&mut self, idx: u8) {
+        let i = idx as usize;
+        if i >= MAX_TCP_CONNS || !self.tcp_conns[i].is_active() {
+            return;
+        }
+        let seq = self.tcp_conns[i].seq_next;
+        let ack = self.tcp_conns[i].ack_next;
+        let _ = self.send_tcp_segment_for_conn(i, seq, ack, TCP_FLAG_FIN | TCP_FLAG_ACK, &[]);
+        self.tcp_conns[i].seq_next = seq.wrapping_add(1);
+        self.tcp_conns[i].state = TcpState::FinWait1;
+    }
+
+    #[allow(dead_code)]
+    fn tcp_conn_info_snapshot(&self) -> ([TcpConnInfo; MAX_TCP_CONNS], usize) {
+        let mut out = [TcpConnInfo {
+            idx: 0,
+            state: "CLOSED",
+            local_port: 0,
+            remote_ip: [0; 4],
+            remote_port: 0,
+            rx_bytes: 0,
+        }; MAX_TCP_CONNS];
+        let mut count = 0usize;
+        for (i, conn) in self.tcp_conns.iter().enumerate() {
+            if conn.is_active() {
+                out[count] = TcpConnInfo {
+                    idx: i as u8,
+                    state: conn.state.as_str(),
+                    local_port: conn.local_port,
+                    remote_ip: conn.remote_ip,
+                    remote_port: conn.remote_port,
+                    rx_bytes: conn.rx_len,
+                };
+                count = count.saturating_add(1);
+            }
+        }
+        (out, count)
     }
 
     fn send_ping(&mut self, target: [u8; 4]) -> Result<u64, NetError> {
@@ -2109,6 +2465,190 @@ pub fn log_info() {
     });
 }
 
+/// Print ifconfig-style interface summary to serial.
+pub fn ifconfig_to_serial() {
+    with_net(|state| {
+        if !state.ready {
+            serial::write_line("ifconfig: lo0: flags=73 mtu=65536");
+            serial::write_line("ifconfig:   inet 127.0.0.1 netmask 0xff000000");
+            serial::write_line("ifconfig: eth0: unavailable");
+            return;
+        }
+        serial::write_line("ifconfig: lo0: flags=73 mtu=65536");
+        serial::write_line("ifconfig:   inet 127.0.0.1 netmask 0xff000000");
+        serial::write_fmt(format_args!(
+            "ifconfig: eth0: flags=4163 mtu=1500 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+            state.mac[0], state.mac[1], state.mac[2], state.mac[3], state.mac[4], state.mac[5]
+        ));
+        serial::write_fmt(format_args!(
+            "ifconfig:   inet {}.{}.{}.{} netmask {}.{}.{}.{} broadcast {}.{}.{}.255\n",
+            state.ipv4[0],
+            state.ipv4[1],
+            state.ipv4[2],
+            state.ipv4[3],
+            state.netmask[0],
+            state.netmask[1],
+            state.netmask[2],
+            state.netmask[3],
+            state.ipv4[0],
+            state.ipv4[1],
+            state.ipv4[2]
+        ));
+        serial::write_fmt(format_args!(
+            "ifconfig:   rx_packets={} tx_packets={} rx_errors=0 tx_errors={}\n",
+            state.stats.rx_frames, state.stats.tx_frames, state.stats.dropped
+        ));
+    });
+}
+
+/// Print route table to serial.
+pub fn route_to_serial() {
+    with_net(|state| {
+        serial::write_line("route: Kernel IP routing table");
+        serial::write_line("route: Destination     Gateway         Genmask         Flags Iface");
+        if !state.ready {
+            serial::write_line("route: 127.0.0.0       0.0.0.0         255.0.0.0       U     lo");
+            return;
+        }
+        serial::write_fmt(format_args!(
+            "route: {}.{}.{}.0       0.0.0.0         {}.{}.{}.{}     U     eth0\n",
+            state.ipv4[0],
+            state.ipv4[1],
+            state.ipv4[2],
+            state.netmask[0],
+            state.netmask[1],
+            state.netmask[2],
+            state.netmask[3]
+        ));
+        serial::write_fmt(format_args!(
+            "route: 0.0.0.0         {}.{}.{}.{}     0.0.0.0         UG    eth0\n",
+            state.gateway[0], state.gateway[1], state.gateway[2], state.gateway[3]
+        ));
+        serial::write_line("route: 127.0.0.0       0.0.0.0         255.0.0.0       U     lo");
+    });
+}
+
+/// Print ARP cache to serial.
+pub fn arp_to_serial() {
+    with_net(|state| {
+        serial::write_line("arp: Address         HWtype  HWaddress           Flags Mask  Iface");
+        if !state.ready {
+            serial::write_line("arp: (empty)");
+            return;
+        }
+        let mut any = false;
+        for entry in &state.arp {
+            if entry.valid {
+                any = true;
+                serial::write_fmt(format_args!(
+                    "arp: {}.{}.{}.{}  ether   {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  C         eth0\n",
+                    entry.ip[0],
+                    entry.ip[1],
+                    entry.ip[2],
+                    entry.ip[3],
+                    entry.mac[0],
+                    entry.mac[1],
+                    entry.mac[2],
+                    entry.mac[3],
+                    entry.mac[4],
+                    entry.mac[5]
+                ));
+            }
+        }
+        if !any {
+            serial::write_line("arp: (no resolved entries)");
+        }
+    });
+}
+
+/// Print netstat-style connection table to serial.
+pub fn netstat_to_serial() {
+    with_net(|state| {
+        serial::write_line("netstat: Active Internet connections (w/o servers)");
+        serial::write_line("netstat: Proto  Local Address           Foreign Address         State");
+        let mut any = false;
+        for (i, conn) in state.tcp_conns.iter().enumerate() {
+            if conn.is_active() {
+                any = true;
+                serial::write_fmt(format_args!(
+                    "netstat: tcp    0.0.0.0:{:<5}         {}.{}.{}.{}:{:<5}    {}\n",
+                    conn.local_port,
+                    conn.remote_ip[0],
+                    conn.remote_ip[1],
+                    conn.remote_ip[2],
+                    conn.remote_ip[3],
+                    conn.remote_port,
+                    conn.state.as_str()
+                ));
+                let _ = i;
+            }
+        }
+        if !any {
+            serial::write_line("netstat: (no active TCP connections)");
+        }
+        serial::write_fmt(format_args!(
+            "netstat: stats rx_tcp={} tx_frames={} dropped={}\n",
+            state.stats.rx_tcp, state.stats.tx_frames, state.stats.dropped
+        ));
+    });
+}
+
+/// Print `ss`-style socket summary (alias for netstat_to_serial).
+pub fn ss_to_serial() {
+    with_net(|state| {
+        serial::write_line(
+            "ss: Netid  State      Recv-Q  Send-Q  Local Address:Port  Peer Address:Port",
+        );
+        let mut any = false;
+        for conn in &state.tcp_conns {
+            if conn.is_active() {
+                any = true;
+                serial::write_fmt(format_args!(
+                    "ss: tcp    {:<10} {:<7} {:<7} 0.0.0.0:{:<5}          {}.{}.{}.{}:{}\n",
+                    conn.state.as_str(),
+                    conn.rx_len,
+                    0,
+                    conn.local_port,
+                    conn.remote_ip[0],
+                    conn.remote_ip[1],
+                    conn.remote_ip[2],
+                    conn.remote_ip[3],
+                    conn.remote_port
+                ));
+            }
+        }
+        if !any {
+            serial::write_line("ss: (no active sockets)");
+        }
+    });
+}
+
+/// Print `ip addr` / `ip route` output to serial.
+pub fn ip_to_serial(subcmd: &str) {
+    match subcmd.trim() {
+        "addr" | "a" | "" => ifconfig_to_serial(),
+        "route" | "r" => route_to_serial(),
+        "link" | "l" => {
+            with_net(|state| {
+                if state.ready {
+                    serial::write_fmt(format_args!(
+                        "ip: 2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                        state.mac[0],
+                        state.mac[1],
+                        state.mac[2],
+                        state.mac[3],
+                        state.mac[4],
+                        state.mac[5]
+                    ));
+                } else {
+                    serial::write_line("ip: eth0: unavailable");
+                }
+            });
+        }
+        _ => serial::write_line("ip: usage: ip [addr|link|route]"),
+    }
+}
+
 pub fn ping(target: [u8; 4]) -> Result<u64, NetError> {
     with_net_mut(|state| state.send_ping(target))
 }
@@ -2322,6 +2862,40 @@ pub fn last_udp() -> Option<LastUdpReport> {
             preview_len,
         })
     })
+}
+
+// ── Public TCP API ────────────────────────────────────────────────────────────
+
+/// Connect to a remote TCP endpoint.  Returns a connection index (0..MAX_TCP_CONNS).
+/// `local_port` = 0 means "pick an ephemeral port".
+pub fn tcp_connect(dst_ip: [u8; 4], dst_port: u16, local_port: u16) -> Result<u8, NetError> {
+    let lport = if local_port == 0 {
+        49152u16.wrapping_add((time::ticks() as u16) & 0x0fff)
+    } else {
+        local_port
+    };
+    with_net_mut(|state| state.tcp_connect_blocking(dst_ip, dst_port, lport))
+}
+
+/// Send data on an open TCP connection.
+pub fn tcp_send(conn_idx: u8, data: &[u8]) -> Result<usize, NetError> {
+    with_net_mut(|state| state.tcp_send_data(conn_idx, data))
+}
+
+/// Receive data from an open TCP connection (non-blocking; returns 0 if no data).
+pub fn tcp_recv(conn_idx: u8, buf: &mut [u8]) -> Result<usize, NetError> {
+    with_net_mut(|state| state.tcp_recv_data(conn_idx, buf))
+}
+
+/// Close a TCP connection gracefully.
+pub fn tcp_close(conn_idx: u8) {
+    with_net_mut(|state| state.tcp_close_conn(conn_idx));
+}
+
+/// Returns info about all active TCP connections (for netstat).
+#[allow(dead_code)]
+pub fn tcp_conns_snapshot() -> ([TcpConnInfo; MAX_TCP_CONNS], usize) {
+    with_net(|state| state.tcp_conn_info_snapshot())
 }
 
 pub fn parse_ipv4(text: &str) -> Option<[u8; 4]> {

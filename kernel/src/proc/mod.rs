@@ -12,11 +12,12 @@ use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
     AF_INET, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FileStat,
-    IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, SEEK_CUR, SEEK_END, SEEK_SET,
-    SOCK_DGRAM, SYS_CAP_DROP, SYS_CAP_GET, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FREAD,
-    SYS_FSTAT, SYS_FWRITE, SYS_GETPID, SYS_OPEN, SYS_READ, SYS_RECVFROM, SYS_SEEK, SYS_SENDTO,
+    IPPROTO_TCP, IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, SEEK_CUR, SEEK_END,
+    SEEK_SET, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_CAP_DROP, SYS_CAP_GET, SYS_CLOSE,
+    SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETPID,
+    SYS_LISTEN, SYS_OPEN, SYS_READ, SYS_RECV, SYS_RECVFROM, SYS_SEEK, SYS_SEND, SYS_SENDTO,
     SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_TIME_MS, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
-    UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
+    TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -24,7 +25,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ring3_groundwork::{
     AddressSpaceToken, MAX_USER_RANGES, Ring3ProcessImage, Ring3ProcessState, Ring3TrapFrame,
-    UserMemoryRange,
+    UserMemoryRange, copy_from_user, copy_from_user_bytes, copy_to_user_bytes,
 };
 
 const MAX_TASKS: usize = 4;
@@ -1351,6 +1352,14 @@ impl Scheduler {
                 self.stats.recvfrom = self.stats.recvfrom.saturating_add(1);
                 self.syscall_recvfrom(arg0, arg1, arg2)
             }
+            SYS_BIND | SYS_LISTEN | SYS_ACCEPT => {
+                // Not yet implemented for cooperative tasks.
+                errno::ENOSYS
+            }
+            SYS_CONNECT | SYS_SEND | SYS_RECV => {
+                // Not yet implemented for cooperative tasks.
+                errno::ENOSYS
+            }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 log_syscall_unknown(task.pid, task.name, number, errno::ENOSYS);
@@ -1544,6 +1553,22 @@ impl Scheduler {
             SYS_RECVFROM => {
                 self.stats.recvfrom = self.stats.recvfrom.saturating_add(1);
                 self.syscall_recvfrom_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_BIND | SYS_LISTEN | SYS_ACCEPT => {
+                // Passive TCP (server-side) not yet implemented.
+                errno::ENOSYS
+            }
+            SYS_CONNECT => {
+                // arg0 = req_ptr, arg1 = req_len (sizeof TcpConnectReq)
+                self.syscall_connect_ring3(ctx, arg0, arg1)
+            }
+            SYS_SEND => {
+                // arg0 = fd, arg1 = buf_ptr, arg2 = buf_len
+                self.syscall_send_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_RECV => {
+                // arg0 = fd, arg1 = buf_ptr, arg2 = buf_cap
+                self.syscall_recv_ring3(ctx, arg0, arg1, arg2)
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
@@ -2143,6 +2168,46 @@ impl Scheduler {
         .map_err(|error| self.map_ring3_copy_error(error))
     }
 
+    fn ring3_copy_from_user<T: Copy>(&mut self, src_ptr: u64, value: &mut T) -> Result<(), isize> {
+        let process = self.ring3_context.process;
+        match copy_from_user(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            src_ptr,
+        ) {
+            Ok(v) => {
+                *value = v;
+                Ok(())
+            }
+            Err(error) => Err(self.map_ring3_copy_error(error)),
+        }
+    }
+
+    fn ring3_copy_slice_from_user(&mut self, src_ptr: u64, dst: &mut [u8]) -> Result<(), isize> {
+        let process = self.ring3_context.process;
+        copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            src_ptr,
+            dst,
+        )
+        .map_err(|error| self.map_ring3_copy_error(error))
+    }
+
+    fn ring3_copy_slice_to_user(&mut self, dst_ptr: u64, src: &[u8]) -> Result<(), isize> {
+        let process = self.ring3_context.process;
+        copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            dst_ptr,
+            src,
+        )
+        .map_err(|error| self.map_ring3_copy_error(error))
+    }
+
     fn map_ring3_copy_error(&mut self, error: ring3_groundwork::UserCopyError) -> isize {
         self.stats.errors = self.stats.errors.saturating_add(1);
         self.ring3_context.process.state = Ring3ProcessState::Faulted;
@@ -2473,6 +2538,13 @@ impl Scheduler {
                     rc
                 }
             },
+            FdTarget::TcpSocket(idx) => match net::tcp_recv(idx, out) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    net_error_to_errno(e)
+                }
+            },
         }
     }
 
@@ -2523,6 +2595,13 @@ impl Scheduler {
                     let rc = map_fs_error(error);
                     self.stats.errors = self.stats.errors.saturating_add(1);
                     rc
+                }
+            },
+            FdTarget::TcpSocket(idx) => match net::tcp_send(idx, data) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    net_error_to_errno(e)
                 }
             },
         }
@@ -2597,6 +2676,7 @@ impl Scheduler {
                     Err(rc)
                 }
             },
+            FdTarget::TcpSocket(_) => Ok(serial_fd_stat(true)),
         }
     }
 
@@ -3125,15 +3205,156 @@ impl Scheduler {
     }
 
     fn syscall_socket(&mut self, domain: u64, socket_type: u64, protocol: u64) -> isize {
-        if domain != AF_INET || socket_type != SOCK_DGRAM {
+        if domain != AF_INET {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EAFNOSUPPORT;
         }
-        if protocol != 0 && protocol != IPPROTO_UDP {
-            self.stats.errors = self.stats.errors.saturating_add(1);
-            return errno::EPROTONOSUPPORT;
+        match socket_type {
+            SOCK_DGRAM => {
+                if protocol != 0 && protocol != IPPROTO_UDP {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    return errno::EPROTONOSUPPORT;
+                }
+                UDP_SOCKET_FD as isize
+            }
+            SOCK_STREAM => {
+                if protocol != 0 && protocol != IPPROTO_TCP {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    return errno::EPROTONOSUPPORT;
+                }
+                // A SOCK_STREAM socket is represented as a TCP_SOCKET fd once connected.
+                // Until connect() is called, return a placeholder fd > UDP_SOCKET_FD that
+                // maps to "unconnected TCP socket" state. We encode it as 2 (first available).
+                2_isize
+            }
+            _ => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EAFNOSUPPORT
+            }
         }
-        UDP_SOCKET_FD as isize
+    }
+
+    fn syscall_connect_ring3(
+        &mut self,
+        _ctx: Ring3ProcessContext,
+        req_ptr: u64,
+        req_len: u64,
+    ) -> isize {
+        if req_len as usize != size_of::<TcpConnectReq>() {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut req = TcpConnectReq::new([0; 4], 0, 0);
+        // SAFETY: req_ptr is a user-space pointer validated against ring3 memory map.
+        if let Err(e) = self.ring3_copy_from_user(req_ptr, &mut req) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return e;
+        }
+        match net::tcp_connect(req.dst_ip, req.dst_port, req.src_port) {
+            Ok(conn_idx) => {
+                // Allocate an fd for the TCP socket.
+                self.with_ring3_fd_table(|_, fd_table| match fd_table.open_tcp_socket(conn_idx) {
+                    Ok(fd) => fd as isize,
+                    Err(error) => {
+                        net::tcp_close(conn_idx);
+                        error.as_errno()
+                    }
+                })
+            }
+            Err(err) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                net_error_to_errno(err)
+            }
+        }
+    }
+
+    fn syscall_send_ring3(
+        &mut self,
+        _ctx: Ring3ProcessContext,
+        fd: u64,
+        buf_ptr: u64,
+        buf_len: u64,
+    ) -> isize {
+        let Ok(fd32) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let conn_idx = self.with_ring3_fd_table(|_, fd_table| match fd_table.description(fd32) {
+            Ok(desc) => match desc.target {
+                FdTarget::TcpSocket(idx) => Ok(idx),
+                _ => Err(errno::EBADF),
+            },
+            Err(e) => Err(e.as_errno()),
+        });
+        let conn_idx = match conn_idx {
+            Ok(idx) => idx,
+            Err(e) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return e;
+            }
+        };
+        let len = buf_len as usize;
+        if len == 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 512];
+        let copy_len = len.min(buf.len());
+        // SAFETY: buf_ptr is a user-space pointer into ring3 mapping.
+        if let Err(e) = self.ring3_copy_slice_from_user(buf_ptr, &mut buf[..copy_len]) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return e;
+        }
+        match net::tcp_send(conn_idx, &buf[..copy_len]) {
+            Ok(sent) => sent as isize,
+            Err(err) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                net_error_to_errno(err)
+            }
+        }
+    }
+
+    fn syscall_recv_ring3(
+        &mut self,
+        _ctx: Ring3ProcessContext,
+        fd: u64,
+        buf_ptr: u64,
+        buf_cap: u64,
+    ) -> isize {
+        let Ok(fd32) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let conn_idx = self.with_ring3_fd_table(|_, fd_table| match fd_table.description(fd32) {
+            Ok(desc) => match desc.target {
+                FdTarget::TcpSocket(idx) => Ok(idx),
+                _ => Err(errno::EBADF),
+            },
+            Err(e) => Err(e.as_errno()),
+        });
+        let conn_idx = match conn_idx {
+            Ok(idx) => idx,
+            Err(e) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return e;
+            }
+        };
+        let cap = (buf_cap as usize).min(2048);
+        let mut buf = [0u8; 2048];
+        match net::tcp_recv(conn_idx, &mut buf[..cap]) {
+            Ok(n) => {
+                if n > 0
+                    && let Err(e) = self.ring3_copy_slice_to_user(buf_ptr, &buf[..n])
+                {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    return e;
+                }
+                n as isize
+            }
+            Err(err) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                net_error_to_errno(err)
+            }
+        }
     }
 
     fn syscall_cap_drop(&mut self, task: &mut Task, drop_mask: u64) -> isize {
@@ -4116,6 +4337,20 @@ fn log_syscall_unknown(pid: u32, name: &str, number: u64, error: isize) {
     ));
 }
 
+fn net_error_to_errno(err: net::NetError) -> isize {
+    use net::NetError;
+    match err {
+        NetError::NotReady => errno::ENODEV,
+        NetError::NotFound => errno::ENOENT,
+        NetError::QueueUnavailable => errno::EMFILE,
+        NetError::AddressTranslationFailed => errno::EFAULT,
+        NetError::FrameTooLarge => errno::EMSGSIZE,
+        NetError::IoTimeout => errno::ETIMEDOUT,
+        NetError::ArpTimeout => errno::EHOSTUNREACH,
+        NetError::UdpPayloadTooLarge => errno::EMSGSIZE,
+    }
+}
+
 fn apply_cap_drop_mask(caps_mask: &mut u32, drop_mask: u64) -> Result<u32, isize> {
     let Ok(drop_mask) = u32::try_from(drop_mask) else {
         return Err(errno::EINVAL);
@@ -4139,7 +4374,8 @@ fn syscall_required_caps(number: u64) -> u32 {
         | SYS_FREAD | SYS_FWRITE | SYS_SEEK | SYS_FSTAT | SYS_DUP | SYS_DUP2 => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
         SYS_TIME_MS => caps::TIME,
-        SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM => caps::NET,
+        SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
+        | SYS_LISTEN | SYS_ACCEPT => caps::NET,
         _ => 0,
     }
 }

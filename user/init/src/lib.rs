@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn metadata_is_stable() {
         assert_eq!(app_name(), "init");
-        assert_eq!(abi_revision(), 4);
+        assert_eq!(abi_revision(), 5);
     }
 
     #[test]

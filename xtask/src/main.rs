@@ -52,7 +52,7 @@ const USER_BIN_PS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PS_ELF_HINT";
 const USER_BIN_PS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PS_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-net [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -100,6 +100,7 @@ enum TopLevelCommand {
     SmokeRing3,
     SmokeRing3Run,
     SmokeRing3Fault,
+    SmokeNet,
 }
 
 struct UserArtifact {
@@ -165,6 +166,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Fault) => smoke_ring3_fault(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeNet) => smoke_net(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -193,6 +195,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
         Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
         Some("smoke-ring3-fault") => Ok(TopLevelCommand::SmokeRing3Fault),
+        Some("smoke-net") => Ok(TopLevelCommand::SmokeNet),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -2402,6 +2405,160 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         println!("{smoke_name}: {line}");
     }
     if let Some(line) = last_matching_line(&log_snapshot, "BINSMOKE.TXT") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+fn smoke_net(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    smoke_net_impl(arch)
+}
+
+fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-net";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // Verify net info is available
+        send_serial_command(stdin, "net\n")?;
+        wait_for_log(&log, "net: backend=", Duration::from_secs(8), "net info")?;
+
+        // netstat shows connection table header
+        send_serial_command(stdin, "netstat\n")?;
+        wait_for_log(
+            &log,
+            "netstat: Active Internet connections",
+            Duration::from_secs(8),
+            "netstat header",
+        )?;
+
+        // ifconfig shows eth0 line
+        send_serial_command(stdin, "ifconfig\n")?;
+        wait_for_log(
+            &log,
+            "ifconfig: eth0:",
+            Duration::from_secs(8),
+            "ifconfig eth0 line",
+        )?;
+
+        // route shows routing table header
+        send_serial_command(stdin, "route\n")?;
+        wait_for_log(
+            &log,
+            "route: Kernel IP routing table",
+            Duration::from_secs(8),
+            "route table header",
+        )?;
+
+        // arp shows ARP cache header
+        send_serial_command(stdin, "arp\n")?;
+        wait_for_log(
+            &log,
+            "arp: Address",
+            Duration::from_secs(8),
+            "arp cache header",
+        )?;
+
+        // ss shows socket summary header
+        send_serial_command(stdin, "ss\n")?;
+        wait_for_log(
+            &log,
+            "ss: Netid",
+            Duration::from_secs(8),
+            "ss socket header",
+        )?;
+
+        // ip addr shows interface info
+        send_serial_command(stdin, "ip addr\n")?;
+        wait_for_log(
+            &log,
+            "ifconfig: eth0:",
+            Duration::from_secs(8),
+            "ip addr output (delegates to ifconfig)",
+        )?;
+
+        // Verify /bin/netstat is in ls /bin output
+        send_serial_command(stdin, "ls /bin\n")?;
+        wait_for_log(
+            &log,
+            "/bin/netstat (exec)",
+            Duration::from_secs(8),
+            "/bin/netstat in ls /bin",
+        )?;
+        wait_for_log(
+            &log,
+            "/bin/ifconfig (exec)",
+            Duration::from_secs(8),
+            "/bin/ifconfig in ls /bin",
+        )?;
+        wait_for_log(
+            &log,
+            "/bin/ip (exec)",
+            Duration::from_secs(8),
+            "/bin/ip in ls /bin",
+        )?;
+
+        Ok(())
+    })();
+
+    let kill_result = child.kill();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if smoke_result.is_err() {
+        eprintln!("--- {smoke_name} log ---");
+        eprintln!("{log_snapshot}");
+        eprintln!("--- end {smoke_name} log ---");
+    }
+    kill_result.with_context(|| format!("failed to kill qemu for {smoke_tag}"))?;
+    smoke_result?;
+    if let Some(line) = last_matching_line(&log_snapshot, "net: backend=") {
+        println!("{smoke_name}: {line}");
+    }
+    if let Some(line) = last_matching_line(&log_snapshot, "netstat: Active") {
         println!("{smoke_name}: {line}");
     }
     Ok(())

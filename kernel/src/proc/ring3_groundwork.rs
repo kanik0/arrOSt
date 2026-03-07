@@ -1647,7 +1647,7 @@ fn parse_dynamic_relocation_table(
         if rela_size == 0 {
             return Ok(None);
         }
-        if rela_ent != ELF_RELA_ENTRY_SIZE || rela_size % rela_ent != 0 {
+        if rela_ent != ELF_RELA_ENTRY_SIZE || !rela_size.is_multiple_of(rela_ent) {
             return Err(Ring3ElfLoadError::InvalidDynamicRelocations);
         }
         let total_entries = rela_size / rela_ent;

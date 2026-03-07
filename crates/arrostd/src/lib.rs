@@ -2,7 +2,7 @@
 
 // crates/arrostd/src/lib.rs: shared no_std helpers for ArrOSt crates.
 pub mod abi {
-    pub const USERLAND_ABI_REVISION: u16 = 4;
+    pub const USERLAND_ABI_REVISION: u16 = 5;
     pub const USERLAND_INIT_APP: &str = "init";
     pub const USERLAND_DOOM_APP: &str = "doom";
     pub const USERLAND_PATH_MAX: usize = 160;
@@ -13,7 +13,7 @@ pub mod abi {
 }
 
 pub mod syscall {
-    pub const ABI_REVISION: u16 = 4;
+    pub const ABI_REVISION: u16 = 5;
 
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_READ: u64 = 2;
@@ -37,6 +37,12 @@ pub mod syscall {
     pub const SYS_FSTAT: u64 = 20;
     pub const SYS_DUP: u64 = 21;
     pub const SYS_DUP2: u64 = 22;
+    pub const SYS_BIND: u64 = 47;
+    pub const SYS_LISTEN: u64 = 48;
+    pub const SYS_ACCEPT: u64 = 49;
+    pub const SYS_CONNECT: u64 = 50;
+    pub const SYS_SEND: u64 = 51;
+    pub const SYS_RECV: u64 = 52;
 
     pub mod app {
         pub const INIT: u64 = 1;
@@ -52,9 +58,45 @@ pub mod syscall {
     }
 
     pub const AF_INET: u64 = 2;
+    pub const SOCK_STREAM: u64 = 1;
     pub const SOCK_DGRAM: u64 = 2;
+    pub const IPPROTO_TCP: u64 = 6;
     pub const IPPROTO_UDP: u64 = 17;
     pub const UDP_SOCKET_FD: u64 = 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TcpConnectReq {
+        pub dst_ip: [u8; 4],
+        pub dst_port: u16,
+        pub src_port: u16,
+    }
+
+    impl TcpConnectReq {
+        pub const fn new(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> Self {
+            Self {
+                dst_ip,
+                dst_port,
+                src_port,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TcpSendReq {
+        pub fd: u64,
+        pub buf_ptr: u64,
+        pub buf_len: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TcpRecvReq {
+        pub fd: u64,
+        pub buf_ptr: u64,
+        pub buf_cap: u64,
+    }
 
     pub const O_RDONLY: u32 = 0;
     pub const O_WRONLY: u32 = 1;
@@ -181,6 +223,12 @@ pub mod syscall {
             SYS_FSTAT => "fstat",
             SYS_DUP => "dup",
             SYS_DUP2 => "dup2",
+            SYS_BIND => "bind",
+            SYS_LISTEN => "listen",
+            SYS_ACCEPT => "accept",
+            SYS_CONNECT => "connect",
+            SYS_SEND => "send",
+            SYS_RECV => "recv",
             _ => "unknown",
         }
     }
@@ -203,7 +251,10 @@ pub mod syscall {
         pub const EAFNOSUPPORT: isize = -97;
         pub const ENOTCONN: isize = -107;
         pub const ETIMEDOUT: isize = -110;
+        pub const ECONNREFUSED: isize = -111;
         pub const EHOSTUNREACH: isize = -113;
+        pub const EADDRINUSE: isize = -98;
+        pub const EISCONN: isize = -106;
 
         pub const fn name(code: isize) -> &'static str {
             match code {
@@ -224,7 +275,10 @@ pub mod syscall {
                 EAFNOSUPPORT => "EAFNOSUPPORT",
                 ENOTCONN => "ENOTCONN",
                 ETIMEDOUT => "ETIMEDOUT",
+                ECONNREFUSED => "ECONNREFUSED",
                 EHOSTUNREACH => "EHOSTUNREACH",
+                EADDRINUSE => "EADDRINUSE",
+                EISCONN => "EISCONN",
                 _ => "UNKNOWN",
             }
         }
@@ -704,7 +758,7 @@ mod tests {
 
     #[test]
     fn syscall_numbering_matches_golden_contract() {
-        assert_eq!(syscall::ABI_REVISION, 4);
+        assert_eq!(syscall::ABI_REVISION, 5);
         assert_eq!(
             [
                 syscall::SYS_WRITE,
@@ -733,6 +787,17 @@ mod tests {
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ]
+        );
+        assert_eq!(
+            [
+                syscall::SYS_BIND,
+                syscall::SYS_LISTEN,
+                syscall::SYS_ACCEPT,
+                syscall::SYS_CONNECT,
+                syscall::SYS_SEND,
+                syscall::SYS_RECV,
+            ],
+            [47, 48, 49, 50, 51, 52]
         );
     }
 
