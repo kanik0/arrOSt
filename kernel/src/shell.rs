@@ -317,6 +317,20 @@ fn process_byte(byte: u8) {
             print_prompt();
             return;
         }
+        // If chars were buffered before doom capture was re-armed by a UI event,
+        // honour the pending command on \r/\n rather than passing it to doom.
+        if (byte == b'\n' || byte == b'\r') && shell.len > 0 {
+            shell.release_all_serial_capture_keys();
+            shell.doom_capture = false;
+            let _ = doom::set_capture(false);
+            serial::write_str("\n");
+            run_command(shell);
+            shell.clear();
+            if !shell.doom_capture && shell.waiting_vfs_pid.is_none() {
+                print_prompt();
+            }
+            return;
+        }
         shell.refresh_serial_capture_key(byte, time::ticks());
         return;
     }
