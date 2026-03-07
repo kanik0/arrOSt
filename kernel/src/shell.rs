@@ -41,6 +41,7 @@ const SERIAL_BIN_ARP: &str = "/bin/arp";
 const SERIAL_BIN_SS: &str = "/bin/ss";
 const SERIAL_BIN_NC: &str = "/bin/nc";
 const SERIAL_BIN_IP: &str = "/bin/ip";
+const SERIAL_BIN_PING: &str = "/bin/ping";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -710,7 +711,14 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
 
-    if let Some(ip) = input.strip_prefix("ping ") {
+    if input == "ping" || input == SERIAL_BIN_PING {
+        serial::write_line("usage: ping <a.b.c.d>");
+        return;
+    }
+    if let Some(ip) = input
+        .strip_prefix("ping ")
+        .or_else(|| input.strip_prefix("/bin/ping "))
+    {
         let ip = ip.trim();
         if ip.is_empty() {
             serial::write_line("usage: ping <a.b.c.d>");
