@@ -88,7 +88,12 @@ pub fn init() -> InterruptInitReport {
             idt[SYSCALL_VECTOR]
                 .set_handler_addr(VirtAddr::new(syscall::int80_entry_addr()))
                 .set_privilege_level(PrivilegeLevel::Ring3);
-            idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+            // SAFETY: timer_isr_entry_addr points to the naked timer ISR (ring3.rs) which
+            // saves all GPRs before calling Rust, ACKs the PIC, ticks the clock, handles
+            // quantum-based preemption, and either restores GPRs + iretq or jumps to the
+            // kernel scheduler path — identical structure to int80_entry.
+            idt[InterruptIndex::Timer.as_u8()]
+                .set_handler_addr(VirtAddr::new(ring3::timer_isr_entry_addr()));
             idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
             idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
 
@@ -412,17 +417,6 @@ extern "x86-interrupt" fn simd_floating_point_handler(stack_frame: InterruptStac
     ));
     serial::write_fmt(format_args!("{stack_frame:#?}\n"));
     crate::arch::halt_forever();
-}
-
-extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
-    let from_ring3 = (stack_frame.code_segment.0 & 0x3) == 0x3;
-    ring3::sample_user_timer(
-        stack_frame.instruction_pointer.as_u64(),
-        stack_frame.stack_pointer.as_u64(),
-        from_ring3,
-    );
-    time::on_timer_tick();
-    pic::end_of_interrupt(InterruptIndex::Timer.as_u8());
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

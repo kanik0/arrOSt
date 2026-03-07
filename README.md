@@ -118,7 +118,7 @@ Useful runtime commands:
 - Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
-- Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
+- Timer-driven hard preemption (M14) fires at arbitrary instruction boundaries; the quantum is 10 PIT ticks on x86_64 and 10 GIC virtual-timer ticks on aarch64.
 - The syscall surface is intentionally small and not POSIX-complete.
 - `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
 - `diskfs-v2` journals metadata only; file data is not journaled.
