@@ -11,12 +11,15 @@ use arrost_user_doom as user_doom;
 use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
-    AF_INET, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FileStat,
-    IPPROTO_TCP, IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, SEEK_CUR, SEEK_END,
-    SEEK_SET, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_CAP_DROP, SYS_CAP_GET, SYS_CLOSE,
-    SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETPID,
-    SYS_LISTEN, SYS_OPEN, SYS_READ, SYS_RECV, SYS_RECVFROM, SYS_SEEK, SYS_SEND, SYS_SENDTO,
-    SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_TIME_MS, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
+    AF_INET, DIRENT_HEADER_SIZE, Dirent, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR,
+    FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR,
+    O_TRUNC, SEEK_CUR, SEEK_END, SEEK_SET, SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND,
+    SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2,
+    SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
+    SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
+    SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM,
+    SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP,
+    SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
     TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
@@ -273,6 +276,9 @@ pub struct Ring3SyscallDispatch {
     pub action: Ring3SyscallAction,
 }
 
+/// Maximum length of the per-process current working directory path.
+pub const MAX_CWD_LEN: usize = arrostd::abi::USERLAND_PATH_MAX;
+
 #[derive(Clone, Copy)]
 pub struct Ring3ProcessContext {
     pub pid: u32,
@@ -286,20 +292,29 @@ pub struct Ring3ProcessContext {
     pub user_ranges: [Option<UserMemoryRange>; MAX_USER_RANGES],
     pub user_range_count: usize,
     pub mapped_pages: usize,
+    /// Current working directory (UTF-8, no trailing slash except for root).
+    pub cwd: [u8; MAX_CWD_LEN],
+    pub cwd_len: usize,
 }
 
-const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = Ring3ProcessContext {
-    pid: 0,
-    name: "",
-    syscall_caps: 0,
-    fd_table: FdTable::new(),
-    address_space: AddressSpaceToken::empty(),
-    trap_frame: Ring3TrapFrame::empty(),
-    kernel_stack_top: 0,
-    state: Ring3ProcessState::ready(),
-    user_ranges: ring3_groundwork::empty_user_ranges(),
-    user_range_count: 0,
-    mapped_pages: 0,
+const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
+    let mut ctx = Ring3ProcessContext {
+        pid: 0,
+        name: "",
+        syscall_caps: 0,
+        fd_table: FdTable::new(),
+        address_space: AddressSpaceToken::empty(),
+        trap_frame: Ring3TrapFrame::empty(),
+        kernel_stack_top: 0,
+        state: Ring3ProcessState::ready(),
+        user_ranges: ring3_groundwork::empty_user_ranges(),
+        user_range_count: 0,
+        mapped_pages: 0,
+        cwd: [0u8; MAX_CWD_LEN],
+        cwd_len: 1,
+    };
+    ctx.cwd[0] = b'/';
+    ctx
 };
 
 #[derive(Clone, Copy)]
@@ -460,6 +475,22 @@ pub struct SyscallStats {
     pub socket: u64,
     pub sendto: u64,
     pub recvfrom: u64,
+    // M15 extended syscall surface
+    pub mkdir: u64,
+    pub rmdir: u64,
+    pub unlink: u64,
+    pub rename: u64,
+    pub link: u64,
+    pub symlink: u64,
+    pub readlink: u64,
+    pub getcwd: u64,
+    pub chdir: u64,
+    pub getdents: u64,
+    pub getppid: u64,
+    pub getuid: u64,
+    pub getgid: u64,
+    pub kill: u64,
+    pub pipe: u64,
     pub errors: u64,
 }
 
@@ -488,6 +519,21 @@ impl SyscallStats {
             socket: 0,
             sendto: 0,
             recvfrom: 0,
+            mkdir: 0,
+            rmdir: 0,
+            unlink: 0,
+            rename: 0,
+            link: 0,
+            symlink: 0,
+            readlink: 0,
+            getcwd: 0,
+            chdir: 0,
+            getdents: 0,
+            getppid: 0,
+            getuid: 0,
+            getgid: 0,
+            kill: 0,
+            pipe: 0,
             errors: 0,
         }
     }
@@ -1368,6 +1414,45 @@ impl Scheduler {
                 // Not yet implemented for cooperative tasks.
                 errno::ENOSYS
             }
+            // M15 Phase A1: path ops — cooperative tasks use direct fs APIs; ENOSYS here.
+            SYS_MKDIR | SYS_RMDIR | SYS_UNLINK | SYS_RENAME | SYS_LINK | SYS_SYMLINK
+            | SYS_READLINK | SYS_GETCWD | SYS_CHDIR | SYS_GETDENTS => errno::ENOSYS,
+            // M15 Phase A2: process identity
+            SYS_GETPPID => {
+                self.stats.getppid = self.stats.getppid.saturating_add(1);
+                task.parent_pid as isize
+            }
+            SYS_GETUID => {
+                self.stats.getuid = self.stats.getuid.saturating_add(1);
+                0 // cooperative kernel tasks run as root
+            }
+            SYS_GETGID => {
+                self.stats.getgid = self.stats.getgid.saturating_add(1);
+                0
+            }
+            SYS_KILL => {
+                self.stats.kill = self.stats.kill.saturating_add(1);
+                // arg0 = pid, arg1 = signal; only SIGKILL(9) supported
+                if arg1 == u64::from(SIGKILL) {
+                    self.kill_process(arg0 as u32)
+                } else {
+                    errno::ENOSYS
+                }
+            }
+            // M15 Phase A3: memory ops — stubs
+            SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => errno::ENOSYS,
+            // M15 Phase A2: signals — stubs
+            SYS_SIGACTION | SYS_SIGRETURN => errno::ENOSYS,
+            // M15 Phase A4: pipe IPC
+            SYS_PIPE => {
+                self.stats.pipe = self.stats.pipe.saturating_add(1);
+                self.syscall_pipe_coop(task, arg0)
+            }
+            SYS_PIPE2 => {
+                self.stats.pipe = self.stats.pipe.saturating_add(1);
+                // arg1 = flags; only 0 supported for now
+                self.syscall_pipe_coop(task, arg0)
+            }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 log_syscall_unknown(task.pid, task.name, number, errno::ENOSYS);
@@ -1577,6 +1662,101 @@ impl Scheduler {
             SYS_RECV => {
                 // arg0 = fd, arg1 = buf_ptr, arg2 = buf_cap
                 self.syscall_recv_ring3(ctx, arg0, arg1, arg2)
+            }
+            // M15 Phase A1: filesystem / directory syscalls
+            SYS_MKDIR => {
+                self.stats.mkdir = self.stats.mkdir.saturating_add(1);
+                // arg0=path_ptr, arg1=mode, arg2=path_len
+                self.syscall_mkdir_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_RMDIR => {
+                self.stats.rmdir = self.stats.rmdir.saturating_add(1);
+                // arg0=path_ptr, arg1=path_len
+                self.syscall_rmdir_ring3(ctx, arg0, arg1)
+            }
+            SYS_UNLINK => {
+                self.stats.unlink = self.stats.unlink.saturating_add(1);
+                // arg0=path_ptr, arg1=path_len
+                self.syscall_unlink_ring3(ctx, arg0, arg1)
+            }
+            SYS_RENAME => {
+                self.stats.rename = self.stats.rename.saturating_add(1);
+                // arg0=buf_ptr, arg1=old_len, arg2=new_len  (old||new in one buffer)
+                self.syscall_rename_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_LINK => {
+                self.stats.link = self.stats.link.saturating_add(1);
+                // arg0=buf_ptr, arg1=src_len, arg2=dst_len
+                self.syscall_link_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_SYMLINK => {
+                self.stats.symlink = self.stats.symlink.saturating_add(1);
+                // arg0=buf_ptr, arg1=target_len, arg2=link_len
+                self.syscall_symlink_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_READLINK => {
+                self.stats.readlink = self.stats.readlink.saturating_add(1);
+                // arg0=path_ptr, arg1=path_len, arg2=buf_ptr (buf cap = MAX_OPEN_PATH_BYTES)
+                self.syscall_readlink_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_GETCWD => {
+                self.stats.getcwd = self.stats.getcwd.saturating_add(1);
+                // arg0=buf_ptr, arg1=buf_cap
+                self.syscall_getcwd_ring3(ctx, arg0, arg1)
+            }
+            SYS_CHDIR => {
+                self.stats.chdir = self.stats.chdir.saturating_add(1);
+                // arg0=path_ptr, arg1=path_len
+                self.syscall_chdir_ring3(ctx, arg0, arg1)
+            }
+            SYS_GETDENTS => {
+                self.stats.getdents = self.stats.getdents.saturating_add(1);
+                // arg0=fd, arg1=buf_ptr, arg2=buf_cap
+                self.syscall_getdents_ring3(ctx, arg0, arg1, arg2)
+            }
+            // M15 Phase A2: process identity and signals
+            SYS_GETPPID => {
+                self.stats.getppid = self.stats.getppid.saturating_add(1);
+                if let Some(slot) = self.ring3_active_slot {
+                    if let Some(ref task) = self.ring3_tasks[slot] {
+                        task.parent_pid as isize
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+            SYS_GETUID => {
+                self.stats.getuid = self.stats.getuid.saturating_add(1);
+                1000 // ring-3 processes run as uid=1000
+            }
+            SYS_GETGID => {
+                self.stats.getgid = self.stats.getgid.saturating_add(1);
+                1000 // ring-3 processes run as gid=1000
+            }
+            SYS_KILL => {
+                self.stats.kill = self.stats.kill.saturating_add(1);
+                // arg0=pid, arg1=signal; only SIGKILL(9) supported
+                if arg1 == u64::from(SIGKILL) {
+                    self.kill_process(arg0 as u32)
+                } else {
+                    errno::ENOSYS
+                }
+            }
+            SYS_SIGACTION | SYS_SIGRETURN => errno::ENOSYS,
+            // M15 Phase A3: memory ops — stubs
+            SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => errno::ENOSYS,
+            // M15 Phase A4: pipe IPC
+            SYS_PIPE => {
+                self.stats.pipe = self.stats.pipe.saturating_add(1);
+                // arg0 = fds_ptr (pointer to [u32; 2])
+                self.syscall_pipe_ring3(ctx, arg0)
+            }
+            SYS_PIPE2 => {
+                self.stats.pipe = self.stats.pipe.saturating_add(1);
+                // arg0 = fds_ptr, arg1 = flags (only 0 supported)
+                self.syscall_pipe_ring3(ctx, arg0)
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
@@ -2567,6 +2747,18 @@ impl Scheduler {
                     net_error_to_errno(e)
                 }
             },
+            FdTarget::PipeRead(idx) => {
+                let rc = fs::pipe::read_pipe(idx, out);
+                if rc < 0 {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                }
+                rc
+            }
+            // Write-only ends must not reach fd_read_into; can_read() guards this.
+            FdTarget::PipeWrite(_) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
         }
     }
 
@@ -2626,6 +2818,18 @@ impl Scheduler {
                     net_error_to_errno(e)
                 }
             },
+            FdTarget::PipeWrite(idx) => {
+                let rc = fs::pipe::write_pipe(idx, data);
+                if rc < 0 {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                }
+                rc
+            }
+            // Read-only ends must not reach fd_write_from; can_write() guards this.
+            FdTarget::PipeRead(_) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
         }
     }
 
@@ -2699,6 +2903,7 @@ impl Scheduler {
                 }
             },
             FdTarget::TcpSocket(_) => Ok(serial_fd_stat(true)),
+            FdTarget::PipeRead(_) | FdTarget::PipeWrite(_) => Ok(serial_fd_stat(true)),
         }
     }
 
@@ -4239,6 +4444,720 @@ impl Scheduler {
         }
     }
 
+    // ─── M15 Phase A4: pipe IPC handlers ────────────────────────────────────
+
+    /// Cooperative-task pipe: allocate a new pipe and write `(read_fd, write_fd)`
+    /// into the kernel-space `[u32; 2]` pointed to by `fds_ptr`.
+    fn syscall_pipe_coop(&mut self, task: &mut Task, fds_ptr: u64) -> isize {
+        if fds_ptr == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EFAULT;
+        }
+        let pipe_idx = fs::pipe::alloc_pipe();
+        if pipe_idx < 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EMFILE;
+        }
+        match task.fd_table.open_pipe_ends(pipe_idx as u8) {
+            Ok((read_fd, write_fd)) => {
+                // SAFETY: cooperative tasks pass kernel-space pointers directly.
+                unsafe {
+                    let fds = &mut *(fds_ptr as *mut [u32; 2]);
+                    fds[0] = read_fd;
+                    fds[1] = write_fd;
+                }
+                0
+            }
+            Err(error) => {
+                // Release the pipe we just allocated since the fd table has no room.
+                fs::pipe::close_pipe_read(pipe_idx as u8);
+                fs::pipe::close_pipe_write(pipe_idx as u8);
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                error.as_errno()
+            }
+        }
+    }
+
+    /// Ring-3 pipe: allocate a new pipe and write `(read_fd, write_fd)` into
+    /// the user-space `[u32; 2]` pointed to by `fds_ptr`.
+    fn syscall_pipe_ring3(&mut self, process: Ring3ProcessContext, fds_ptr: u64) -> isize {
+        if fds_ptr == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EFAULT;
+        }
+        let pipe_idx = fs::pipe::alloc_pipe();
+        if pipe_idx < 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EMFILE;
+        }
+        let (read_fd, write_fd) =
+            match self.with_ring3_fd_table(|_, fd_table| fd_table.open_pipe_ends(pipe_idx as u8)) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    fs::pipe::close_pipe_read(pipe_idx as u8);
+                    fs::pipe::close_pipe_write(pipe_idx as u8);
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    return error.as_errno();
+                }
+            };
+        // Pack the two file descriptors as little-endian u32s.
+        let mut fds_bytes = [0u8; 8];
+        fds_bytes[0..4].copy_from_slice(&read_fd.to_le_bytes());
+        fds_bytes[4..8].copy_from_slice(&write_fd.to_le_bytes());
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            unsafe {
+                let dst = &mut *(fds_ptr as *mut [u32; 2]);
+                dst[0] = read_fd;
+                dst[1] = write_fd;
+            }
+            return 0;
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            fds_ptr,
+            &fds_bytes,
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        0
+    }
+
+    // ─── M15 Phase A1: filesystem / directory syscall handlers ──────────────
+
+    /// Copy `total = src_len + dst_len` bytes from user space into `buf`.
+    /// Used by two-path syscalls (rename, link, symlink).
+    fn copy_two_paths_from_ring3(
+        &mut self,
+        process: &Ring3ProcessContext,
+        buf_ptr: u64,
+        src_len: usize,
+        dst_len: usize,
+        buf: &mut [u8],
+    ) -> Result<(), isize> {
+        let total = src_len + dst_len;
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, total) };
+            buf[..total].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            buf_ptr,
+            &mut buf[..total],
+        ) {
+            return Err(self.map_ring3_copy_error(error));
+        }
+        Ok(())
+    }
+
+    fn syscall_mkdir_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        mode_arg: u64,
+        path_len: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved = match fs::resolve_path_from(cwd_str, path_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        let mode = u16::try_from(mode_arg & 0o7777).unwrap_or(0o755);
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::mkdir_dir(resolved.as_str(), mode, Some(process.pid))
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_rmdir_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        path_len: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved = match fs::resolve_path_from(cwd_str, path_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::rmdir_dir(resolved.as_str(), Some(process.pid))
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_unlink_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        path_len: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved = match fs::resolve_path_from(cwd_str, path_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::delete_file_for_pid(resolved.as_str(), Some(process.pid))
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_rename_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        buf_ptr: u64,
+        old_len: u64,
+        new_len: u64,
+    ) -> isize {
+        let Ok(old_len) = usize::try_from(old_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let Ok(new_len) = usize::try_from(new_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let total = old_len.saturating_add(new_len);
+        if buf_ptr == 0 || old_len == 0 || new_len == 0 || total > 2 * MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut buf = [0u8; 2 * MAX_OPEN_PATH_BYTES];
+        if let Err(e) =
+            self.copy_two_paths_from_ring3(&process, buf_ptr, old_len, new_len, &mut buf)
+        {
+            return e;
+        }
+        let (Ok(old_str), Ok(new_str)) = (
+            core::str::from_utf8(&buf[..old_len]),
+            core::str::from_utf8(&buf[old_len..old_len + new_len]),
+        ) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved_old = match fs::resolve_path_from(cwd_str, old_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        let resolved_new = match fs::resolve_path_from(cwd_str, new_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::rename_file(
+                resolved_old.as_str(),
+                resolved_new.as_str(),
+                Some(process.pid),
+            )
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_link_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        buf_ptr: u64,
+        src_len: u64,
+        dst_len: u64,
+    ) -> isize {
+        let Ok(src_len) = usize::try_from(src_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let Ok(dst_len) = usize::try_from(dst_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let total = src_len.saturating_add(dst_len);
+        if buf_ptr == 0 || src_len == 0 || dst_len == 0 || total > 2 * MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut buf = [0u8; 2 * MAX_OPEN_PATH_BYTES];
+        if let Err(e) =
+            self.copy_two_paths_from_ring3(&process, buf_ptr, src_len, dst_len, &mut buf)
+        {
+            return e;
+        }
+        let (Ok(src_str), Ok(dst_str)) = (
+            core::str::from_utf8(&buf[..src_len]),
+            core::str::from_utf8(&buf[src_len..src_len + dst_len]),
+        ) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved_src = match fs::resolve_path_from(cwd_str, src_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        let resolved_dst = match fs::resolve_path_from(cwd_str, dst_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::link_file_for_pid(
+                resolved_src.as_str(),
+                resolved_dst.as_str(),
+                Some(process.pid),
+            )
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_symlink_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        buf_ptr: u64,
+        target_len: u64,
+        link_len: u64,
+    ) -> isize {
+        let Ok(target_len) = usize::try_from(target_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let Ok(link_len) = usize::try_from(link_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let total = target_len.saturating_add(link_len);
+        if buf_ptr == 0 || target_len == 0 || link_len == 0 || total > 2 * MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut buf = [0u8; 2 * MAX_OPEN_PATH_BYTES];
+        if let Err(e) =
+            self.copy_two_paths_from_ring3(&process, buf_ptr, target_len, link_len, &mut buf)
+        {
+            return e;
+        }
+        let (Ok(target_str), Ok(link_str)) = (
+            core::str::from_utf8(&buf[..target_len]),
+            core::str::from_utf8(&buf[target_len..target_len + link_len]),
+        ) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        // Symlink target is stored verbatim (may be relative).
+        // Only the link path is resolved against CWD.
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved_link = match fs::resolve_path_from(cwd_str, link_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        match with_fs_identity_override(FsIdentity::user(), || {
+            fs::symlink_file_for_pid(target_str, resolved_link.as_str(), Some(process.pid))
+        }) {
+            Ok(()) => 0,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                map_fs_error(error)
+            }
+        }
+    }
+
+    fn syscall_readlink_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        path_len: u64,
+        buf_ptr: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES || buf_ptr == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved = match fs::resolve_path_from(cwd_str, path_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        let mut link_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        let n = match with_fs_identity_override(FsIdentity::user(), || {
+            fs::readlink_path_for_pid(resolved.as_str(), &mut link_buf, Some(process.pid))
+        }) {
+            Ok(n) => n,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            unsafe {
+                core::ptr::copy_nonoverlapping(link_buf.as_ptr(), buf_ptr as *mut u8, n);
+            }
+            return n as isize;
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            buf_ptr,
+            &link_buf[..n],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        n as isize
+    }
+
+    fn syscall_getcwd_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        buf_ptr: u64,
+        buf_cap: u64,
+    ) -> isize {
+        if buf_ptr == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EFAULT;
+        }
+        let cwd_len = process.cwd_len;
+        let buf_cap = buf_cap as usize;
+        if buf_cap < cwd_len {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let cwd_bytes = &process.cwd[..cwd_len];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            unsafe {
+                core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf_ptr as *mut u8, cwd_len);
+            }
+            return cwd_len as isize;
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            buf_ptr,
+            cwd_bytes,
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        cwd_len as isize
+    }
+
+    fn syscall_chdir_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        path_ptr: u64,
+        path_len: u64,
+    ) -> isize {
+        let Ok(path_len) = usize::try_from(path_len) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        if path_ptr == 0 || path_len == 0 || path_len > MAX_OPEN_PATH_BYTES {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let Ok(path_str) = core::str::from_utf8(&path_buf[..path_len]) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        };
+        let cwd_str = core::str::from_utf8(&process.cwd[..process.cwd_len]).unwrap_or("/");
+        let resolved = match fs::resolve_path_from(cwd_str, path_str) {
+            Ok(p) => p,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        // Verify the resolved path exists and is a directory.
+        let stat = match with_fs_identity_override(FsIdentity::user(), || {
+            fs::stat_path(resolved.as_str(), Some(process.pid))
+        }) {
+            Ok(stat) => stat,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        if stat.file_type != fs::FileType::Directory {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::ENOTDIR;
+        }
+        // Persist the new CWD directly into the active ring-3 process context.
+        let new_cwd = resolved.as_bytes();
+        let new_cwd_len = new_cwd.len().min(MAX_CWD_LEN);
+        self.ring3_context.process.cwd[..new_cwd_len].copy_from_slice(&new_cwd[..new_cwd_len]);
+        self.ring3_context.process.cwd_len = new_cwd_len;
+        0
+    }
+
+    fn syscall_getdents_ring3(
+        &mut self,
+        process: Ring3ProcessContext,
+        fd: u64,
+        buf_ptr: u64,
+        buf_cap: u64,
+    ) -> isize {
+        let Ok(fd) = u32::try_from(fd) else {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EBADF;
+        };
+        let buf_cap = (buf_cap as usize).min(MAX_RING3_IO_BYTES);
+        if buf_ptr == 0 || buf_cap == 0 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        // Get the open file and the current entry-index offset from the fd table.
+        let desc = match self.ring3_context.process.fd_table.description(fd) {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return error.as_errno();
+            }
+        };
+        let (open_file, entry_start) = match desc.target {
+            FdTarget::File(file) => (file, desc.offset as usize),
+            _ => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return errno::ENOTDIR;
+            }
+        };
+        // Read all directory entries from the VFS (up to 32).
+        let mut entries = [fs::VfsDirEntry::empty(); 32];
+        let total_entries = match with_fs_identity_override(FsIdentity::user(), || {
+            fs::readdir_open_file(open_file, &mut entries, Some(process.pid))
+        }) {
+            Ok(n) => n,
+            Err(error) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return map_fs_error(error);
+            }
+        };
+        // EOF: all entries already consumed by previous calls.
+        if entry_start >= total_entries {
+            return 0;
+        }
+        // Serialise entries starting at `entry_start` into a kernel staging buffer,
+        // stopping when the user buffer would overflow.
+        // Each record: [ino:u32 LE][file_type:u16 LE][name_len:u16 LE][name bytes][0-3 pad].
+        let mut kbuf = [0u8; MAX_RING3_IO_BYTES];
+        let mut kbuf_pos = 0usize;
+        let mut entries_emitted = 0usize;
+        for entry in entries[..total_entries].iter().skip(entry_start) {
+            let name_len = entry.name_len as usize;
+            // Round record size up to 4-byte alignment.
+            let record_size = (DIRENT_HEADER_SIZE + name_len + 3) & !3usize;
+            if kbuf_pos + record_size > buf_cap.min(kbuf.len()) {
+                break;
+            }
+            let header = Dirent {
+                ino: entry.ino,
+                file_type: file_type_to_abi(entry.file_type),
+                name_len: name_len as u16,
+            };
+            kbuf[kbuf_pos..kbuf_pos + 4].copy_from_slice(&header.ino.to_le_bytes());
+            kbuf[kbuf_pos + 4..kbuf_pos + 6].copy_from_slice(&header.file_type.to_le_bytes());
+            kbuf[kbuf_pos + 6..kbuf_pos + 8].copy_from_slice(&header.name_len.to_le_bytes());
+            kbuf[kbuf_pos + 8..kbuf_pos + 8 + name_len].copy_from_slice(&entry.name[..name_len]);
+            // Padding bytes are already zero (kbuf is zero-initialised).
+            kbuf_pos += record_size;
+            entries_emitted += 1;
+        }
+        if entries_emitted == 0 {
+            return 0; // nothing fit — user buffer too small or at EOF
+        }
+        // Advance the fd's entry-index offset so the next getdents call continues here.
+        let _ = self
+            .ring3_context
+            .process
+            .fd_table
+            .set_offset(fd, (entry_start + entries_emitted) as u64);
+        // Copy the staged buffer to user space.
+        if process.user_range_count == 0 {
+            // SAFETY: smoke path uses kernel-space pointers.
+            unsafe {
+                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, kbuf_pos);
+            }
+            return kbuf_pos as isize;
+        }
+        if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            buf_ptr,
+            &kbuf[..kbuf_pos],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        kbuf_pos as isize
+    }
+
     fn log_syscall_stats(&self) {
         serial::write_fmt(format_args!(
             "syscalls: write={} read={} open={} close={} fread={} fwrite={} seek={} fstat={} dup={} dup2={} yield={} sleep={} exit={} getpid={} time_ms={} cap_get={} cap_drop={} spawn={} waitpid={} socket={} sendto={} recvfrom={} errors={}\n",
@@ -4291,6 +5210,10 @@ fn map_fs_error(error: fs::FsError) -> isize {
         }
         fs::FsError::ReadOnly | fs::FsError::PermissionDenied => errno::EPERM,
         fs::FsError::TooManySymlinks => errno::ELOOP,
+        fs::FsError::IsADirectory => errno::EISDIR,
+        fs::FsError::NotADirectory => errno::ENOTDIR,
+        fs::FsError::DirectoryNotEmpty => errno::ENOTEMPTY,
+        fs::FsError::AlreadyExists => errno::EEXIST,
         _ => errno::EINVAL,
     }
 }
@@ -4394,7 +5317,18 @@ fn syscall_required_caps(number: u64) -> u32 {
     match number {
         SYS_WRITE | SYS_READ | SYS_EXIT | SYS_YIELD | SYS_SLEEP | SYS_OPEN | SYS_CLOSE
         | SYS_FREAD | SYS_FWRITE | SYS_SEEK | SYS_FSTAT | SYS_DUP | SYS_DUP2 => caps::CORE,
+        // M15 Phase A1: filesystem/directory ops
+        SYS_MKDIR | SYS_RMDIR | SYS_UNLINK | SYS_RENAME | SYS_LINK | SYS_SYMLINK | SYS_READLINK
+        | SYS_GETCWD | SYS_CHDIR | SYS_GETDENTS => caps::CORE,
+        // M15 Phase A3: memory management (stubs for now)
+        SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => caps::CORE,
+        // M15 Phase A4: pipe IPC
+        SYS_PIPE | SYS_PIPE2 => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
+        // M15 Phase A2: process identity and control
+        SYS_GETPPID | SYS_GETUID | SYS_GETGID | SYS_KILL | SYS_SIGACTION | SYS_SIGRETURN => {
+            caps::PROC
+        }
         SYS_TIME_MS => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
         | SYS_LISTEN | SYS_ACCEPT => caps::NET,

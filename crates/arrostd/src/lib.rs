@@ -37,6 +37,28 @@ pub mod syscall {
     pub const SYS_FSTAT: u64 = 20;
     pub const SYS_DUP: u64 = 21;
     pub const SYS_DUP2: u64 = 22;
+    pub const SYS_MKDIR: u64 = 25;
+    pub const SYS_RMDIR: u64 = 26;
+    pub const SYS_UNLINK: u64 = 27;
+    pub const SYS_RENAME: u64 = 28;
+    pub const SYS_LINK: u64 = 29;
+    pub const SYS_SYMLINK: u64 = 30;
+    pub const SYS_READLINK: u64 = 31;
+    pub const SYS_GETCWD: u64 = 32;
+    pub const SYS_CHDIR: u64 = 33;
+    pub const SYS_GETDENTS: u64 = 34;
+    pub const SYS_GETPPID: u64 = 35;
+    pub const SYS_GETUID: u64 = 36;
+    pub const SYS_GETGID: u64 = 37;
+    pub const SYS_KILL: u64 = 38;
+    pub const SYS_SIGACTION: u64 = 39;
+    pub const SYS_SIGRETURN: u64 = 40;
+    pub const SYS_MMAP: u64 = 41;
+    pub const SYS_MUNMAP: u64 = 42;
+    pub const SYS_MPROTECT: u64 = 43;
+    pub const SYS_BRK: u64 = 44;
+    pub const SYS_PIPE: u64 = 45;
+    pub const SYS_PIPE2: u64 = 46;
     pub const SYS_BIND: u64 = 47;
     pub const SYS_LISTEN: u64 = 48;
     pub const SYS_ACCEPT: u64 = 49;
@@ -98,6 +120,11 @@ pub mod syscall {
         pub buf_cap: u64,
     }
 
+    pub const SIGKILL: u32 = 9;
+    pub const SIGTERM: u32 = 15;
+    pub const SIGUSR1: u32 = 10;
+    pub const SIGUSR2: u32 = 12;
+
     pub const O_RDONLY: u32 = 0;
     pub const O_WRONLY: u32 = 1;
     pub const O_RDWR: u32 = 2;
@@ -148,6 +175,21 @@ pub mod syscall {
             }
         }
     }
+
+    /// Header of a `getdents` directory entry record.
+    ///
+    /// Layout in the user buffer per entry:
+    ///   `[Dirent header (8 bytes)][name bytes (name_len bytes)][padding to 4-byte alignment]`
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct Dirent {
+        pub ino: u32,
+        pub file_type: u16,
+        pub name_len: u16,
+    }
+
+    /// Size of the `Dirent` header in bytes (without the trailing name).
+    pub const DIRENT_HEADER_SIZE: usize = 8;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -229,6 +271,28 @@ pub mod syscall {
             SYS_CONNECT => "connect",
             SYS_SEND => "send",
             SYS_RECV => "recv",
+            SYS_MKDIR => "mkdir",
+            SYS_RMDIR => "rmdir",
+            SYS_UNLINK => "unlink",
+            SYS_RENAME => "rename",
+            SYS_LINK => "link",
+            SYS_SYMLINK => "symlink",
+            SYS_READLINK => "readlink",
+            SYS_GETCWD => "getcwd",
+            SYS_CHDIR => "chdir",
+            SYS_GETDENTS => "getdents",
+            SYS_GETPPID => "getppid",
+            SYS_GETUID => "getuid",
+            SYS_GETGID => "getgid",
+            SYS_KILL => "kill",
+            SYS_SIGACTION => "sigaction",
+            SYS_SIGRETURN => "sigreturn",
+            SYS_MMAP => "mmap",
+            SYS_MUNMAP => "munmap",
+            SYS_MPROTECT => "mprotect",
+            SYS_BRK => "brk",
+            SYS_PIPE => "pipe",
+            SYS_PIPE2 => "pipe2",
             _ => "unknown",
         }
     }
@@ -255,6 +319,12 @@ pub mod syscall {
         pub const EHOSTUNREACH: isize = -113;
         pub const EADDRINUSE: isize = -98;
         pub const EISCONN: isize = -106;
+        pub const EISDIR: isize = -21;
+        pub const ENOTDIR: isize = -20;
+        pub const ENOTEMPTY: isize = -39;
+        pub const EPIPE: isize = -32;
+        pub const ESRCH: isize = -3;
+        pub const EEXIST: isize = -17;
 
         pub const fn name(code: isize) -> &'static str {
             match code {
@@ -279,6 +349,12 @@ pub mod syscall {
                 EHOSTUNREACH => "EHOSTUNREACH",
                 EADDRINUSE => "EADDRINUSE",
                 EISCONN => "EISCONN",
+                EISDIR => "EISDIR",
+                ENOTDIR => "ENOTDIR",
+                ENOTEMPTY => "ENOTEMPTY",
+                EPIPE => "EPIPE",
+                ESRCH => "ESRCH",
+                EEXIST => "EEXIST",
                 _ => "UNKNOWN",
             }
         }
@@ -362,8 +438,10 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_CLOSE, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_OPEN,
-        SYS_SEEK, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_CHDIR, SYS_CLOSE, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE,
+        SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK,
+        SYS_MKDIR, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
+        SYS_SYMLINK, SYS_UNLINK, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -618,6 +696,133 @@ pub mod runtime {
             stat as *mut FileStat as u64,
             core::mem::size_of::<FileStat>() as u64,
         )
+    }
+
+    pub fn mkdir(path: &str, mode: u16) -> isize {
+        syscall3(
+            SYS_MKDIR,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            mode as u64,
+        )
+    }
+
+    pub fn rmdir(path: &str) -> isize {
+        syscall2(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64)
+    }
+
+    pub fn unlink(path: &str) -> isize {
+        syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64)
+    }
+
+    /// `rename(old, new)`: pass both paths in a single contiguous buffer.
+    pub fn rename(old: &str, new: &str) -> isize {
+        // Build a stack buffer holding old_path || new_path (no NUL separator needed).
+        let old_bytes = old.as_bytes();
+        let new_bytes = new.as_bytes();
+        if old_bytes.len() + new_bytes.len() > crate::abi::USERLAND_PATH_MAX * 2 {
+            return crate::syscall::errno::EINVAL;
+        }
+        let mut buf = [0u8; crate::abi::USERLAND_PATH_MAX * 2];
+        buf[..old_bytes.len()].copy_from_slice(old_bytes);
+        buf[old_bytes.len()..old_bytes.len() + new_bytes.len()].copy_from_slice(new_bytes);
+        syscall3(
+            SYS_RENAME,
+            buf.as_ptr() as u64,
+            old_bytes.len() as u64,
+            new_bytes.len() as u64,
+        )
+    }
+
+    /// `link(old, new)`: hard link.
+    pub fn link(old: &str, new: &str) -> isize {
+        let old_bytes = old.as_bytes();
+        let new_bytes = new.as_bytes();
+        if old_bytes.len() + new_bytes.len() > crate::abi::USERLAND_PATH_MAX * 2 {
+            return crate::syscall::errno::EINVAL;
+        }
+        let mut buf = [0u8; crate::abi::USERLAND_PATH_MAX * 2];
+        buf[..old_bytes.len()].copy_from_slice(old_bytes);
+        buf[old_bytes.len()..old_bytes.len() + new_bytes.len()].copy_from_slice(new_bytes);
+        syscall3(
+            SYS_LINK,
+            buf.as_ptr() as u64,
+            old_bytes.len() as u64,
+            new_bytes.len() as u64,
+        )
+    }
+
+    /// `symlink(target, linkpath)`.
+    pub fn symlink(target: &str, link_path: &str) -> isize {
+        let target_bytes = target.as_bytes();
+        let link_bytes = link_path.as_bytes();
+        if target_bytes.len() + link_bytes.len() > crate::abi::USERLAND_PATH_MAX * 2 {
+            return crate::syscall::errno::EINVAL;
+        }
+        let mut buf = [0u8; crate::abi::USERLAND_PATH_MAX * 2];
+        buf[..target_bytes.len()].copy_from_slice(target_bytes);
+        buf[target_bytes.len()..target_bytes.len() + link_bytes.len()].copy_from_slice(link_bytes);
+        syscall3(
+            SYS_SYMLINK,
+            buf.as_ptr() as u64,
+            target_bytes.len() as u64,
+            link_bytes.len() as u64,
+        )
+    }
+
+    /// `readlink(path, buf)` → bytes written or -errno.
+    /// `path` must be NUL-terminated or the kernel reads up to `USERLAND_PATH_MAX` bytes.
+    pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
+        syscall3(
+            SYS_READLINK,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf.as_mut_ptr() as u64,
+        )
+    }
+
+    /// `getcwd(buf)` → bytes written or -errno.
+    pub fn getcwd(buf: &mut [u8]) -> isize {
+        syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64)
+    }
+
+    pub fn chdir(path: &str) -> isize {
+        syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64)
+    }
+
+    /// `getdents(fd, buf)` → bytes written or -errno.
+    pub fn getdents(fd: u32, buf: &mut [u8]) -> isize {
+        syscall3(
+            SYS_GETDENTS,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+
+    pub fn getppid() -> u32 {
+        syscall0(SYS_GETPPID) as u32
+    }
+
+    pub fn getuid() -> u32 {
+        syscall0(SYS_GETUID) as u32
+    }
+
+    pub fn getgid() -> u32 {
+        syscall0(SYS_GETGID) as u32
+    }
+
+    pub fn kill(pid: u32, signal: u32) -> isize {
+        syscall2(SYS_KILL, pid as u64, signal as u64)
+    }
+
+    /// `pipe(pipefd)` fills `pipefd[0]` (read) and `pipefd[1]` (write).
+    pub fn pipe(pipefd: &mut [u32; 2]) -> isize {
+        syscall1(SYS_PIPE, pipefd.as_mut_ptr() as u64)
+    }
+
+    pub fn pipe2(pipefd: &mut [u32; 2], flags: u32) -> isize {
+        syscall2(SYS_PIPE2, pipefd.as_mut_ptr() as u64, flags as u64)
     }
 
     pub fn copy_fd_to_stdout(fd: u32, buffer: &mut [u8]) -> isize {

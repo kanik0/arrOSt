@@ -11,6 +11,7 @@ mod fd;
 mod journal;
 mod migrate;
 mod mount;
+pub mod pipe;
 mod procfs;
 mod ramfs;
 mod tmpfs;
@@ -1233,6 +1234,34 @@ impl FsState {
         }
     }
 
+    /// List directory entries for an already-open directory file.
+    fn readdir_open_file(
+        &self,
+        file: OpenFile,
+        out: &mut [VfsDirEntry],
+        current_pid: Option<u32>,
+    ) -> Result<usize, FsError> {
+        match file {
+            OpenFile::File { mount, ino } => {
+                // Permission check via inode stat.
+                let node = ResolvedInode { mount, ino };
+                let stat = self.inode_stat(node)?;
+                let identity = proc::fs_identity(current_pid);
+                require_inode_permission(identity, &stat, 0o4)?;
+                // list_inode_dir verifies the inode is a directory.
+                match mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => list_inode_dir(&self.ramfs, ino, out),
+                        FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, ino, out),
+                    },
+                    MountKind::Tmp => list_inode_dir(&self.tmpfs, ino, out),
+                    MountKind::Proc => Err(FsError::NotADirectory),
+                }
+            }
+            OpenFile::Proc(_) => Err(FsError::NotADirectory),
+        }
+    }
+
     fn seed_defaults_ramfs(&mut self) {
         let _ = self.ramfs.write(
             "/README.TXT",
@@ -1286,6 +1315,60 @@ impl FsState {
         let file = self.open_path(path, None, O_WRONLY | O_CREAT | O_TRUNC)?;
         let _ = self.write_open_file(file, 0, data)?;
         self.chmod_path(path, mode, None)
+    }
+
+    fn rmdir_path(&mut self, path: &str, current_pid: Option<u32>) -> Result<(), FsError> {
+        let canonical = canonicalize(path)?;
+        let (parent_path, name) = split_parent_path(canonical.as_str())?;
+        let identity = proc::fs_identity(current_pid);
+        let result = match self.resolve_path(parent_path, true)? {
+            ResolvedPath::Inode(node) => {
+                let parent_stat = self.inode_stat(node)?;
+                require_inode_permission(identity, &parent_stat, 0o2)?;
+                match node.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => self.ramfs.rmdir(node.ino, name.as_bytes()),
+                        FsBackend::DiskFsV2 => self.diskfs_v2.rmdir(node.ino, name.as_bytes()),
+                    },
+                    MountKind::Tmp => self.tmpfs.rmdir(node.ino, name.as_bytes()),
+                    MountKind::Proc => Err(FsError::ReadOnly),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        };
+        if result.is_ok() {
+            self.invalidate_dentry_cache();
+            trace_dentry_invalidate("rmdir");
+        }
+        result
+    }
+
+    fn readlink_path(
+        &self,
+        path: &str,
+        buf: &mut [u8],
+        current_pid: Option<u32>,
+    ) -> Result<usize, FsError> {
+        // Resolve WITHOUT following the final symlink (follow_final=false).
+        let identity = proc::fs_identity(current_pid);
+        match self.resolve_path(path, false)? {
+            ResolvedPath::Inode(node) => {
+                let stat = self.inode_stat(node)?;
+                require_inode_permission(identity, &stat, 0o4)?;
+                if stat.file_type != FileType::Symlink {
+                    return Err(FsError::InvalidPath);
+                }
+                match node.mount {
+                    MountKind::Root => match self.backend {
+                        FsBackend::RamFs => self.ramfs.readlink(node.ino, buf),
+                        FsBackend::DiskFsV2 => self.diskfs_v2.readlink(node.ino, buf),
+                    },
+                    MountKind::Tmp => self.tmpfs.readlink(node.ino, buf),
+                    MountKind::Proc => Err(FsError::ReadOnly),
+                }
+            }
+            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+        }
     }
 }
 
@@ -1435,6 +1518,18 @@ pub fn rename_file(
 
 pub fn chmod_file(path: &str, mode: u16, current_pid: Option<u32>) -> Result<(), FsError> {
     with_fs_mut(|state| state.chmod_path(path, mode, current_pid))
+}
+
+pub fn rmdir_dir(path: &str, current_pid: Option<u32>) -> Result<(), FsError> {
+    with_fs_mut(|state| state.rmdir_path(path, current_pid))
+}
+
+pub fn readlink_path_for_pid(
+    path: &str,
+    buf: &mut [u8],
+    current_pid: Option<u32>,
+) -> Result<usize, FsError> {
+    with_fs(|state| state.readlink_path(path, buf, current_pid))
 }
 
 pub fn resolve_path_from(cwd: &str, path: &str) -> Result<String, FsError> {
@@ -1618,6 +1713,15 @@ pub fn reload_from_disk() -> Result<(), FsError> {
 
 pub fn stat_path(path: &str, current_pid: Option<u32>) -> Result<Stat, FsError> {
     with_fs(|state| state.stat_path(path, current_pid))
+}
+
+/// List directory entries from an already-open file descriptor target.
+pub(crate) fn readdir_open_file(
+    file: OpenFile,
+    out: &mut [VfsDirEntry],
+    current_pid: Option<u32>,
+) -> Result<usize, FsError> {
+    with_fs(|state| state.readdir_open_file(file, out, current_pid))
 }
 
 pub fn list_dir(

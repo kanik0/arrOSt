@@ -11,7 +11,7 @@ use crate::serial;
 use crate::storage;
 use crate::time;
 use alloc::string::String;
-use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP, shell_prompt};
+use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{app, errno};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
@@ -358,6 +358,8 @@ fn poll_waiting_vfs_child() -> bool {
     }
     shell.waiting_vfs_pid = None;
     if !shell.doom_capture {
+        // Binary output may not end with '\n'; always start the prompt on a fresh line.
+        serial::write_str("\n");
         print_prompt();
     }
     true
@@ -2018,5 +2020,7 @@ fn refresh_file_manager_preview_view(path: &str, bytes: &[u8]) {
 }
 
 fn print_prompt() {
-    serial::write_str(shell_prompt());
+    // SAFETY: shell state is read on the main loop thread.
+    let shell = unsafe { &*SHELL_STATE.0.get() };
+    serial::write_fmt(format_args!("user@arrost {}> ", shell.cwd()));
 }
