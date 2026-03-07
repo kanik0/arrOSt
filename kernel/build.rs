@@ -348,10 +348,8 @@ fn emit_user_vfs_bin_embed(repo_root: &Path) {
         let present = env::var(present_env)
             .map(|value| value == "true")
             .unwrap_or(false);
-        if present {
-            if let Some(path) = hint.filter(|path| path.exists()) {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+        if present && let Some(path) = hint.filter(|path| path.exists()) {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 }

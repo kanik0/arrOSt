@@ -81,6 +81,14 @@ const TERMINAL_BIN_DOOM: &str = "/bin/doom";
 const TERMINAL_BIN_TERMINAL: &str = "/bin/terminal";
 const TERMINAL_BIN_LINK: &str = "/bin/link";
 const TERMINAL_BIN_SYMLINK: &str = "/bin/symlink";
+const TERMINAL_BIN_NETSTAT: &str = "/bin/netstat";
+const TERMINAL_BIN_IFCONFIG: &str = "/bin/ifconfig";
+const TERMINAL_BIN_ROUTE: &str = "/bin/route";
+const TERMINAL_BIN_ARP: &str = "/bin/arp";
+const TERMINAL_BIN_SS: &str = "/bin/ss";
+const TERMINAL_BIN_NC: &str = "/bin/nc";
+const TERMINAL_BIN_IP: &str = "/bin/ip";
+const TERMINAL_BIN_PING: &str = "/bin/ping";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -3435,21 +3443,33 @@ impl GfxState {
                     return true;
                 };
                 let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "PING {}.{}.{}.{}: 56 data bytes",
+                    target[0], target[1], target[2], target[3]
+                );
+                self.push_terminal_text(index, &line);
+                line.clear();
                 match net::ping(target) {
                     Ok(rtt_ticks) => {
+                        let ms = rtt_ticks.saturating_mul(10);
                         let _ = writeln!(
                             line,
-                            "ping: reply from {}.{}.{}.{} time={} ticks ({} ms)",
-                            target[0],
-                            target[1],
-                            target[2],
-                            target[3],
-                            rtt_ticks,
-                            rtt_ticks.saturating_mul(10)
+                            "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms",
+                            target[0], target[1], target[2], target[3], ms
+                        );
+                        let _ = writeln!(
+                            line,
+                            "\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss",
+                            target[0], target[1], target[2], target[3]
                         );
                     }
-                    Err(err) => {
-                        let _ = writeln!(line, "ping: failed ({})", err.as_str());
+                    Err(_) => {
+                        let _ = writeln!(
+                            line,
+                            "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss",
+                            target[0], target[1], target[2], target[3]
+                        );
                     }
                 }
                 self.push_terminal_text(index, &line);
@@ -3512,6 +3532,379 @@ impl GfxState {
         if let Some(rest) = command.strip_prefix("curl ") {
             let output = net::curl_text(rest);
             self.push_terminal_text(index, &output);
+            return true;
+        }
+
+        // /bin/ping <ip>
+        if let Some(ip) = command.strip_prefix("/bin/ping ") {
+            let ip = ip.trim();
+            if ip.is_empty() {
+                self.push_terminal_text(index, "usage: ping <a.b.c.d>\n");
+            } else {
+                let Some(target) = net::parse_ipv4(ip) else {
+                    self.push_terminal_text(index, "ping: invalid ip (usage: ping <a.b.c.d>)\n");
+                    return true;
+                };
+                let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "PING {}.{}.{}.{}: 56 data bytes",
+                    target[0], target[1], target[2], target[3]
+                );
+                self.push_terminal_text(index, &line);
+                line.clear();
+                match net::ping(target) {
+                    Ok(rtt_ticks) => {
+                        let ms = rtt_ticks.saturating_mul(10);
+                        let _ = writeln!(
+                            line,
+                            "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms",
+                            target[0], target[1], target[2], target[3], ms
+                        );
+                        let _ = writeln!(
+                            line,
+                            "\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss",
+                            target[0], target[1], target[2], target[3]
+                        );
+                    }
+                    Err(_) => {
+                        let _ = writeln!(
+                            line,
+                            "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss",
+                            target[0], target[1], target[2], target[3]
+                        );
+                    }
+                }
+                self.push_terminal_text(index, &line);
+            }
+            return true;
+        }
+        if command == TERMINAL_BIN_PING {
+            self.push_terminal_text(index, "usage: ping <a.b.c.d>\n");
+            return true;
+        }
+
+        // netstat / /bin/netstat
+        if command == "netstat" || command == TERMINAL_BIN_NETSTAT {
+            self.push_terminal_text(
+                index,
+                "netstat: Active Internet connections (w/o servers)\n",
+            );
+            self.push_terminal_text(
+                index,
+                "netstat: Proto  Local Address           Foreign Address         State\n",
+            );
+            let (conns, count) = net::tcp_conns_snapshot();
+            if count == 0 {
+                self.push_terminal_text(index, "netstat: (no active TCP connections)\n");
+            } else {
+                for conn in conns.iter().take(count) {
+                    let mut line = String::new();
+                    let _ = writeln!(
+                        line,
+                        "netstat: tcp    0.0.0.0:{:<5}         {}.{}.{}.{}:{:<5}    {}",
+                        conn.local_port,
+                        conn.remote_ip[0],
+                        conn.remote_ip[1],
+                        conn.remote_ip[2],
+                        conn.remote_ip[3],
+                        conn.remote_port,
+                        conn.state
+                    );
+                    self.push_terminal_text(index, &line);
+                }
+            }
+            return true;
+        }
+
+        // ifconfig / /bin/ifconfig
+        if command == "ifconfig" || command == TERMINAL_BIN_IFCONFIG {
+            let status = net::status();
+            let mut out = String::new();
+            let _ = writeln!(out, "ifconfig: lo0: flags=73 mtu=65536");
+            let _ = writeln!(out, "ifconfig:   inet 127.0.0.1 netmask 0xff000000");
+            if status.ready {
+                let _ = writeln!(
+                    out,
+                    "ifconfig: eth0: flags=4163 mtu=1500 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    status.mac[0],
+                    status.mac[1],
+                    status.mac[2],
+                    status.mac[3],
+                    status.mac[4],
+                    status.mac[5]
+                );
+                let _ = writeln!(
+                    out,
+                    "ifconfig:   inet {}.{}.{}.{} netmask {}.{}.{}.{}",
+                    status.ipv4[0],
+                    status.ipv4[1],
+                    status.ipv4[2],
+                    status.ipv4[3],
+                    status.netmask[0],
+                    status.netmask[1],
+                    status.netmask[2],
+                    status.netmask[3]
+                );
+                let _ = writeln!(
+                    out,
+                    "ifconfig:   rx_packets={} tx_packets={} rx_errors=0 tx_errors={}",
+                    status.stats.rx_frames, status.stats.tx_frames, status.stats.dropped
+                );
+            } else {
+                let _ = writeln!(out, "ifconfig: eth0: unavailable");
+            }
+            self.push_terminal_text(index, &out);
+            return true;
+        }
+
+        // route / /bin/route
+        if command == "route" || command == TERMINAL_BIN_ROUTE {
+            let status = net::status();
+            let mut out = String::new();
+            let _ = writeln!(out, "route: Kernel IP routing table");
+            let _ = writeln!(
+                out,
+                "route: Destination     Gateway         Genmask         Flags Iface"
+            );
+            if status.ready {
+                let _ = writeln!(
+                    out,
+                    "route: {}.{}.{}.0       0.0.0.0         {}.{}.{}.{}     U     eth0",
+                    status.ipv4[0],
+                    status.ipv4[1],
+                    status.ipv4[2],
+                    status.netmask[0],
+                    status.netmask[1],
+                    status.netmask[2],
+                    status.netmask[3]
+                );
+                let _ = writeln!(
+                    out,
+                    "route: 0.0.0.0         {}.{}.{}.{}     0.0.0.0         UG    eth0",
+                    status.gateway[0], status.gateway[1], status.gateway[2], status.gateway[3]
+                );
+            }
+            let _ = writeln!(
+                out,
+                "route: 127.0.0.0       0.0.0.0         255.0.0.0       U     lo"
+            );
+            self.push_terminal_text(index, &out);
+            return true;
+        }
+
+        // arp / /bin/arp
+        if command == "arp" || command == TERMINAL_BIN_ARP {
+            let status = net::status();
+            let mut out = String::new();
+            let _ = writeln!(
+                out,
+                "arp: Address         HWtype  HWaddress           Flags Mask  Iface"
+            );
+            if !status.ready {
+                let _ = writeln!(out, "arp: (empty)");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "arp: (see `net` for ARP stats; arp_rx={})",
+                    status.stats.rx_arp
+                );
+            }
+            self.push_terminal_text(index, &out);
+            return true;
+        }
+
+        // ss / /bin/ss
+        if command == "ss" || command == TERMINAL_BIN_SS {
+            self.push_terminal_text(
+                index,
+                "ss: Netid  State      Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\n",
+            );
+            let (conns, count) = net::tcp_conns_snapshot();
+            if count == 0 {
+                self.push_terminal_text(index, "ss: (no active sockets)\n");
+            } else {
+                for conn in conns.iter().take(count) {
+                    let mut line = String::new();
+                    let _ = writeln!(
+                        line,
+                        "ss: tcp    {:<10} {:<7} 0       0.0.0.0:{:<5}          {}.{}.{}.{}:{}",
+                        conn.state,
+                        conn.rx_bytes,
+                        conn.local_port,
+                        conn.remote_ip[0],
+                        conn.remote_ip[1],
+                        conn.remote_ip[2],
+                        conn.remote_ip[3],
+                        conn.remote_port
+                    );
+                    self.push_terminal_text(index, &line);
+                }
+            }
+            return true;
+        }
+
+        // nc / /bin/nc
+        if command == "nc" || command == TERMINAL_BIN_NC {
+            self.push_terminal_text(index, "nc: usage: nc <host> <port>\n");
+            return true;
+        }
+        if let Some(rest) = command
+            .strip_prefix("nc ")
+            .or_else(|| command.strip_prefix("/bin/nc "))
+        {
+            let rest = rest.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let host = parts.next().unwrap_or("");
+            let port = parts.next().unwrap_or("").trim();
+            if host.is_empty() || port.is_empty() {
+                self.push_terminal_text(index, "nc: usage: nc <host> <port>\n");
+            } else {
+                let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "nc: connect {}:{} (interactive mode not supported; use curl for HTTP)",
+                    host, port
+                );
+                self.push_terminal_text(index, &line);
+            }
+            return true;
+        }
+
+        // ip [addr|link|route] / /bin/ip [addr|link|route]
+        if command == "ip" || command == TERMINAL_BIN_IP {
+            // delegate to ifconfig (addr)
+            let status = net::status();
+            let mut out = String::new();
+            let _ = writeln!(out, "ifconfig: lo0: flags=73 mtu=65536");
+            let _ = writeln!(out, "ifconfig:   inet 127.0.0.1 netmask 0xff000000");
+            if status.ready {
+                let _ = writeln!(
+                    out,
+                    "ifconfig: eth0: flags=4163 mtu=1500 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    status.mac[0],
+                    status.mac[1],
+                    status.mac[2],
+                    status.mac[3],
+                    status.mac[4],
+                    status.mac[5]
+                );
+                let _ = writeln!(
+                    out,
+                    "ifconfig:   inet {}.{}.{}.{} netmask {}.{}.{}.{}",
+                    status.ipv4[0],
+                    status.ipv4[1],
+                    status.ipv4[2],
+                    status.ipv4[3],
+                    status.netmask[0],
+                    status.netmask[1],
+                    status.netmask[2],
+                    status.netmask[3]
+                );
+            } else {
+                let _ = writeln!(out, "ifconfig: eth0: unavailable");
+            }
+            self.push_terminal_text(index, &out);
+            return true;
+        }
+        if let Some(rest) = command
+            .strip_prefix("ip ")
+            .or_else(|| command.strip_prefix("/bin/ip "))
+        {
+            let subcmd = rest.trim();
+            match subcmd {
+                "addr" | "a" => {
+                    // re-dispatch as "ip"
+                    let status = net::status();
+                    let mut out = String::new();
+                    let _ = writeln!(out, "ifconfig: lo0: flags=73 mtu=65536");
+                    let _ = writeln!(out, "ifconfig:   inet 127.0.0.1 netmask 0xff000000");
+                    if status.ready {
+                        let _ = writeln!(
+                            out,
+                            "ifconfig: eth0: flags=4163 mtu=1500 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            status.mac[0],
+                            status.mac[1],
+                            status.mac[2],
+                            status.mac[3],
+                            status.mac[4],
+                            status.mac[5]
+                        );
+                        let _ = writeln!(
+                            out,
+                            "ifconfig:   inet {}.{}.{}.{} netmask {}.{}.{}.{}",
+                            status.ipv4[0],
+                            status.ipv4[1],
+                            status.ipv4[2],
+                            status.ipv4[3],
+                            status.netmask[0],
+                            status.netmask[1],
+                            status.netmask[2],
+                            status.netmask[3]
+                        );
+                    } else {
+                        let _ = writeln!(out, "ifconfig: eth0: unavailable");
+                    }
+                    self.push_terminal_text(index, &out);
+                }
+                "route" | "r" => {
+                    let status = net::status();
+                    let mut out = String::new();
+                    let _ = writeln!(out, "route: Kernel IP routing table");
+                    let _ = writeln!(
+                        out,
+                        "route: Destination     Gateway         Genmask         Flags Iface"
+                    );
+                    if status.ready {
+                        let _ = writeln!(
+                            out,
+                            "route: {}.{}.{}.0       0.0.0.0         {}.{}.{}.{}     U     eth0",
+                            status.ipv4[0],
+                            status.ipv4[1],
+                            status.ipv4[2],
+                            status.netmask[0],
+                            status.netmask[1],
+                            status.netmask[2],
+                            status.netmask[3]
+                        );
+                        let _ = writeln!(
+                            out,
+                            "route: 0.0.0.0         {}.{}.{}.{}     0.0.0.0         UG    eth0",
+                            status.gateway[0],
+                            status.gateway[1],
+                            status.gateway[2],
+                            status.gateway[3]
+                        );
+                    }
+                    let _ = writeln!(
+                        out,
+                        "route: 127.0.0.0       0.0.0.0         255.0.0.0       U     lo"
+                    );
+                    self.push_terminal_text(index, &out);
+                }
+                "link" | "l" => {
+                    let status = net::status();
+                    let mut out = String::new();
+                    if status.ready {
+                        let _ = writeln!(
+                            out,
+                            "ip: 2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 link/ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            status.mac[0],
+                            status.mac[1],
+                            status.mac[2],
+                            status.mac[3],
+                            status.mac[4],
+                            status.mac[5]
+                        );
+                    } else {
+                        let _ = writeln!(out, "ip: eth0: unavailable");
+                    }
+                    self.push_terminal_text(index, &out);
+                }
+                _ => {
+                    self.push_terminal_text(index, "ip: usage: ip [addr|link|route]\n");
+                }
+            }
             return true;
         }
 

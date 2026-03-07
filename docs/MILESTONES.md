@@ -689,9 +689,27 @@ pub trait AudioDevice {
 
 ## M19: Production TCP/IP Stack + Unix Network Utilities
 
-**Status**: Planned
+**Status**: In Progress
 **Limitation**: Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.
 **Goal**: Full TCP/IP stack with proper state machine, congestion control, and socket API. Classic Unix network utilities as `/bin/*` executables with standard syntax and behavior.
+
+### Delivered scope
+
+- TCP connection table with state machine: CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 / CLOSE_WAIT.
+- BSD socket syscalls (ABI revision 5): `socket(6)`, `connect(50)`, `send(51)`, `recv(52)`, plus stubs `bind(47)`, `listen(48)`, `accept(49)` returning `ENOSYS`.
+- `FdTarget::TcpSocket(u8)` in the per-process fd table; `close` triggers FIN.
+- Kernel-side helpers for `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip` dispatched from both serial shell and GUI terminal.
+- `/bin/netstat`, `/bin/ifconfig`, `/bin/route`, `/bin/arp`, `/bin/ss`, `/bin/nc`, `/bin/ip`, `/bin/ping` in `BIN_EXEC_PATHS`.
+- `smoke-net` QEMU harness verifying all utility commands produce expected output.
+- Unix-standard `ping` output: `PING <ip>: 56 data bytes` / `64 bytes from <ip>: icmp_seq=1 ttl=64 time=N ms` / statistics summary.
+
+### Remaining follow-up
+
+- User-space ring-3 ELF binaries for each utility (depends on M15 extended syscall surface).
+- Congestion control (slow start / Reno-style CWND).
+- Full TIME_WAIT / CLOSING / LAST_ACK states and 2*MSL timer.
+- Passive TCP (`bind`/`listen`/`accept`) implementation.
+- `traceroute`, `host`, `dig` utilities.
 
 ### Dependencies
 - M12 (VFS-backed ELF launch groundwork) recommended for running utilities as ring-3 binaries.

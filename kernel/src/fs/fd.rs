@@ -28,6 +28,8 @@ pub(crate) enum FdTarget {
     TtyStdout(u32),
     TtyStderr(u32),
     File(OpenFile),
+    /// TCP socket; the u8 is an index into the kernel-global TcpTable.
+    TcpSocket(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +122,17 @@ impl FdTable {
         self.descriptions[0] = FdSlot::new(FdTarget::TtyStdin(tty), O_RDONLY, 1);
         self.descriptions[1] = FdSlot::new(FdTarget::TtyStdout(tty), O_WRONLY, 1);
         self.descriptions[2] = FdSlot::new(FdTarget::TtyStderr(tty), O_WRONLY, 1);
+    }
+
+    pub fn open_tcp_socket(&mut self, conn_idx: u8) -> Result<u32, FdError> {
+        let fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
+        let Some(desc_index) = self.alloc_description_slot() else {
+            self.fd_slots[fd_index] = None;
+            return Err(FdError::TooManyFiles);
+        };
+        self.descriptions[desc_index] = FdSlot::new(FdTarget::TcpSocket(conn_idx), O_RDWR, 1);
+        self.fd_slots[fd_index] = Some(desc_index as u8);
+        Ok(fd_index as u32)
     }
 
     pub fn open_file(&mut self, file: OpenFile, flags: u32) -> Result<u32, FdError> {

@@ -34,6 +34,14 @@ const SERIAL_BIN_DOOM: &str = "/bin/doom";
 const SERIAL_BIN_TERMINAL: &str = "/bin/terminal";
 const SERIAL_BIN_LINK: &str = "/bin/link";
 const SERIAL_BIN_SYMLINK: &str = "/bin/symlink";
+const SERIAL_BIN_NETSTAT: &str = "/bin/netstat";
+const SERIAL_BIN_IFCONFIG: &str = "/bin/ifconfig";
+const SERIAL_BIN_ROUTE: &str = "/bin/route";
+const SERIAL_BIN_ARP: &str = "/bin/arp";
+const SERIAL_BIN_SS: &str = "/bin/ss";
+const SERIAL_BIN_NC: &str = "/bin/nc";
+const SERIAL_BIN_IP: &str = "/bin/ip";
+const SERIAL_BIN_PING: &str = "/bin/ping";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -194,7 +202,7 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 
 pub fn init() {
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, netstat, ifconfig, route, arp, ss, nc, ip, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink|/bin/netstat|/bin/ifconfig|/bin/route|/bin/arp|/bin/ss|/bin/nc|/bin/ip; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -703,13 +711,78 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
 
-    if let Some(ip) = input.strip_prefix("ping ") {
+    if input == "ping" || input == SERIAL_BIN_PING {
+        serial::write_line("usage: ping <a.b.c.d>");
+        return;
+    }
+    if let Some(ip) = input
+        .strip_prefix("ping ")
+        .or_else(|| input.strip_prefix("/bin/ping "))
+    {
         let ip = ip.trim();
         if ip.is_empty() {
             serial::write_line("usage: ping <a.b.c.d>");
             return;
         }
         net::ping_to_serial(ip);
+        return;
+    }
+
+    if input == "netstat" || input == SERIAL_BIN_NETSTAT {
+        with_shell_bin_process(SERIAL_BIN_NETSTAT, |_pid| net::netstat_to_serial());
+        return;
+    }
+    if input == "ifconfig" || input == SERIAL_BIN_IFCONFIG {
+        with_shell_bin_process(SERIAL_BIN_IFCONFIG, |_pid| net::ifconfig_to_serial());
+        return;
+    }
+    if input == "route" || input == SERIAL_BIN_ROUTE {
+        with_shell_bin_process(SERIAL_BIN_ROUTE, |_pid| net::route_to_serial());
+        return;
+    }
+    if input == "arp" || input == SERIAL_BIN_ARP {
+        with_shell_bin_process(SERIAL_BIN_ARP, |_pid| net::arp_to_serial());
+        return;
+    }
+    if input == "ss" || input == SERIAL_BIN_SS {
+        with_shell_bin_process(SERIAL_BIN_SS, |_pid| net::ss_to_serial());
+        return;
+    }
+    if input == "nc" || input == SERIAL_BIN_NC {
+        serial::write_line("nc: usage: nc <host> <port>");
+        return;
+    }
+    if let Some(rest) = input
+        .strip_prefix("nc ")
+        .or_else(|| input.strip_prefix("/bin/nc "))
+    {
+        let rest = rest.trim();
+        // Parse "nc <host> <port>" - just reports connection info (interactive mode unsupported)
+        let parts: [&str; 2] = {
+            let mut it = rest.splitn(2, char::is_whitespace);
+            let host = it.next().unwrap_or("");
+            let port = it.next().unwrap_or("").trim();
+            [host, port]
+        };
+        if parts[0].is_empty() || parts[1].is_empty() {
+            serial::write_line("nc: usage: nc <host> <port>");
+        } else {
+            serial::write_fmt(format_args!(
+                "nc: connect {}:{} (interactive mode not supported; use curl for HTTP)\n",
+                parts[0], parts[1]
+            ));
+        }
+        return;
+    }
+    if input == "ip" || input == SERIAL_BIN_IP {
+        net::ip_to_serial("");
+        return;
+    }
+    if let Some(rest) = input
+        .strip_prefix("ip ")
+        .or_else(|| input.strip_prefix("/bin/ip "))
+    {
+        net::ip_to_serial(rest.trim());
         return;
     }
 
@@ -912,7 +985,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath>",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | netstat | ifconfig | route | arp | ss | nc <host> <port> | ip [addr|link|route] | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath> | /bin/netstat | /bin/ifconfig | /bin/route | /bin/arp | /bin/ss | /bin/nc <host> <port> | /bin/ip [addr|link|route]",
             );
         }
         "version" => {
@@ -1445,7 +1518,7 @@ fn run_shell_ls_command(path: &str, current_pid: Option<u32>) {
 }
 
 fn run_shell_bin_dir_listing(current_pid: Option<u32>) {
-    let mut entries = [fs::VfsDirEntry::empty(); 16];
+    let mut entries = [fs::VfsDirEntry::empty(); 32];
     let count = match fs::list_dir("/bin", &mut entries, current_pid) {
         Ok(count) => count,
         Err(err) => {

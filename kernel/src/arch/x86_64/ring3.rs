@@ -349,7 +349,7 @@ pub fn sample_user_timer(user_rip: u64, user_rsp: u64, from_ring3: bool) {
     let sample = RING3_TIMER_SAMPLES
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
-    if sample <= 8 || sample % 25 == 0 {
+    if sample <= 8 || sample.is_multiple_of(25) {
         serial::write_fmt(format_args!(
             "ring3 run: timer sample={} rip={:#018x} rsp={:#018x}\n",
             sample, user_rip, user_rsp

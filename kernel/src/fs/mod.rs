@@ -39,7 +39,7 @@ use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 10] = [
+pub const BIN_EXEC_PATHS: [&str; 18] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -50,6 +50,14 @@ pub const BIN_EXEC_PATHS: [&str; 10] = [
     "/bin/terminal",
     "/bin/link",
     "/bin/symlink",
+    "/bin/netstat",
+    "/bin/ifconfig",
+    "/bin/route",
+    "/bin/arp",
+    "/bin/ss",
+    "/bin/nc",
+    "/bin/ip",
+    "/bin/ping",
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
