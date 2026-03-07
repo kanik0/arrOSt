@@ -74,7 +74,7 @@ Representative commands:
 - Cooperative kernel task table for core runtime tasks.
 - Ring-3 multiprocess runtime for VFS-backed `/bin/*` ELFs plus embedded `ring3 run` smoke/debug apps (`init`, `doom`).
 - Additional external process table for compositor-launched terminals and Doom runtime sessions.
-- Ring-3 scheduling is round-robin with syscall-timeslice preemption.
+- Ring-3 scheduling is round-robin with timer-driven hard preemption (10-tick quantum via PIT IRQ0 on x86_64 / GIC virtual timer IRQ27 on aarch64) and syscall-timeslice preemption.
 - Ring-3 ELF segments and stacks are mapped into dedicated per-arch user virtual ranges owned by each process (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`).
 - Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
 - `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
@@ -118,7 +118,6 @@ Useful runtime commands:
 - Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
-- Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
 - The syscall surface is intentionally small and not POSIX-complete.
 - `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
 - `diskfs-v2` journals metadata only; file data is not journaled.

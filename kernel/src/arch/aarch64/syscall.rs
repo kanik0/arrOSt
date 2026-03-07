@@ -1,7 +1,8 @@
 // kernel/src/arch/aarch64/syscall.rs: aarch64 SVC gate groundwork + optional EL0 boot smoke.
 use crate::{proc, serial};
 use arrostd::syscall::{SYS_EXIT, SYS_GETPID, SYS_TIME_MS, caps, errno};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 const RING3_BOOT_SMOKE_ENV: &str = match option_env!("ARROST_RING3_BOOT_SMOKE") {
     Some(value) => value,
@@ -26,6 +27,72 @@ const STATE_IDLE: u8 = 0;
 const STATE_ARMED: u8 = 1;
 const STATE_COMPLETED: u8 = 2;
 const STATE_FAILED: u8 = 3;
+
+// ---------- timer-driven hard preemption (M14) ----------
+
+/// Full EL0 CPU register snapshot captured by `__arrost_irq_from_el0` when
+/// the timer fires during ring-3 execution.
+///
+/// Layout MUST match the EL0 IRQ asm entry push sequence:
+///   stp x0,x1 … stp x28,x29 (offsets 0..232)
+///   str x30             (offset 240)
+///   sp_el0 (mrs)        (offset 248)
+///   elr_el1 (mrs)       (offset 256)
+///   spsr_el1 (mrs)      (offset 264)
+/// Total: 272 bytes, 16-byte aligned.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct El0PreemptFrame {
+    pub x0: u64,
+    pub x1: u64,
+    pub x2: u64,
+    pub x3: u64,
+    pub x4: u64,
+    pub x5: u64,
+    pub x6: u64,
+    pub x7: u64,
+    pub x8: u64,
+    pub x9: u64,
+    pub x10: u64,
+    pub x11: u64,
+    pub x12: u64,
+    pub x13: u64,
+    pub x14: u64,
+    pub x15: u64,
+    pub x16: u64,
+    pub x17: u64,
+    pub x18: u64,
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,      // offset 224
+    pub x30: u64,      // offset 240
+    pub sp_el0: u64,   // offset 248
+    pub elr_el1: u64,  // offset 256
+    pub spsr_el1: u64, // offset 264
+}
+
+/// Remaining timer ticks before the active ring-3 process is preempted.
+static AARCH64_PREEMPT_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// PID of the ring-3 process whose register state is stored in AARCH64_EL0_PREEMPT_FRAME.
+static AARCH64_PREEMPT_FRAME_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Whether AARCH64_EL0_PREEMPT_FRAME holds a valid preempted-process snapshot.
+static AARCH64_PREEMPT_FRAME_VALID: AtomicU8 = AtomicU8::new(0);
+
+// SAFETY: single-core kernel; written only by the EL0 IRQ handler (interrupts masked) and
+// read after AARCH64_PREEMPT_FRAME_VALID is published with Release ordering.
+static mut AARCH64_EL0_PREEMPT_FRAME: MaybeUninit<El0PreemptFrame> = MaybeUninit::uninit();
+
+// ---------- end preemption statics ----------
 
 #[repr(align(16))]
 struct SmokeStack([u8; RING3_SMOKE_STACK_BYTES]);
@@ -197,6 +264,28 @@ fn arm_and_enter(
         launch.syscall_caps,
         if expect_fault { "fault" } else { "normal" }
     ));
+
+    // Reset the per-process quantum so the timer ISR knows when to preempt.
+    AARCH64_PREEMPT_TICKS.store(proc::RING3_PREEMPT_QUANTUM, Ordering::Release);
+
+    // If this process was previously preempted, restore the full saved register frame
+    // (all 31 GPRs + ELR_EL1 + SPSR_EL1 + SP_EL0) instead of entering fresh via eret.
+    if AARCH64_PREEMPT_FRAME_VALID.load(Ordering::Acquire) == 1
+        && AARCH64_PREEMPT_FRAME_PID.load(Ordering::Acquire) == launch.pid
+    {
+        AARCH64_PREEMPT_FRAME_VALID.store(0, Ordering::Release);
+        // SAFETY: AARCH64_EL0_PREEMPT_FRAME was fully written before AARCH64_PREEMPT_FRAME_VALID
+        // was published with Release ordering.
+        // SAFETY: addr_of! avoids creating a shared reference to mutable static.
+        let frame_ptr: *const El0PreemptFrame =
+            core::ptr::addr_of!(AARCH64_EL0_PREEMPT_FRAME).cast();
+        serial::write_fmt(format_args!(
+            "{label}: resuming preempted pid={} from saved frame\n",
+            launch.pid
+        ));
+        // SAFETY: frame_ptr is valid; we are in EL1 about to eret.
+        unsafe { enter_from_preempt_frame_el0(frame_ptr) }
+    }
 
     // SAFETY: optional smoke transitions to EL0 using a controlled entry point/stack.
     unsafe {
@@ -461,6 +550,109 @@ fn ring3_smoke_user_entry_fault() -> ! {
             "b .",
             sys_getpid = const SYS_GETPID,
             options(noreturn)
+        );
+    }
+}
+
+// ---------- aarch64 M14 preemption functions ----------
+
+/// Called from the EL0 timer IRQ Rust dispatch when a timer fires during ring-3.
+/// Decrements the per-process quantum; if it reaches zero, saves the full register
+/// frame and resumes the kernel scheduler (never returns in that case).
+/// Returns false for the non-preempting path (asm stub restores regs and erets normally).
+pub fn on_el0_timer_for_preempt(frame: &El0PreemptFrame) -> bool {
+    if RING3_SMOKE_STATE.load(Ordering::Acquire) != STATE_ARMED {
+        return false;
+    }
+    let prev = AARCH64_PREEMPT_TICKS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |t| {
+        Some(t.saturating_sub(1))
+    });
+    // Preempt when the old quantum was 1 (now 0).
+    if prev == Ok(1) {
+        // SAFETY: frame is valid (asm stub allocated it on the kernel stack before the call).
+        unsafe { preempt_ring3_el0(frame) };
+        // `preempt_ring3_el0` never returns; the compiler does not know this.
+    }
+    false
+}
+
+/// Save the full EL0 register state and resume the kernel scheduler.
+/// DOES NOT RETURN.
+unsafe fn preempt_ring3_el0(frame: &El0PreemptFrame) -> ! {
+    // Copy the full EL0 snapshot to the static save area.
+    // SAFETY: AARCH64_EL0_PREEMPT_FRAME is only written here (single-core, EL1 interrupt handler)
+    // and only read after AARCH64_PREEMPT_FRAME_VALID is published with Release ordering.
+    // SAFETY: addr_of_mut! avoids creating a reference; cast to *mut El0PreemptFrame is safe
+    // because MaybeUninit<El0PreemptFrame> has identical size and alignment to El0PreemptFrame.
+    unsafe {
+        let dst: *mut El0PreemptFrame = core::ptr::addr_of_mut!(AARCH64_EL0_PREEMPT_FRAME).cast();
+        dst.write(*frame);
+    }
+
+    let pid = proc::ring3_active_pid();
+    AARCH64_PREEMPT_FRAME_PID.store(pid, Ordering::Release);
+    AARCH64_PREEMPT_FRAME_VALID.store(1, Ordering::Release);
+
+    serial::write_fmt(format_args!(
+        "ring3 preempt(a64): pid={} elr={:#018x} sp_el0={:#018x}\n",
+        pid, frame.elr_el1, frame.sp_el0,
+    ));
+
+    // Notify the scheduler: record rip/rsp and mark the process as ready.
+    proc::on_ring3_preempted(frame.elr_el1, frame.sp_el0);
+
+    RING3_SMOKE_STATE.store(STATE_IDLE, Ordering::Release);
+
+    let resume_sp = RING3_SMOKE_RETURN_SP.load(Ordering::Acquire);
+    let resume_daif = RING3_SMOKE_RETURN_DAIF.load(Ordering::Acquire);
+    let continue_fn = RING3_SMOKE_CONTINUE_FN.load(Ordering::Acquire);
+    if resume_sp == 0 || continue_fn == 0 {
+        serial::write_line("ring3 preempt(a64): invalid kernel resume context, halting");
+        crate::arch::halt_forever();
+    }
+
+    // SAFETY: resume context was captured in arm_and_enter before entering EL0.
+    unsafe { resume_kernel_path(resume_sp as usize, resume_daif, continue_fn as usize) }
+}
+
+/// Restore a preempted ring-3 process from its saved `El0PreemptFrame`.
+///
+/// Restores ELR_EL1, SPSR_EL1, SP_EL0 and all 31 GPRs, then executes `eret`
+/// to return to the exact instruction boundary where the timer interrupt fired.
+/// DOES NOT RETURN.
+unsafe fn enter_from_preempt_frame_el0(frame_ptr: *const El0PreemptFrame) -> ! {
+    // SAFETY: frame_ptr is valid (AARCH64_EL0_PREEMPT_FRAME was initialised before
+    // AARCH64_PREEMPT_FRAME_VALID was published).  We are in EL1 before the eret.
+    unsafe {
+        core::arch::asm!(
+            // Restore system registers using x1 as a scratch (will be overwritten by ldp below).
+            "ldr x1, [{frame}, #256]",    // elr_el1
+            "msr elr_el1, x1",
+            "ldr x1, [{frame}, #264]",    // spsr_el1
+            "msr spsr_el1, x1",
+            "ldr x1, [{frame}, #248]",    // sp_el0
+            "msr sp_el0, x1",
+            // Move frame base into x30 so we can bulk-restore x0..x29 without losing frame ptr.
+            "mov x30, {frame}",
+            "ldp x0,  x1,  [x30, #0]",   // x0, x1
+            "ldp x2,  x3,  [x30, #16]",  // x2, x3
+            "ldp x4,  x5,  [x30, #32]",  // x4, x5
+            "ldp x6,  x7,  [x30, #48]",  // x6, x7
+            "ldp x8,  x9,  [x30, #64]",  // x8, x9
+            "ldp x10, x11, [x30, #80]",  // x10, x11
+            "ldp x12, x13, [x30, #96]",  // x12, x13
+            "ldp x14, x15, [x30, #112]", // x14, x15
+            "ldp x16, x17, [x30, #128]", // x16, x17
+            "ldp x18, x19, [x30, #144]", // x18, x19
+            "ldp x20, x21, [x30, #160]", // x20, x21
+            "ldp x22, x23, [x30, #176]", // x22, x23
+            "ldp x24, x25, [x30, #192]", // x24, x25
+            "ldp x26, x27, [x30, #208]", // x26, x27
+            "ldp x28, x29, [x30, #224]", // x28, x29
+            "ldr x30, [x30, #240]",       // x30 (LR) — must be last
+            "eret",
+            frame = in(reg) frame_ptr,
+            options(noreturn),
         );
     }
 }

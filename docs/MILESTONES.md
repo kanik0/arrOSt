@@ -261,8 +261,8 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 ## M14: Timer-Driven Hard Preemption
 
-**Status**: Planned
-**Limitation**: Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries.
+**Status**: Implemented
+**Limitation** (resolved): Preemption now occurs at any instruction boundary, not just syscall/trap boundaries.
 **Goal**: Preempt user-mode processes via timer interrupt at any instruction boundary.
 
 ### Context

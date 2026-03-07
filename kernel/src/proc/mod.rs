@@ -22,7 +22,7 @@ use arrostd::syscall::{
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ring3_groundwork::{
     AddressSpaceToken, MAX_USER_RANGES, Ring3ProcessImage, Ring3ProcessState, Ring3TrapFrame,
     UserMemoryRange, copy_from_user, copy_from_user_bytes, copy_to_user_bytes,
@@ -36,6 +36,9 @@ const MAX_WRITE_BYTES: usize = 256;
 const MAX_RING3_IO_BYTES: usize = 4096;
 const RING3_SYSCALL_TIMESLICE: u32 = 8;
 const KILL_EXIT_CODE: i32 = 137;
+
+/// Number of timer ticks a ring-3 process is allowed to run before preemption.
+pub const RING3_PREEMPT_QUANTUM: u32 = 10;
 const USER_SHELL_SCRIPT: &[u8] = b"";
 const TASK_CAP_INIT: u32 = user_init::required_caps();
 const TASK_CAP_SHELL: u32 = caps::ALL;
@@ -52,6 +55,11 @@ unsafe impl Sync for FsIdentityOverrideCell {}
 static SCHED_LOCK: SpinLock = SpinLock::new();
 static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(Scheduler::new()));
 static FS_IDENTITY_OVERRIDE: FsIdentityOverrideCell = FsIdentityOverrideCell(UnsafeCell::new(None));
+
+/// PID of the ring-3 process currently executing; 0 when no ring-3 process is running.
+/// Written/cleared by the scheduler, read from the timer ISR without holding the scheduler lock.
+// SAFETY: single-core kernel; written only from scheduler context, read-only from ISR.
+pub static RING3_ACTIVE_PID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 pub struct ProcInitReport {
@@ -1997,7 +2005,10 @@ impl Scheduler {
                 task.state = Ring3TaskState::Running;
                 self.ring3_context.active = true;
                 self.ring3_context.process = task.process;
-                self.ring3_context.process.launch_context()
+                let launch = self.ring3_context.process.launch_context();
+                // Publish the active PID so the timer ISR can preempt without holding the lock.
+                RING3_ACTIVE_PID.store(launch.pid, Ordering::Release);
+                launch
             };
             self.ring3_active_slot = Some(index);
             self.ring3_active_sleep_until = 0;
@@ -2051,7 +2062,18 @@ impl Scheduler {
         self.complete_ring3_resume();
     }
 
+    fn on_ring3_preempted(&mut self, ip: u64, sp: u64) {
+        if self.ring3_context.active {
+            // Save the preempted instruction pointer and stack so we can resume later.
+            self.ring3_context.process.trap_frame = Ring3TrapFrame::new(ip, sp);
+            // State stays Running so complete_ring3_resume maps it to Ready.
+        }
+        self.complete_ring3_resume();
+    }
+
     fn complete_ring3_resume(&mut self) {
+        // Clear the active PID before any state transition so the timer ISR sees 0.
+        RING3_ACTIVE_PID.store(0, Ordering::Release);
         self.restore_ring3_address_space_if_needed();
         if let Some(index) = self.ring3_active_slot {
             let mut reap_now = false;
@@ -4912,6 +4934,18 @@ pub fn on_ring3_kernel_resume() {
 
 pub fn on_ring3_kernel_resume_with_trap(ip: u64, sp: u64, ret0: u64) {
     with_scheduler(|scheduler| scheduler.on_ring3_trap_resume(ip, sp, ret0));
+}
+
+/// Called by the timer ISR when the ring-3 quantum expires.
+/// Saves the preempted instruction pointer/stack and marks the process as ready.
+pub fn on_ring3_preempted(ip: u64, sp: u64) {
+    with_scheduler(|scheduler| scheduler.on_ring3_preempted(ip, sp));
+}
+
+/// Returns the PID of the ring-3 process currently scheduled on the CPU, or 0.
+/// Safe to call from interrupt context without holding the scheduler lock.
+pub fn ring3_active_pid() -> u32 {
+    RING3_ACTIVE_PID.load(Ordering::Acquire)
 }
 
 pub fn mark_active_ring3_fault() {

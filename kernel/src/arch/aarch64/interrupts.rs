@@ -4,6 +4,7 @@ use crate::{serial, time};
 use arrostd::syscall::errno;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, without_provenance_mut, write_volatile};
+use core::sync::atomic::Ordering;
 
 const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
@@ -51,7 +52,7 @@ __arrost_aarch64_vectors:
 
     // Lower EL using AArch64
     arrost_vector __arrost_sync_lower_aarch64
-    arrost_vector __arrost_irq_common
+    arrost_vector __arrost_irq_from_el0
     arrost_vector __arrost_sync_unhandled
     arrost_vector __arrost_sync_unhandled
 
@@ -174,11 +175,116 @@ __arrost_irq_common:
     ldp x0, x1, [sp, #0]
     add sp, sp, #64
     eret
+
+// Full-save EL0 IRQ handler for timer-driven hard preemption (M14).
+// Saves ALL 31 GPRs plus SP_EL0, ELR_EL1, SPSR_EL1 (272 bytes total, 16-byte aligned),
+// calls the Rust dispatch function, then restores everything and erets.
+// If the Rust function decides to preempt, it jumps directly to the kernel scheduler
+// and this epilogue is skipped.
+__arrost_irq_from_el0:
+    sub sp, sp, #272
+    stp x0,  x1,  [sp, #0]
+    stp x2,  x3,  [sp, #16]
+    stp x4,  x5,  [sp, #32]
+    stp x6,  x7,  [sp, #48]
+    stp x8,  x9,  [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30,      [sp, #240]
+    mrs x0, sp_el0
+    mrs x1, elr_el1
+    mrs x2, spsr_el1
+    stp x0, x1,   [sp, #248]
+    str x2,       [sp, #264]
+    mov x0, sp
+    bl __arrost_aarch64_irq_el0_dispatch
+    // Non-preempting path: restore system registers from (potentially unmodified) frame.
+    ldr x2,       [sp, #264]
+    ldp x0, x1,   [sp, #248]
+    msr spsr_el1, x2
+    msr elr_el1,  x1
+    msr sp_el0,   x0
+    // Restore GPRs.
+    ldr x30,      [sp, #240]
+    ldp x28, x29, [sp, #224]
+    ldp x26, x27, [sp, #208]
+    ldp x24, x25, [sp, #192]
+    ldp x22, x23, [sp, #176]
+    ldp x20, x21, [sp, #160]
+    ldp x18, x19, [sp, #144]
+    ldp x16, x17, [sp, #128]
+    ldp x14, x15, [sp, #112]
+    ldp x12, x13, [sp, #96]
+    ldp x10, x11, [sp, #80]
+    ldp x8,  x9,  [sp, #64]
+    ldp x6,  x7,  [sp, #48]
+    ldp x4,  x5,  [sp, #32]
+    ldp x2,  x3,  [sp, #16]
+    ldp x0,  x1,  [sp, #0]
+    add sp, sp, #272
+    eret
 "#
 );
 
 unsafe extern "C" {
     static __arrost_aarch64_vectors: u8;
+}
+
+/// Rust dispatch for the EL0 IRQ handler (`__arrost_irq_from_el0`).
+///
+/// Called with a pointer to the 272-byte `El0PreemptFrame` allocated on the kernel stack.
+/// Handles GIC acknowledgement, timer rearm, clock ticking, and quantum-based preemption.
+/// Returns normally on the non-preempting path; jumps to the kernel scheduler if preempting.
+#[unsafe(no_mangle)]
+extern "C" fn __arrost_aarch64_irq_el0_dispatch(frame_ptr: *mut syscall::El0PreemptFrame) {
+    // Read GIC CPU interface IAR to identify and acknowledge the interrupt.
+    // SAFETY: MMIO read of GICC_IAR on QEMU virt GIC.
+    let iar: u32 = unsafe { mmio_read_u32(GICC_BASE + GICC_IAR) };
+    let irq_id = iar & 0x3ff;
+
+    if irq_id == TIMER_IRQ_ID_VIRTUAL {
+        // Rearm the virtual timer for the next period.
+        let counts_per_tick = aarch64::AARCH64_TIMER_COUNTS_PER_TICK.load(Ordering::Relaxed);
+        if counts_per_tick != 0 {
+            // SAFETY: writing architectural timer TVAL register in EL1.
+            unsafe {
+                core::arch::asm!(
+                    "msr cntv_tval_el0, {0}",
+                    in(reg) counts_per_tick,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+        // EOI: signal to GIC that the IRQ has been handled.
+        // SAFETY: MMIO write of GICC_EOIR on QEMU virt GIC.
+        unsafe { mmio_write_u32(GICC_BASE + GICC_EOIR, iar) };
+
+        // Increment the pending tick counter so the kernel clock is updated when
+        // the scheduler loop runs next (poll_timer_ticks drains this).
+        aarch64::AARCH64_IRQ_TICKS_PENDING.fetch_add(1, Ordering::AcqRel);
+
+        // Check preemption quantum; preempt if expired.
+        let Some(frame) = (unsafe { frame_ptr.as_mut() }) else {
+            return;
+        };
+        // on_el0_timer_for_preempt never returns if it decides to preempt.
+        syscall::on_el0_timer_for_preempt(frame);
+    } else if irq_id < SPURIOUS_IRQ_ID_MIN {
+        // Unknown non-spurious IRQ: EOI and record.
+        // SAFETY: MMIO write of GICC_EOIR on QEMU virt GIC.
+        unsafe { mmio_write_u32(GICC_BASE + GICC_EOIR, iar) };
+        aarch64::AARCH64_IRQ_UNHANDLED_COUNT.fetch_add(1, Ordering::AcqRel);
+        aarch64::AARCH64_IRQ_UNHANDLED_LAST.store(u64::from(irq_id), Ordering::Release);
+    }
+    // Spurious IRQ (id >= 1020): no EOI needed, just return.
 }
 
 #[unsafe(no_mangle)]

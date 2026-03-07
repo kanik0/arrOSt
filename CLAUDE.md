@@ -243,9 +243,8 @@ Three scheduler tables coexist:
 **Goal**: Implement `fork()` with CoW page sharing, demand-paged user mappings, and optionally a basic swap backend to virtio-blk.
 
 ### M14: Timer-Driven Hard Preemption
-**Status**: Planned
-**Limitation**: "Preemption occurs at syscall/trap boundaries, not arbitrary instruction boundaries."
-**Goal**: Implement true timer-interrupt-driven preemption that can interrupt user-mode code at any instruction boundary.
+**Status**: Implemented
+**Summary**: PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) now preempt ring-3 processes at any instruction boundary. Naked ISR (x86_64) / full-save EL0 IRQ vector (aarch64) capture all GPRs; saved to static frame; restored on rescheduling. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`).
 
 ### M15: Extended Syscall Surface
 **Status**: Planned
