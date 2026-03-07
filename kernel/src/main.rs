@@ -192,6 +192,10 @@ fn build_x86_kernel_boot_handoff(boot_info: &BootInfo) -> KernelBootHandoffRepor
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::FixedAddress(0xffff_8000_0000_0000));
+    // M15 grew Ring3ProcessContext by ~168 bytes (cwd: [u8; 160] + cwd_len), which pushed
+    // the debug-mode dispatch_ring3_syscall_with_action frame over the 80 KiB bootloader
+    // default, causing a double-fault.  Match the aarch64 boot stack headroom.
+    config.kernel_stack_size = 512 * 1024;
     config
 };
 
