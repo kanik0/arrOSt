@@ -2658,17 +2658,35 @@ pub fn ping_to_serial(ip_text: &str) {
         serial::write_line("ping: invalid ip (usage: ping <a.b.c.d>)");
         return;
     };
+    serial::write_fmt(format_args!(
+        "PING {}.{}.{}.{}: 56 data bytes\n",
+        target[0], target[1], target[2], target[3]
+    ));
     match with_net_mut(|state| state.send_ping(target)) {
-        Ok(rtt_ticks) => serial::write_fmt(format_args!(
-            "ping: reply from {}.{}.{}.{} time={} ticks ({} ms)\n",
-            target[0],
-            target[1],
-            target[2],
-            target[3],
-            rtt_ticks,
-            rtt_ticks.saturating_mul(10)
-        )),
-        Err(err) => serial::write_fmt(format_args!("ping: failed ({})\n", err.as_str())),
+        Ok(rtt_ticks) => {
+            let ms = rtt_ticks.saturating_mul(10);
+            serial::write_fmt(format_args!(
+                "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\n",
+                target[0],
+                target[1],
+                target[2],
+                target[3],
+                ms,
+                target[0],
+                target[1],
+                target[2],
+                target[3]
+            ));
+        }
+        Err(NetError::ArpTimeout) | Err(NetError::IoTimeout) => {
+            serial::write_fmt(format_args!(
+                "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss\n",
+                target[0], target[1], target[2], target[3]
+            ));
+        }
+        Err(err) => {
+            serial::write_fmt(format_args!("ping: error: {}\n", err.as_str()));
+        }
     }
 }
 

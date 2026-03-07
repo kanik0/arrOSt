@@ -18,7 +18,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external runtime helpers.
 - Ring-3 ELF isolation with per-process page-table ownership, dedicated user virtual mappings, and kernel-resume fault containment.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
-- Syscall ABI revision `4`, including filesystem syscalls and per-process fd tables.
+- Syscall ABI revision `5`, including filesystem syscalls, per-process fd tables, and BSD TCP socket syscalls.
 - Cross-target build orchestration and smoke automation through `cargo xtask`.
 - DoomGeneric integration with runtime controls, viewport rendering, and virtio-audio preference when available.
 
@@ -81,13 +81,13 @@ Representative commands:
 - `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
 - User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
-- ABI revision is `4`.
+- ABI revision is `5`.
 
 Current syscall surface includes:
 
 - lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`
 - capabilities: `cap_get`, `cap_drop`
-- networking: `socket`, `sendto`, `recvfrom`
+- networking: `socket`, `sendto`, `recvfrom`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`
 - filesystem: `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, `dup2`
 
 Useful runtime commands:
@@ -109,7 +109,8 @@ Useful runtime commands:
 - Desktop compositor with taskbar and `Apps` launcher.
 - Multi-window GUI terminal sessions with independent state.
 - File manager backed by the current VFS API.
-- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, and basic `curl` support for UDP and HTTP requests.
+- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, minimal TCP state machine with BSD socket syscalls, and `curl` support for UDP and HTTP.
+- Unix network utilities available as `/bin/*` executables and shell commands: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`.
 - DoomGeneric runtime with dedicated window, keyboard capture, configurable viewport filter, and audio status/control commands.
 
 ## Known limitations
@@ -270,6 +271,8 @@ Representative smoke commands:
 - `cargo xtask smoke-ring3-run --arch x86_64`
 - `cargo xtask smoke-ring3-run --arch aarch64`
 - `cargo xtask smoke-ring3-fault --arch aarch64`
+- `cargo xtask smoke-net --arch x86_64`
+- `cargo xtask smoke-net --arch aarch64`
 
 ## Documentation index
 

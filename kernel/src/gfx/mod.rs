@@ -3443,21 +3443,33 @@ impl GfxState {
                     return true;
                 };
                 let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "PING {}.{}.{}.{}: 56 data bytes",
+                    target[0], target[1], target[2], target[3]
+                );
+                self.push_terminal_text(index, &line);
+                line.clear();
                 match net::ping(target) {
                     Ok(rtt_ticks) => {
+                        let ms = rtt_ticks.saturating_mul(10);
                         let _ = writeln!(
                             line,
-                            "ping: reply from {}.{}.{}.{} time={} ticks ({} ms)",
-                            target[0],
-                            target[1],
-                            target[2],
-                            target[3],
-                            rtt_ticks,
-                            rtt_ticks.saturating_mul(10)
+                            "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms",
+                            target[0], target[1], target[2], target[3], ms
+                        );
+                        let _ = writeln!(
+                            line,
+                            "\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss",
+                            target[0], target[1], target[2], target[3]
                         );
                     }
-                    Err(err) => {
-                        let _ = writeln!(line, "ping: failed ({})", err.as_str());
+                    Err(_) => {
+                        let _ = writeln!(
+                            line,
+                            "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss",
+                            target[0], target[1], target[2], target[3]
+                        );
                     }
                 }
                 self.push_terminal_text(index, &line);
@@ -3523,11 +3535,8 @@ impl GfxState {
             return true;
         }
 
-        // ping <ip> / /bin/ping <ip>
-        if let Some(ip) = command
-            .strip_prefix("ping ")
-            .or_else(|| command.strip_prefix("/bin/ping "))
-        {
+        // /bin/ping <ip>
+        if let Some(ip) = command.strip_prefix("/bin/ping ") {
             let ip = ip.trim();
             if ip.is_empty() {
                 self.push_terminal_text(index, "usage: ping <a.b.c.d>\n");
@@ -3537,16 +3546,33 @@ impl GfxState {
                     return true;
                 };
                 let mut line = String::new();
+                let _ = writeln!(
+                    line,
+                    "PING {}.{}.{}.{}: 56 data bytes",
+                    target[0], target[1], target[2], target[3]
+                );
+                self.push_terminal_text(index, &line);
+                line.clear();
                 match net::ping(target) {
                     Ok(rtt_ticks) => {
+                        let ms = rtt_ticks.saturating_mul(10);
                         let _ = writeln!(
                             line,
-                            "ping: {}.{}.{}.{} rtt={} ticks",
-                            target[0], target[1], target[2], target[3], rtt_ticks
+                            "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms",
+                            target[0], target[1], target[2], target[3], ms
+                        );
+                        let _ = writeln!(
+                            line,
+                            "\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss",
+                            target[0], target[1], target[2], target[3]
                         );
                     }
-                    Err(err) => {
-                        let _ = writeln!(line, "ping: failed ({})", err.as_str());
+                    Err(_) => {
+                        let _ = writeln!(
+                            line,
+                            "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss",
+                            target[0], target[1], target[2], target[3]
+                        );
                     }
                 }
                 self.push_terminal_text(index, &line);

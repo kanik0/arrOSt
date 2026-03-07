@@ -163,10 +163,10 @@ Three scheduler tables coexist:
 2. **Ring-3 ELF processes** - Per-process page tables, dedicated user virtual range (`0x0000_2000_...`). Round-robin scheduling. State: `ready/running/sleep/exited/faulted`.
 3. **External process table** - Compositor-launched entries (GUI terminals, Doom sessions, `/bin/*` helpers).
 
-### Syscall ABI (revision 4)
+### Syscall ABI (revision 5)
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
-- Numbers: write(1) read(2) exit(3) yield(4) sleep(5) socket(6) sendto(7) recvfrom(8) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14) open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22)
+- Numbers: write(1) read(2) exit(3) yield(4) sleep(5) socket(6) sendto(7) recvfrom(8) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14) open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22) bind(47) listen(48) accept(49) connect(50) send(51) recv(52)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -268,9 +268,10 @@ Three scheduler tables coexist:
 **Goal**: Add a device abstraction layer and at least one non-virtio backend per class (storage, net, graphics).
 
 ### M19: Production TCP/IP Stack + Unix Network Utilities
-**Status**: Planned
+**Status**: In Progress
 **Limitation**: "Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack."
-**Goal**: Full TCP/IP stack (TCP state machine, congestion control, socket API) plus classic Unix network utilities (`ip`, `ping`, `traceroute`, `netstat`, `ss`, `nc`, `ifconfig`, `route`, `arp`, `host`, `dig`) as `/bin/*` executables with standard Unix syntax and behavior.
+**Delivered**: TCP state machine (SYN_SENT → ESTABLISHED → FIN_WAIT_1/CLOSE_WAIT), BSD socket syscalls (socket/bind/listen/accept/connect/send/recv), ABI revision 5, kernel-side Unix network utilities as shell commands and `/bin/*` entries (netstat, ifconfig, route, arp, ss, nc, ip, ping).
+**Remaining**: User-space ring-3 ELF binaries for each utility; congestion control; full TIME_WAIT/CLOSING states; traceroute, host, dig utilities.
 
 ---
 
