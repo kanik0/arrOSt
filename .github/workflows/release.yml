@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 ovmf \
+            qemu-system-arm qemu-efi-aarch64 \
+            lsof clang jq
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none,aarch64-unknown-none,aarch64-unknown-uefi
+
+      - name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-
+
+      - name: Vendor DoomGeneric sources
+        run: bash scripts/vendor_doomgeneric.sh
+
+      - name: Build all images
+        run: cargo xtask build
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          # Extract version from the root workspace Cargo.toml.
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "arrost") | .version')
+
+          # Use major.minor as the version base (e.g. "0.1.0" -> "0.1").
+          BASE=$(echo "$CARGO_VERSION" | cut -d. -f1-2)
+
+          # Count existing releases whose tag starts with "v{BASE}." to get
+          # the next incremental build number for this version line.
+          COUNT=$(gh release list --json tagName --limit 1000 \
+            --jq "[.[] | select(.tagName | startswith(\"v${BASE}.\"))] | length")
+          BUILD=$(( COUNT + 1 ))
+
+          TAG="v${BASE}.${BUILD}"
+          TITLE="ArrOSt ${BASE}.${BUILD}"
+          COMMIT=$(git rev-parse --short HEAD)
+
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "title=${TITLE}"   >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}"     >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write release notes
+        run: |
+          cat > /tmp/release-notes.md <<EOF
+          Automated release built from \`master\` at commit \`${COMMIT}\`.
+
+          ## Artifacts
+
+          | File | Description |
+          |------|-------------|
+          | \`arrost-x86_64.bin\` | x86_64 UEFI boot disk image |
+          | \`arrost-disk.img\` | Shared virtio-blk storage image (both architectures) |
+          | \`arrost-aarch64-kernel\` | aarch64 kernel ELF |
+          | \`arrost-aarch64-uefi-loader.efi\` | aarch64 UEFI chainloader |
+
+          ## Quick start
+
+          **x86_64** (requires OVMF):
+          \`\`\`bash
+          cargo xtask run
+          \`\`\`
+
+          **aarch64** (requires AAVMF):
+          \`\`\`bash
+          cargo xtask run --arch aarch64
+          \`\`\`
+
+          See [README.md](https://github.com/${REPO}/blob/master/README.md) for full instructions.
+          EOF
+        env:
+          COMMIT: ${{ steps.tag.outputs.commit }}
+          REPO: ${{ github.repository }}
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes-file /tmp/release-notes.md \
+            "target/x86_64-unknown-none/debug/bootimage-arrost-kernel.bin#arrost-x86_64.bin" \
+            "target/x86_64-unknown-none/debug/m6-disk.img#arrost-disk.img" \
+            "target/aarch64-unknown-none/debug/arrost-kernel#arrost-aarch64-kernel" \
+            "target/aarch64-unknown-uefi/debug/arrost-aarch64-uefi-loader.efi#arrost-aarch64-uefi-loader.efi"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TITLE: ${{ steps.tag.outputs.title }}

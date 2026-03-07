@@ -1530,7 +1530,7 @@ fn smoke_proc_caps_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         wait_for_log(
             &log,
             "[init] caps smoke: PASS",
@@ -1646,7 +1646,7 @@ fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         wait_for_log(
             &log,
             "[init] spawn/wait smoke: PASS",
@@ -1941,7 +1941,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         wait_for_log(
             &log,
             "mount: / type=",
@@ -2286,7 +2286,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         }
         wait_for_log(
             &log,
-            "arrost> ",
+            "arrost /",
             Duration::from_secs(6),
             "shell prompt before doom kill",
         )?;
@@ -2455,7 +2455,7 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         let stdin = child
             .stdin
             .as_mut()
@@ -2635,7 +2635,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         let stdin = child
             .stdin
             .as_mut()
@@ -3097,7 +3097,7 @@ fn smoke_ring3_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         let stdin = child
             .stdin
             .as_mut()
@@ -3260,7 +3260,7 @@ fn smoke_ring3_run_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         let stdin = child
             .stdin
             .as_mut()
@@ -3487,7 +3487,7 @@ fn smoke_ring3_fault_impl(arch: RuntimeArch) -> Result<()> {
         )?;
         wait_for_log(
             &log,
-            "arrost> ",
+            "arrost /",
             Duration::from_secs(30),
             "shell prompt after fault fallback resume",
         )?;
@@ -3581,7 +3581,7 @@ fn smoke_doom_impl(
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost> ", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
         let startup_snapshot = snapshot_log(&log);
         let software_accel_mode = startup_snapshot.contains("Using QEMU acceleration: tcg")
             || startup_snapshot.contains("Using QEMU acceleration: none");
