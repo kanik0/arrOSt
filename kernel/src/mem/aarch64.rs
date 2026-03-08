@@ -124,6 +124,10 @@ impl fmt::Display for MemoryError {
     }
 }
 
+pub const fn heap_size_bytes() -> usize {
+    HEAP_SIZE_BYTES
+}
+
 pub fn init(boot_info: &'static BootInfo) -> Result<MemoryInitReport, MemoryError> {
     let stats = collect_stats(&boot_info.memory_regions);
     init_with_stats(stats, None)

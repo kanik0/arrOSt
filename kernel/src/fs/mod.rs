@@ -19,6 +19,8 @@ mod user_bin_embed {
     include!(concat!(env!("OUT_DIR"), "/user_vfs_bin_embed.rs"));
 }
 
+use crate::mem;
+use crate::net;
 use crate::proc::{self, FsIdentity};
 use crate::serial;
 use crate::storage;
@@ -492,43 +494,43 @@ impl FsState {
                     core::str::from_utf8(&path[..path_len]).map_err(|_| FsError::InvalidPath)?;
                 self.render_proc_fslist_text(path, current_pid)
             }
+            ProcOpenFile::Version => Ok(self.render_proc_version_text()),
+            ProcOpenFile::CpuInfo => Ok(self.render_proc_cpuinfo_text()),
+            ProcOpenFile::MemInfo => Ok(self.render_proc_meminfo_text()),
+            ProcOpenFile::NetDev => Ok(self.render_proc_net_dev_text()),
+            ProcOpenFile::NetArp => Ok(self.render_proc_net_arp_text()),
+            ProcOpenFile::NetTcp => Ok(self.render_proc_net_tcp_text()),
+            ProcOpenFile::PidStatus { pid } => self.render_proc_pid_status_text(pid),
+            ProcOpenFile::PidCmdline { pid } => self.render_proc_pid_cmdline_text(pid),
+            ProcOpenFile::PidStat { pid } => self.render_proc_pid_stat_text(pid),
             _ => Err(FsError::InvalidPath),
         }
     }
 
     fn proc_generated_stat(&self, file: ProcOpenFile) -> Result<Stat, FsError> {
-        match file {
-            ProcOpenFile::Ps => {
-                let len = self.render_proc_ps_text()?.len();
-                Ok(Stat {
-                    ino: 6,
-                    file_type: FileType::Regular,
-                    mode: 0o444,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    size: len as u32,
-                    created: 0,
-                    modified: 0,
-                    accessed: 0,
-                })
-            }
-            ProcOpenFile::FsList { .. } => {
-                let len = self.proc_generated_text(file)?.len();
-                Ok(Stat {
-                    ino: 7,
-                    file_type: FileType::Regular,
-                    mode: 0o444,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    size: len as u32,
-                    created: 0,
-                    modified: 0,
-                    accessed: 0,
-                })
-            }
-            _ => self.procfs.stat_file(file, self.root_backend_name()),
+        let is_generated = matches!(
+            file,
+            ProcOpenFile::Ps
+                | ProcOpenFile::FsList { .. }
+                | ProcOpenFile::Version
+                | ProcOpenFile::CpuInfo
+                | ProcOpenFile::MemInfo
+                | ProcOpenFile::NetDev
+                | ProcOpenFile::NetArp
+                | ProcOpenFile::NetTcp
+                | ProcOpenFile::PidStatus { .. }
+                | ProcOpenFile::PidCmdline { .. }
+                | ProcOpenFile::PidStat { .. }
+        );
+        if is_generated {
+            let len = self.proc_generated_text(file)?.len();
+            let base = self.procfs.stat_file(file, self.root_backend_name())?;
+            Ok(Stat {
+                size: len as u32,
+                ..base
+            })
+        } else {
+            self.procfs.stat_file(file, self.root_backend_name())
         }
     }
 
@@ -538,23 +540,35 @@ impl FsState {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize, FsError> {
-        match file {
-            ProcOpenFile::Ps | ProcOpenFile::FsList { .. } => {
-                let text = self.proc_generated_text(file)?;
-                let bytes = text.as_bytes();
-                let Ok(offset) = usize::try_from(offset) else {
-                    return Ok(0);
-                };
-                if offset >= bytes.len() {
-                    return Ok(0);
-                }
-                let to_copy = out.len().min(bytes.len() - offset);
-                out[..to_copy].copy_from_slice(&bytes[offset..offset + to_copy]);
-                Ok(to_copy)
+        let is_generated = matches!(
+            file,
+            ProcOpenFile::Ps
+                | ProcOpenFile::FsList { .. }
+                | ProcOpenFile::Version
+                | ProcOpenFile::CpuInfo
+                | ProcOpenFile::MemInfo
+                | ProcOpenFile::NetDev
+                | ProcOpenFile::NetArp
+                | ProcOpenFile::NetTcp
+                | ProcOpenFile::PidStatus { .. }
+                | ProcOpenFile::PidCmdline { .. }
+                | ProcOpenFile::PidStat { .. }
+        );
+        if is_generated {
+            let text = self.proc_generated_text(file)?;
+            let bytes = text.as_bytes();
+            let Ok(offset) = usize::try_from(offset) else {
+                return Ok(0);
+            };
+            if offset >= bytes.len() {
+                return Ok(0);
             }
-            _ => self
-                .procfs
-                .read_open_file(file, self.root_backend_name(), offset, out),
+            let to_copy = out.len().min(bytes.len() - offset);
+            out[..to_copy].copy_from_slice(&bytes[offset..offset + to_copy]);
+            Ok(to_copy)
+        } else {
+            self.procfs
+                .read_open_file(file, self.root_backend_name(), offset, out)
         }
     }
 
@@ -643,6 +657,172 @@ impl FsState {
                 let _ = writeln!(text, "{}", full_path);
             }
         }
+        Ok(text)
+    }
+
+    fn render_proc_version_text(&self) -> String {
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "ArrOSt kernel {} {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            core::option_env!("ARROST_BUILD_DATE").unwrap_or("unknown"),
+            if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else {
+                "aarch64"
+            }
+        );
+        text
+    }
+
+    fn render_proc_cpuinfo_text(&self) -> String {
+        let mut text = String::new();
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        let _ = writeln!(text, "Architecture:\t{arch}");
+        let _ = writeln!(text, "CPU(s):\t\t1");
+        let _ = writeln!(text, "Model name:\tQEMU Virtual CPU");
+        let _ = writeln!(text, "Hypervisor:\tQEMU/KVM");
+        text
+    }
+
+    fn render_proc_meminfo_text(&self) -> String {
+        let heap_kib = mem::heap_size_bytes() / 1024;
+        let mut text = String::new();
+        let _ = writeln!(text, "MemTotal:\t{heap_kib} kB");
+        let _ = writeln!(text, "MemFree:\tunknown");
+        text
+    }
+
+    fn render_proc_net_dev_text(&self) -> String {
+        let status = net::status();
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "Inter-|   Receive                                                |  Transmit"
+        );
+        let _ = writeln!(
+            text,
+            " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+        );
+        if status.ready {
+            let _ = writeln!(
+                text,
+                "  eth0: 0 {} 0 {} 0 0 0 0 0 {} 0 0 0 0 0 0",
+                status.stats.rx_frames, status.stats.dropped, status.stats.tx_frames,
+            );
+        }
+        let _ = writeln!(text, "    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+        text
+    }
+
+    fn render_proc_net_arp_text(&self) -> String {
+        let (entries, count) = net::arp_snapshot();
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "IP address       HW type     Flags       HW address            Mask     Device"
+        );
+        for entry in entries.iter().take(count) {
+            let _ = writeln!(
+                text,
+                "{}.{}.{}.{}    0x1         0x2         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}   *        eth0",
+                entry.ip[0],
+                entry.ip[1],
+                entry.ip[2],
+                entry.ip[3],
+                entry.mac[0],
+                entry.mac[1],
+                entry.mac[2],
+                entry.mac[3],
+                entry.mac[4],
+                entry.mac[5],
+            );
+        }
+        text
+    }
+
+    fn render_proc_net_tcp_text(&self) -> String {
+        let (conns, count) = net::tcp_conns_snapshot();
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        );
+        for conn in conns.iter().take(count) {
+            let _ = writeln!(
+                text,
+                "   {}:  0000000000000000:0000 {:02X}{:02X}{:02X}{:02X}:{:04X} {} 00000000:00000000 00 00000000 00000000 0 0 0",
+                conn.idx,
+                conn.remote_ip[3],
+                conn.remote_ip[2],
+                conn.remote_ip[1],
+                conn.remote_ip[0],
+                conn.remote_port,
+                conn.state,
+            );
+        }
+        text
+    }
+
+    fn render_proc_pid_status_text(&self, pid: u32) -> Result<String, FsError> {
+        let mut snaps = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+        let count = proc::snapshot_processes(&mut snaps);
+        let snap = snaps
+            .iter()
+            .take(count)
+            .find(|s| s.pid == pid)
+            .ok_or(FsError::NotFound)?;
+        let mut text = String::new();
+        let _ = writeln!(text, "Name:\t{}", snap.name);
+        let _ = writeln!(text, "State:\t{}", snap.state.as_str());
+        let _ = writeln!(text, "Pid:\t{}", snap.pid);
+        let _ = writeln!(text, "PPid:\t{}", snap.parent_pid);
+        let _ = writeln!(text, "Uid:\t0\t0\t0\t0");
+        let _ = writeln!(text, "Gid:\t0\t0\t0\t0");
+        let _ = writeln!(text, "Domain:\t{}", snap.domain.as_str());
+        Ok(text)
+    }
+
+    fn render_proc_pid_cmdline_text(&self, pid: u32) -> Result<String, FsError> {
+        let mut snaps = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+        let count = proc::snapshot_processes(&mut snaps);
+        let snap = snaps
+            .iter()
+            .take(count)
+            .find(|s| s.pid == pid)
+            .ok_or(FsError::NotFound)?;
+        let mut text = String::new();
+        let _ = write!(text, "{}", snap.name);
+        Ok(text)
+    }
+
+    fn render_proc_pid_stat_text(&self, pid: u32) -> Result<String, FsError> {
+        let mut snaps = [proc::ProcessSnapshot::empty(); proc::MAX_PROCESS_SNAPSHOTS];
+        let count = proc::snapshot_processes(&mut snaps);
+        let snap = snaps
+            .iter()
+            .take(count)
+            .find(|s| s.pid == pid)
+            .ok_or(FsError::NotFound)?;
+        // Linux-compatible one-liner: pid (name) state ppid ...
+        let state_char = match snap.state {
+            proc::ProcessState::Ready => 'R',
+            proc::ProcessState::Running => 'R',
+            proc::ProcessState::Sleeping { .. } => 'S',
+            proc::ProcessState::Exited { .. } => 'Z',
+            proc::ProcessState::Faulted => 'D',
+        };
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "{} ({}) {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            snap.pid, snap.name, state_char, snap.parent_pid,
+        );
         Ok(text)
     }
 
@@ -767,16 +947,13 @@ impl FsState {
             ResolvedPath::Inode(node) => self.inode_stat(node),
             ResolvedPath::Proc(canonical) => {
                 let resolved = resolve_mount(&canonical);
-                match resolved.local_path() {
-                    "" | "self" => self
-                        .procfs
-                        .stat_path(resolved.local_path(), self.procfs_context(current_pid)),
-                    local_path => {
-                        let file = self
-                            .procfs
-                            .open_file(local_path, self.procfs_context(current_pid))?;
-                        self.proc_generated_stat(file)
-                    }
+                let local_path = resolved.local_path();
+                let ctx = self.procfs_context(current_pid);
+                // Attempt to open as a file; if the path is a directory, fall back to stat_path.
+                match self.procfs.open_file(local_path, ctx) {
+                    Ok(file) => self.proc_generated_stat(file),
+                    Err(FsError::IsADirectory) => self.procfs.stat_path(local_path, ctx),
+                    Err(e) => Err(e),
                 }
             }
         }

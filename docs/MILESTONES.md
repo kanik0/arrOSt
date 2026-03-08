@@ -426,78 +426,67 @@ Replace `mmap`/`munmap`/`mprotect`/`brk` stubs with a VMA manager backed by the 
 
 ## M16: Extended ProcFS
 
-**Status**: Planned
-**Limitation**: procfs exposes only a minimal synthetic set (self/pid, mounts, uptime).
+**Status**: Implemented
+**Limitation**: procfs previously exposed only a minimal synthetic set (self/pid, mounts, uptime).
 **Goal**: Expand `/proc` to a richer process and system information interface.
 
-### Dependencies
-- None; can be implemented incrementally on the current VFS.
+### Summary
 
-### Implementation Plan
+Expanded `/proc` from 5 fixed synthetic entries to a full directory tree with dynamic per-PID
+subdirectories, global system files, and a `/proc/net/` subsystem. All new files are
+heap-generated via the existing `proc_generated_text` path in `fs/mod.rs`.
 
-#### Step 1: Refactor procfs to support dynamic entries
-**Files to modify**: `kernel/src/fs/procfs.rs`
+### Files Modified
+- `kernel/src/fs/procfs.rs` — directory routing, dynamic PID enumeration, new `ProcOpenFile` variants
+- `kernel/src/fs/mod.rs` — render functions for all new file types; stat/read dispatch
+- `kernel/src/net/mod.rs` — `ArpEntryInfo` + `arp_snapshot()` public API
+- `kernel/src/mem/x86_64.rs` / `aarch64.rs` — `pub const fn heap_size_bytes()`
 
-1. Currently procfs has hardcoded entries. Refactor to a **directory-tree model**:
-   - `/proc/<pid>/` directory per process.
-   - `/proc/self` symlink to `/proc/<current_pid>`.
-   - Global entries at `/proc/` root.
-2. The procfs `readdir` for `/proc/` should enumerate:
-   - Numeric directories for each live process (`/proc/1/`, `/proc/2/`, ...).
-   - `self` symlink.
-   - Global files (`mounts`, `uptime`, `cpuinfo`, `meminfo`, `stat`, `net/`).
+### Implemented Entries
 
-#### Step 2: Per-process entries under `/proc/<pid>/`
-**Files to modify**: `kernel/src/fs/procfs.rs`
+#### Global system files
+| Path | Content |
+|------|---------|
+| `/proc/version` | Kernel version string (package version + arch) |
+| `/proc/cpuinfo` | Architecture, CPU count, model name, hypervisor |
+| `/proc/meminfo` | `MemTotal` (heap size in kB) |
+| `/proc/mounts` | Existing: diskfs/ramfs, procfs, tmpfs |
+| `/proc/uptime` | Existing: uptime in milliseconds |
+| `/proc/ps` | Existing: full process table snapshot |
 
-For each PID directory, expose:
+#### Network subsystem — `/proc/net/`
+| Path | Content |
+|------|---------|
+| `/proc/net/dev` | Interface receive/transmit frame counters (Linux `net/dev` format) |
+| `/proc/net/arp` | ARP cache entries (Linux `/proc/net/arp` format) |
+| `/proc/net/tcp` | Active TCP connections (Linux `/proc/net/tcp` format) |
+
+#### Per-process directories — `/proc/<pid>/`
+`readdir("/proc/")` now dynamically enumerates all live PIDs as subdirectories.
 
 | Path | Content |
 |------|---------|
-| `/proc/<pid>/status` | Process name, state, PID, PPID, UID, GID, capabilities, memory usage |
-| `/proc/<pid>/cmdline` | Command line (or binary path) |
-| `/proc/<pid>/maps` | Virtual memory areas (VMA start-end, permissions, backing) |
-| `/proc/<pid>/fd/` | Directory listing of open file descriptors |
-| `/proc/<pid>/fd/<n>` | Symlink to the opened file path |
-| `/proc/<pid>/stat` | One-line stat: pid, name, state, ppid, utime, stime, priority, threads |
-| `/proc/<pid>/cwd` | Symlink to current working directory |
-| `/proc/<pid>/exe` | Symlink to executable path |
-| `/proc/<pid>/environ` | Environment variables (if implemented) |
+| `/proc/<pid>/status` | Name, State, Pid, PPid, Uid, Gid, Domain |
+| `/proc/<pid>/cmdline` | Process binary name |
+| `/proc/<pid>/stat` | Linux-compatible one-line stat (pid, name, state, ppid) |
 
-Implementation per entry:
-1. On `open("/proc/<pid>/status")`, generate the content string dynamically by querying the process table.
-2. Return the generated string as a synthetic file (read-only, non-seekable or seekable from 0).
-3. On `readdir("/proc/<pid>/fd/")`, enumerate open fd numbers from the process fd table.
+### Remaining (future milestones)
+- `/proc/<pid>/maps` — VMA list (requires M13 mmap layer)
+- `/proc/<pid>/fd/` — open file descriptor directory (requires fd snapshot API)
+- `/proc/diskstats` — block device I/O stats
+- `/proc/interrupts` — per-IRQ counters
+- `/proc/net/route` — routing table
+- `/proc/loadavg` — simulated load average
 
-#### Step 3: Global system entries
-**Files to modify**: `kernel/src/fs/procfs.rs`
-
-| Path | Content |
-|------|---------|
-| `/proc/cpuinfo` | Architecture, model, features |
-| `/proc/meminfo` | Total memory, free memory, heap usage, page stats |
-| `/proc/stat` | System-wide CPU time, process counts, boot time |
-| `/proc/version` | Kernel version string |
-| `/proc/loadavg` | Simulated load average based on runnable process count |
-| `/proc/filesystems` | Registered filesystem types (diskfs-v2, ramfs, tmpfs, procfs) |
-| `/proc/net/` | Network subsystem directory |
-| `/proc/net/dev` | Network interface stats (rx/tx packets, bytes, errors) |
-| `/proc/net/arp` | ARP table |
-| `/proc/net/udp` | Open UDP sockets |
-| `/proc/net/tcp` | Open TCP connections (if TCP is available) |
-| `/proc/net/route` | Routing table |
-| `/proc/diskstats` | Block device I/O stats (reads, writes, sectors) |
-| `/proc/interrupts` | Interrupt counter per IRQ line |
-
-#### Step 4: Testing
-1. Boot and run `cat /proc/cpuinfo`, `cat /proc/meminfo`, `cat /proc/version`.
-2. Run `ls /proc/` and verify PID directories appear for running processes.
-3. Run `cat /proc/1/status` and verify content.
-4. Run `ls /proc/1/fd/` and verify open descriptors.
-5. Add a smoke test that validates key procfs entries exist and contain expected patterns.
+### Testing
+1. Boot and run `cat /proc/version`, `cat /proc/cpuinfo`, `cat /proc/meminfo`.
+2. Run `ls /proc/` — verify PID directories appear alongside static entries.
+3. Run `cat /proc/1/status` — verify per-process output.
+4. Run `ls /proc/net/` — verify `dev`, `arp`, `tcp` appear.
+5. Run `cat /proc/net/dev` — verify interface counter line.
 
 #### Documentation
-**Files to update**: `docs/FS.md`, `docs/PROC.md`, `README.md`
+**Files to update**: `docs/FS.md`, `docs/PROC.md`, `README.md`, `CLAUDE.md`
 
 ---
 

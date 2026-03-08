@@ -2916,6 +2916,36 @@ pub fn tcp_conns_snapshot() -> ([TcpConnInfo; MAX_TCP_CONNS], usize) {
     with_net(|state| state.tcp_conn_info_snapshot())
 }
 
+/// Public snapshot of one ARP cache entry for /proc/net/arp.
+#[derive(Clone, Copy)]
+pub struct ArpEntryInfo {
+    pub ip: [u8; 4],
+    pub mac: [u8; 6],
+}
+
+/// Returns all valid ARP cache entries (for /proc/net/arp).
+pub fn arp_snapshot() -> ([ArpEntryInfo; 8], usize) {
+    with_net(|state| {
+        let mut out = [ArpEntryInfo {
+            ip: [0; 4],
+            mac: [0; 6],
+        }; 8];
+        let mut count = 0usize;
+        if state.ready {
+            for entry in &state.arp {
+                if entry.valid && count < 8 {
+                    out[count] = ArpEntryInfo {
+                        ip: entry.ip,
+                        mac: entry.mac,
+                    };
+                    count += 1;
+                }
+            }
+        }
+        (out, count)
+    })
+}
+
 pub fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut idx = 0usize;
