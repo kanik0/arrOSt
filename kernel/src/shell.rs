@@ -11,7 +11,7 @@ use crate::serial;
 use crate::storage;
 use crate::time;
 use alloc::string::String;
-use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP, shell_prompt};
+use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{app, errno};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
@@ -289,6 +289,13 @@ pub fn set_ui_doom_capture(enabled: bool) -> bool {
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
     if enabled {
+        // If the shell already has buffered input a command is in progress.
+        // Skip the rearm so the remaining keystrokes go to the shell, not doom.
+        // gfx::poll() calls this every frame, so capture will be rearmed on the
+        // very next iteration once the line buffer is cleared after execution.
+        if shell.len > 0 {
+            return false;
+        }
         if doom::set_capture(true) {
             shell.doom_capture = true;
             return true;
@@ -315,6 +322,20 @@ fn process_byte(byte: u8) {
             let _ = doom::set_capture(false);
             serial::write_line("\ndoom: capture disabled");
             print_prompt();
+            return;
+        }
+        // If chars were buffered before doom capture was re-armed by a UI event,
+        // honour the pending command on \r/\n rather than passing it to doom.
+        if (byte == b'\n' || byte == b'\r') && shell.len > 0 {
+            shell.release_all_serial_capture_keys();
+            shell.doom_capture = false;
+            let _ = doom::set_capture(false);
+            serial::write_str("\n");
+            run_command(shell);
+            shell.clear();
+            if !shell.doom_capture && shell.waiting_vfs_pid.is_none() {
+                print_prompt();
+            }
             return;
         }
         shell.refresh_serial_capture_key(byte, time::ticks());
@@ -358,6 +379,8 @@ fn poll_waiting_vfs_child() -> bool {
     }
     shell.waiting_vfs_pid = None;
     if !shell.doom_capture {
+        // Binary output may not end with '\n'; always start the prompt on a fresh line.
+        serial::write_str("\n");
         print_prompt();
     }
     true
@@ -2018,5 +2041,7 @@ fn refresh_file_manager_preview_view(path: &str, bytes: &[u8]) {
 }
 
 fn print_prompt() {
-    serial::write_str(shell_prompt());
+    // SAFETY: shell state is read on the main loop thread.
+    let shell = unsafe { &*SHELL_STATE.0.get() };
+    serial::write_fmt(format_args!("user@arrost {}> ", shell.cwd()));
 }

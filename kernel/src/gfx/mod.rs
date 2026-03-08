@@ -1316,7 +1316,12 @@ impl GfxState {
     }
 
     fn push_terminal_prompt(&mut self, index: usize) {
-        self.push_terminal_text(index, "arrost$ ");
+        let cwd = self
+            .terminal_cwd(index)
+            .map(String::from)
+            .unwrap_or_else(|| String::from("/"));
+        let prompt = alloc::format!("user@arrost {}> ", cwd);
+        self.push_terminal_text(index, &prompt);
     }
 
     fn launch_terminal(&mut self) -> bool {

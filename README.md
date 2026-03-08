@@ -18,7 +18,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external runtime helpers.
 - Ring-3 ELF isolation with per-process page-table ownership, dedicated user virtual mappings, and kernel-resume fault containment.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
-- Syscall ABI revision `5`, including filesystem syscalls, per-process fd tables, and BSD TCP socket syscalls.
+- Syscall ABI revision `5`, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, and memory/signal stubs.
 - Cross-target build orchestration and smoke automation through `cargo xtask`.
 - DoomGeneric integration with runtime controls, viewport rendering, and virtio-audio preference when available.
 
@@ -81,7 +81,7 @@ Representative commands:
 - `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
 - User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
-- ABI revision is `5`.
+- ABI revision is `5`. Shell prompt is context-aware: `user@arrost /path> ` in both serial and GUI terminals.
 
 Current syscall surface includes:
 
@@ -89,6 +89,10 @@ Current syscall surface includes:
 - capabilities: `cap_get`, `cap_drop`
 - networking: `socket`, `sendto`, `recvfrom`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`
 - filesystem: `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, `dup2`
+- directory/path: `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `getcwd`, `chdir`, `getdents`
+- process identity: `getppid`, `getuid`, `getgid`, `kill`
+- ipc: `pipe`, `pipe2`
+- stubs (return `ENOSYS`): `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, `brk`
 
 Useful runtime commands:
 
@@ -118,7 +122,7 @@ Useful runtime commands:
 - Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
-- The syscall surface is intentionally small and not POSIX-complete.
+- Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
 - `diskfs-v2` journals metadata only; file data is not journaled.
 - Storage, graphics, and device support remain QEMU/virtio-first.

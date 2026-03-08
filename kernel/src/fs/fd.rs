@@ -1,4 +1,4 @@
-use super::OpenFile;
+use super::{OpenFile, pipe};
 use arrostd::syscall::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, errno};
 
 pub const MAX_FDS: usize = 16;
@@ -30,6 +30,10 @@ pub(crate) enum FdTarget {
     File(OpenFile),
     /// TCP socket; the u8 is an index into the kernel-global TcpTable.
     TcpSocket(u8),
+    /// Read end of a kernel pipe; the u8 is the index in PIPE_TABLE.
+    PipeRead(u8),
+    /// Write end of a kernel pipe; the u8 is the index in PIPE_TABLE.
+    PipeWrite(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +139,29 @@ impl FdTable {
         Ok(fd_index as u32)
     }
 
+    /// Open both ends of a pipe.  Returns `(read_fd, write_fd)` or `TooManyFiles`.
+    pub fn open_pipe_ends(&mut self, pipe_idx: u8) -> Result<(u32, u32), FdError> {
+        use arrostd::syscall::{O_RDONLY, O_WRONLY};
+        let read_fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
+        let Some(read_desc_index) = self.alloc_description_slot() else {
+            self.fd_slots[read_fd_index] = None;
+            return Err(FdError::TooManyFiles);
+        };
+        let write_fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
+        let Some(write_desc_index) = self.alloc_description_slot() else {
+            self.fd_slots[read_fd_index] = None;
+            self.fd_slots[write_fd_index] = None;
+            self.descriptions[read_desc_index] = FdSlot::empty();
+            return Err(FdError::TooManyFiles);
+        };
+        self.descriptions[read_desc_index] = FdSlot::new(FdTarget::PipeRead(pipe_idx), O_RDONLY, 1);
+        self.fd_slots[read_fd_index] = Some(read_desc_index as u8);
+        self.descriptions[write_desc_index] =
+            FdSlot::new(FdTarget::PipeWrite(pipe_idx), O_WRONLY, 1);
+        self.fd_slots[write_fd_index] = Some(write_desc_index as u8);
+        Ok((read_fd_index as u32, write_fd_index as u32))
+    }
+
     pub fn open_file(&mut self, file: OpenFile, flags: u32) -> Result<u32, FdError> {
         let fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
         let Some(desc_index) = self.alloc_description_slot() else {
@@ -160,6 +187,12 @@ impl FdTable {
         let fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
         self.descriptions[source_index].refs =
             self.descriptions[source_index].refs.saturating_add(1);
+        // Bump pipe ref count when duping a pipe end.
+        match self.descriptions[source_index].target {
+            FdTarget::PipeRead(idx) => pipe::dup_pipe_read(idx),
+            FdTarget::PipeWrite(idx) => pipe::dup_pipe_write(idx),
+            _ => {}
+        }
         self.fd_slots[fd_index] = Some(source_index as u8);
         Ok(fd_index as u32)
     }
@@ -215,6 +248,12 @@ impl FdTable {
         if slot.refs > 1 {
             slot.refs -= 1;
             return;
+        }
+        // Last reference: run target-specific teardown before clearing.
+        match slot.target {
+            FdTarget::PipeRead(idx) => pipe::close_pipe_read(idx),
+            FdTarget::PipeWrite(idx) => pipe::close_pipe_write(idx),
+            _ => {}
         }
         *slot = FdSlot::empty();
     }
