@@ -194,8 +194,16 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config.mappings.physical_memory = Some(Mapping::FixedAddress(0xffff_8000_0000_0000));
     // M15 grew Ring3ProcessContext by ~168 bytes (cwd: [u8; 160] + cwd_len), which pushed
     // the debug-mode dispatch_ring3_syscall_with_action frame over the 80 KiB bootloader
-    // default, causing a double-fault.  Match the aarch64 boot stack headroom.
-    config.kernel_stack_size = 512 * 1024;
+    // default, causing a double-fault (observed RSP ≈ 77,736 bytes into the stack).
+    //
+    // Safety constraint: the bootloader's LegacyFrameAllocator is a simple sequential
+    // allocator starting at 0x100000.  The kernel ELF is loaded at fixed physical 0x200000.
+    // With 80 KiB stack the GDT lands at ~0x1D9000 (below kernel); with 512 KiB it lands
+    // at 0x245000 (inside the kernel ELF segment), causing PageAlreadyMapped.
+    // GDT address ≈ 0x1D9000 + (stack_size − 80 KiB); kernel starts at 0x200000, so the
+    // safe ceiling is ≈ 232 KiB total.  128 KiB gives ~53 KiB headroom over observed usage
+    // and keeps the GDT at ~0x1E5000, well below the 0x200000 kernel start.
+    config.kernel_stack_size = 128 * 1024;
     config
 };
 
