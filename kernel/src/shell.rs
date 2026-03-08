@@ -289,6 +289,13 @@ pub fn set_ui_doom_capture(enabled: bool) -> bool {
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
     if enabled {
+        // If the shell already has buffered input a command is in progress.
+        // Skip the rearm so the remaining keystrokes go to the shell, not doom.
+        // gfx::poll() calls this every frame, so capture will be rearmed on the
+        // very next iteration once the line buffer is cleared after execution.
+        if shell.len > 0 {
+            return false;
+        }
         if doom::set_capture(true) {
             shell.doom_capture = true;
             return true;
