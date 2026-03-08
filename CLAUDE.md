@@ -267,9 +267,13 @@ Three scheduler tables coexist:
 **Remaining**: Phase B signal infrastructure (delivery, frames, masking); full mmap/VMA layer.
 
 ### M16: Extended ProcFS
-**Status**: Planned
-**Limitation**: "procfs exposes only a minimal synthetic set (self/pid, mounts, uptime)."
-**Goal**: Expand `/proc` to expose per-process status, memory maps, fd lists, CPU info, system stats, and network info.
+**Status**: Implemented
+**Summary**: Expanded `/proc` from 5 fixed entries to a full tree:
+- Global: `version`, `cpuinfo`, `meminfo` (+ existing `mounts`, `uptime`, `ps`)
+- Network subsystem: `/proc/net/` directory with `dev`, `arp`, `tcp`
+- Per-process directories: `/proc/<pid>/` dynamically enumerated for all live PIDs, each with `status`, `cmdline`, `stat`
+- Added `mem::heap_size_bytes()`, `net::arp_snapshot()`, `net::ArpEntryInfo`
+**Remaining**: `/proc/<pid>/maps` (needs M13), `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`, `/proc/net/route`
 
 ### M17: Full-Data Journaling for diskfs-v2
 **Status**: Planned

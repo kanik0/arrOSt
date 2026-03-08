@@ -45,7 +45,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 
 - Root filesystem mounts `diskfs-v2` when persistent storage is ready, otherwise falls back to `ramfs`.
 - Synthetic mounts:
-  - `/proc` -> read-only `procfs`
+  - `/proc` -> read-only `procfs` (dynamic per-PID dirs, `net/`, `cpuinfo`, `meminfo`, `version`)
   - `/tmp` -> volatile `tmpfs` with world-writable root (`0777`)
 - `diskfs-v2` provides:
   - inode-based hierarchical directories
@@ -123,7 +123,7 @@ Useful runtime commands:
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
-- `procfs` exposes only a minimal synthetic set (`self/pid`, `mounts`, `uptime`).
+- `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journals metadata only; file data is not journaled.
 - Storage, graphics, and device support remain QEMU/virtio-first.
 - Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.

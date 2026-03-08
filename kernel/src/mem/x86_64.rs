@@ -122,6 +122,10 @@ impl fmt::Display for UserPageError {
     }
 }
 
+pub const fn heap_size_bytes() -> usize {
+    HEAP_SIZE_BYTES
+}
+
 pub fn init(boot_info: &'static BootInfo) -> Result<MemoryInitReport, MemoryError> {
     validate_heap_layout()?;
 
