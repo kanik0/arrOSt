@@ -1982,6 +1982,9 @@ impl GfxState {
 
                 let keep_open = self.run_terminal_command(index, command);
                 if keep_open && self.terminal_process_for_window(index).is_some() {
+                    // Command output may not end with '\n'; always start the prompt on a fresh
+                    // line, mirroring the serial shell fix in shell.rs check_vfs_child().
+                    self.push_terminal_text(index, "\n");
                     self.push_terminal_prompt(index);
                 }
             }
