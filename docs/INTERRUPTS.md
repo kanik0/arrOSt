@@ -80,17 +80,33 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 - `x86_64`: IRQ-first (`timer_interrupt_handler`) with PIT polling fallback only when IRQs are disabled.
 - `aarch64`: IRQ-preferred ticks (`gic-timer`) with counter-polling fallback if unhandled IRQs are observed; `wfi` idle is used only after live IRQ ticks are observed.
 
+## KPTI status note (M11)
+
+- Ring-3 process page tables include a dedicated trampoline virtual page (`mem::TRAMPOLINE_VADDR`) as groundwork.
+- Syscall/fault gates are not yet redirected to trampoline entry stubs, so full KPTI isolation is still pending.
+- `proc` now maintains KPTI scratch root-table state for future trampoline code, but interrupt/syscall gates still use existing non-trampoline entries.
+- Architecture-specific trampoline groundwork modules now exist and currently export gateway addresses that mirror active entries.
+- x86_64 IDT syscall gate and page-fault entry, plus aarch64 vector-base installation, now fetch addresses through the trampoline modules (same effective targets for now).
+- Ring-3 syscall entry paths now also update KPTI scratch RSP fields to feed future trampoline entry/exit save-restore logic.
+- Fault/sync dispatch policy now also routes through trampoline helpers (same effective handling paths for now).
+- x86_64 now uses concrete trampoline entry wrappers for syscall/page-fault entry while keeping existing handler behavior.
+- aarch64 lower-EL sync vector now branches to a trampoline-owned dispatch symbol before running existing sync policy logic.
+- Current trampoline wrappers now perform provisional CR3/TTBR root switches using KPTI scratch roots while reusing existing policy handlers.
+- x86_64 and aarch64 trampoline wrappers now include dedicated trampoline-side exit helpers in their transition flow.
+
 ## Relevant files
 
 - `kernel/src/arch/x86_64/interrupts.rs`
 - `kernel/src/arch/x86_64/gdt.rs`
 - `kernel/src/arch/x86_64/ring3.rs`
 - `kernel/src/arch/x86_64/syscall.rs`
+- `kernel/src/arch/x86_64/trampoline.rs`
 - `kernel/src/arch/x86_64/pic.rs`
 - `kernel/src/arch/x86_64/pit.rs`
 - `kernel/src/arch/aarch64/interrupts.rs`
 - `kernel/src/arch/aarch64/mod.rs`
 - `kernel/src/arch/aarch64/syscall.rs`
+- `kernel/src/arch/aarch64/trampoline.rs`
 - `kernel/src/arch/aarch64/port.rs`
 - `kernel/src/input.rs`
 - `kernel/src/keyboard.rs`

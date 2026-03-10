@@ -1,5 +1,5 @@
 // kernel/src/arch/aarch64/interrupts.rs: aarch64 EL1 vectors + GIC/timer + SVC groundwork.
-use crate::arch::aarch64::{self, syscall};
+use crate::arch::aarch64::{self, syscall, trampoline};
 use crate::{serial, time};
 use arrostd::syscall::errno;
 use core::arch::{asm, global_asm};
@@ -79,7 +79,7 @@ __arrost_sync_lower_aarch64:
     stp x18, x30, [sp, #144]
 
     mov x0, sp
-    bl __arrost_aarch64_sync_dispatch
+    bl __arrost_aarch64_sync_trampoline_entry
     str x0, [sp, #0]
 
     ldp x18, x30, [sp, #144]
@@ -287,8 +287,7 @@ extern "C" fn __arrost_aarch64_irq_el0_dispatch(frame_ptr: *mut syscall::El0Pree
     // Spurious IRQ (id >= 1020): no EOI needed, just return.
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame) -> u64 {
+pub(crate) fn sync_dispatch_impl(frame_ptr: *mut syscall::SyncFrame) -> u64 {
     let Some(frame) = (unsafe { frame_ptr.as_mut() }) else {
         return errno::ENOSYS as u64;
     };
@@ -302,14 +301,16 @@ extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame)
     if syscall::is_svc64(esr) {
         let svc_imm = (esr & 0xffff) as u16;
         let call = syscall::SvcCall::from_sync_frame(frame);
-        if let Some(result) = syscall::dispatch_svc(call, svc_imm, elr, sp_el0, from_el0) {
-            return result as u64;
+        if let Some(result) =
+            trampoline::dispatch_svc_transition(call, svc_imm, elr, sp_el0, from_el0)
+        {
+            return result;
         }
         syscall::log_svc_fallback_once(call.number, svc_imm, elr, sp_el0, from_el0);
         return errno::ENOSYS as u64;
     }
 
-    if from_el0 && syscall::handle_lower_sync_fault_if_smoke(esr, elr, spsr, sp_el0) {
+    if from_el0 && trampoline::handle_lower_sync_fault_transition(esr, elr, spsr, sp_el0) {
         // This branch is unreachable because active smoke faults resume directly to kernel path.
         return errno::ENOSYS as u64;
     }
@@ -325,6 +326,11 @@ extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame)
         sp_el0
     ));
     crate::arch::halt_forever();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame) -> u64 {
+    trampoline::sync_dispatch_transition(frame_ptr)
 }
 
 #[derive(Clone, Copy)]
@@ -394,8 +400,12 @@ pub fn enable_runtime_irqs() {
     }
 }
 
+pub fn vector_base_addr() -> u64 {
+    core::ptr::addr_of!(__arrost_aarch64_vectors) as u64
+}
+
 unsafe fn install_vector_base() {
-    let vectors = core::ptr::addr_of!(__arrost_aarch64_vectors) as u64;
+    let vectors = trampoline::trampoline_vector_base_addr();
     // SAFETY: vector base points to 2KiB-aligned static table for EL1.
     unsafe {
         asm!("msr vbar_el1, {0}", in(reg) vectors, options(nostack, preserves_flags));

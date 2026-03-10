@@ -66,7 +66,7 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 
 ## Current limits
 
-- Kernel mappings are still present in each ring-3 page table, but remain supervisor-only.
+- Ring-3 address-space roots now preserve only upper-half root-table entries and map a fixed trampoline user page as KPTI groundwork, but full trampoline gate wiring and CR3/TTBR switching are not implemented yet.
 - There is no `execve` syscall yet; `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` still uses embedded smoke/debug artifacts.
 - Preemption is not yet hard timer-driven at arbitrary instruction boundaries.
 - Syscall surface remains intentionally small.

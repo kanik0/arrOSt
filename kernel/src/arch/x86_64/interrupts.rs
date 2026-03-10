@@ -1,5 +1,5 @@
 // kernel/src/arch/x86_64/interrupts.rs: IDT and interrupt handlers for M3.
-use crate::arch::x86_64::{gdt, pic, pit, port, ring3, syscall};
+use crate::arch::x86_64::{gdt, pic, pit, port, ring3, trampoline};
 use crate::{input, keyboard, mouse, serial, time};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
@@ -83,10 +83,13 @@ pub fn init() -> InterruptInitReport {
             idt.alignment_check.set_handler_fn(alignment_check_handler);
             idt.simd_floating_point
                 .set_handler_fn(simd_floating_point_handler);
-            idt.page_fault.set_handler_fn(page_fault_handler);
+            // SAFETY: trampoline hook currently resolves to the existing x86-interrupt
+            // page-fault entrypoint; wiring via trampoline keeps call sites stable for M11.
+            idt.page_fault
+                .set_handler_addr(VirtAddr::new(trampoline::trampoline_page_fault_entry_addr()));
             // SAFETY: entry address points to a dedicated naked int80 handler with iretq return.
             idt[SYSCALL_VECTOR]
-                .set_handler_addr(VirtAddr::new(syscall::int80_entry_addr()))
+                .set_handler_addr(VirtAddr::new(trampoline::trampoline_syscall_entry_addr()))
                 .set_privilege_level(PrivilegeLevel::Ring3);
             // SAFETY: timer_isr_entry_addr points to the naked timer ISR (ring3.rs) which
             // saves all GPRs before calling Rust, ACKs the PIC, ticks the clock, handles
@@ -151,6 +154,10 @@ pub fn init() -> InterruptInitReport {
     }
 }
 
+pub fn page_fault_entry_addr() -> u64 {
+    page_fault_handler as usize as u64
+}
+
 pub fn ring3_gate_info() -> Option<(u16, u16, u8)> {
     let user_cs = USER_CODE_SELECTOR.load(Ordering::Acquire);
     let user_ds = USER_DATA_SELECTOR.load(Ordering::Acquire);
@@ -194,8 +201,8 @@ extern "x86-interrupt" fn double_fault_handler(
     }
 }
 
-extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+pub(crate) fn page_fault_dispatch(
+    stack_frame: &InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     let fault_addr = match Cr2::read() {
@@ -204,7 +211,7 @@ extern "x86-interrupt" fn page_fault_handler(
     };
     let from_ring3 = error_code.contains(PageFaultErrorCode::USER_MODE)
         || (stack_frame.code_segment.0 & 0x3) == 0x3;
-    if ring3::handle_page_fault(
+    if trampoline::handle_page_fault_transition(
         fault_addr,
         stack_frame.instruction_pointer.as_u64(),
         stack_frame.stack_pointer.as_u64(),
@@ -221,6 +228,13 @@ extern "x86-interrupt" fn page_fault_handler(
     ));
     serial::write_fmt(format_args!("{stack_frame:#?}\n"));
     crate::arch::halt_forever();
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    page_fault_dispatch(&stack_frame, error_code)
 }
 
 extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, error_code: u64) {
