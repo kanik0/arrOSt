@@ -4338,6 +4338,7 @@ fn wait_for_status_with_frame_progress(
     loop {
         let snapshot = snapshot_log(log);
         if let Some(line) = last_matching_line(&snapshot, "doom: app=doom engine=")
+            && line.contains("last_key=")
             && let Some(frames) = parse_metric_value(line, "dg_frames=")
             && frames > min_frames
         {
