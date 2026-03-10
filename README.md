@@ -52,6 +52,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
   - automatic migration from `diskfs-v1`
   - fixed inode table plus block bitmap allocator
   - redo-only metadata journal with replay on mount
+  - journal modes: `MetadataOnly`, `Ordered` (default), and `Full` data journaling
 - Path resolution is mount-aware and supports `.` / `..`, hard links, symlinks, and `ELOOP` after 8 symlink hops.
 - File metadata tracks `uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, and `ctime`.
 - Permission enforcement is active in the VFS.
@@ -66,7 +67,7 @@ Representative commands:
 - `mkdir <dir>`, `mv <src> <dst>`
 - `link <src> <dst>`, `symlink <target> <linkpath>`
 - `stat <path>`, `chmod <mode> <path>`
-- `sync`, `reload`
+- `sync`, `reload`, `journal`, `journal mode <metadata|ordered|full>`
 - `cat /proc/self/pid`, `cat /proc/mounts`, `cat /proc/uptime`
 
 ### Processes and syscalls
@@ -124,7 +125,7 @@ Useful runtime commands:
 - No `fork`, copy-on-write, demand paging, or swap.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
-- `diskfs-v2` journals metadata only; file data is not journaled.
+- `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
 - Storage, graphics, and device support remain QEMU/virtio-first.
 - Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.
 

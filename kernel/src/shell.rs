@@ -1337,6 +1337,16 @@ fn run_command(shell: &mut ShellState) {
         "net" => {
             net::log_info();
         }
+        "journal" => {
+            fs::journal_status_to_serial();
+        }
+        _ if input.starts_with("journal mode ") => {
+            let Some(mode) = input.strip_prefix("journal mode ") else {
+                serial::write_line("usage: journal mode <metadata|ordered|full>");
+                return;
+            };
+            fs::set_journal_mode_to_serial(mode);
+        }
         "sync" => {
             fs::sync_to_disk_to_serial();
         }

@@ -8,7 +8,7 @@
 //   Sectors 161+:   Data region  (one sector = one block)
 
 use super::bitmap::{self, Bitmap};
-use super::journal::Journal;
+use super::journal::{Journal, JournalMode, JournalStatus};
 use super::{
     DirEntry, FileType, FsError, InodeNum, MAX_OPEN_PATH_BYTES, MAX_VNAME_LEN, ROOT_INO, Stat, Vfs,
     VfsDirEntry, VfsOps,
@@ -34,6 +34,7 @@ const BITMAP_SECTORS: u64 = bitmap::BITMAP_SECTORS as u64; // 32
 
 const JOURNAL_START: u64 = BITMAP_START + BITMAP_SECTORS; // 97
 const JOURNAL_SECTORS: u64 = 64;
+const DEFAULT_JOURNAL_MODE: JournalMode = JournalMode::Ordered;
 
 const DATA_REGION_START: u64 = JOURNAL_START + JOURNAL_SECTORS; // 161
 
@@ -143,7 +144,7 @@ impl DiskFsV2 {
             inodes: [DiskInode::empty(); INODE_COUNT as usize],
             bitmap: Bitmap::new(),
             free_inode_count: INODE_COUNT,
-            journal: Journal::new(),
+            journal: Journal::new(DEFAULT_JOURNAL_MODE),
             tx_bitmap_dirty: false,
         }
     }
@@ -192,7 +193,7 @@ impl DiskFsV2 {
         // Zero journal area.
         self.zero_sectors(JOURNAL_START, JOURNAL_SECTORS)?;
 
-        self.journal = Journal::new();
+        self.journal = Journal::new(DEFAULT_JOURNAL_MODE);
         self.tx_bitmap_dirty = false;
         self.mounted = true;
         Ok(())
@@ -210,6 +211,18 @@ impl DiskFsV2 {
             return Err(FsError::StorageUnavailable);
         }
         self.with_metadata_tx(|_| Ok(()))
+    }
+
+    pub fn journal_status(&self) -> JournalStatus {
+        self.journal.status()
+    }
+
+    pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<(), FsError> {
+        if !self.mounted {
+            return Err(FsError::StorageUnavailable);
+        }
+        self.journal.set_mode(mode)?;
+        self.sync_metadata()
     }
 
     pub fn max_files(&self) -> usize {
@@ -455,14 +468,21 @@ impl DiskFsV2 {
         self.read_sector_overlay(sector, buf)
     }
 
-    /// Write data block payload (ordered mode, outside the journal).
+    /// Write data block payload.
+    ///
+    /// In `JournalMode::Full`, data payload writes are staged inside the active
+    /// transaction so replay can recover file contents after a crash.
     fn write_block_data(
-        &self,
+        &mut self,
         blk_idx: u32,
         buf: &[u8; storage::SECTOR_SIZE],
     ) -> Result<(), FsError> {
         let sector = DATA_REGION_START + blk_idx as u64;
-        storage::write_sector(sector, buf).map_err(|_| FsError::StorageIo)
+        if self.journal.is_active() && self.journal.mode() == JournalMode::Full {
+            self.journal.stage_data(sector as u32, buf)
+        } else {
+            storage::write_sector(sector, buf).map_err(|_| FsError::StorageIo)
+        }
     }
 
     /// Write directory/indirect block metadata.

@@ -492,9 +492,23 @@ heap-generated via the existing `proc_generated_text` path in `fs/mod.rs`.
 
 ## M17: Full-Data Journaling for diskfs-v2
 
-**Status**: Planned
-**Limitation**: diskfs-v2 journals metadata only; file data is not journaled.
+**Status**: Complete
+**Limitation**: diskfs-v2 defaults to ordered journaling; full-data journaling is available but not yet enabled by default.
 **Goal**: Add data journaling mode for crash-consistent file data writes.
+
+### Delivered scope
+
+- Added `JournalMode` (`MetadataOnly`, `Ordered`, `Full`) in `kernel/src/fs/journal.rs`.
+- Extended journal header format (with backward-compatible legacy decode) to persist journal mode and per-entry kind metadata.
+- Added data entry staging path (`stage_data`) and ordered home-write apply sequence (`DATA` then `METADATA`) in `Full` mode.
+- Updated journal replay to handle data entries and preserve mode information across clean mounts.
+- Integrated `diskfs_v2` data writes with full-data journaling: when an active transaction uses `JournalMode::Full`, file payload sectors are journaled before home writes.
+
+### Validation notes
+
+- Runtime control is exposed via shell commands: `journal` and `journal mode <metadata|ordered|full>`.
+- Journal mode is persisted in the on-disk v2 header and preserved across remount/replay.
+- Fixed journal capacity remains 63 staged sectors per transaction; larger writes return `storage_no_space` and should be split at caller level.
 
 ### Dependencies
 - None; builds directly on `kernel/src/fs/journal.rs` and `kernel/src/fs/diskfs_v2.rs`.
@@ -504,7 +518,7 @@ heap-generated via the existing `proc_generated_text` path in `fs/mod.rs`.
 #### Step 1: Understand current journal
 **Files to read**: `kernel/src/fs/journal.rs`, `kernel/src/fs/diskfs_v2.rs`
 
-Current state: The journal stores redo records for metadata mutations (inode allocation, directory entry changes, bitmap updates). On mount, `journal_replay()` replays any uncommitted records. File data is written directly to data blocks with ordered writes (metadata commit only after data is on disk).
+Current state: The journal stores redo records for metadata mutations (inode allocation, directory entry changes, bitmap updates). On mount, `journal_replay()` replays any uncommitted records. In default `Ordered` mode, file data is written directly to data blocks before metadata commit; in `Full` mode, file data blocks are journaled and replayed before metadata home writes.
 
 #### Step 2: Add journal mode selection
 **Files to modify**: `kernel/src/fs/journal.rs`
