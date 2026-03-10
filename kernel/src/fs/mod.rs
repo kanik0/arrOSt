@@ -1855,6 +1855,50 @@ pub fn stat_path_to_serial(path: &str, current_pid: Option<u32>) {
     }
 }
 
+fn parse_journal_mode(mode: &str) -> Option<journal::JournalMode> {
+    match mode {
+        "metadata" | "metadata-only" | "meta" => Some(journal::JournalMode::MetadataOnly),
+        "ordered" => Some(journal::JournalMode::Ordered),
+        "full" => Some(journal::JournalMode::Full),
+        _ => None,
+    }
+}
+
+pub fn journal_status_to_serial() {
+    match with_fs(|state| match state.backend {
+        FsBackend::DiskFsV2 => Ok(state.diskfs_v2.journal_status()),
+        FsBackend::RamFs => Err(FsError::StorageUnavailable),
+    }) {
+        Ok(status) => serial::write_fmt(format_args!(
+            "journal: mode={} active={} poisoned={} staged={} max={} next_seq={}\n",
+            status.mode.as_str(),
+            status.active,
+            status.poisoned,
+            status.entry_count,
+            journal::MAX_JOURNAL_ENTRIES,
+            status.next_seq
+        )),
+        Err(err) => serial::write_fmt(format_args!("journal: failed ({})\n", err.as_str())),
+    }
+}
+
+pub fn set_journal_mode_to_serial(mode: &str) {
+    let Some(parsed) = parse_journal_mode(mode.trim()) else {
+        serial::write_line("usage: journal mode <metadata|ordered|full>");
+        return;
+    };
+    match with_fs_mut(|state| match state.backend {
+        FsBackend::DiskFsV2 => state.diskfs_v2.set_journal_mode(parsed),
+        FsBackend::RamFs => Err(FsError::StorageUnavailable),
+    }) {
+        Ok(()) => serial::write_fmt(format_args!("journal: mode set to {}\n", parsed.as_str())),
+        Err(err) => serial::write_fmt(format_args!(
+            "journal: mode change failed ({})\n",
+            err.as_str()
+        )),
+    }
+}
+
 pub fn sync_to_disk_to_serial() {
     match sync_to_disk() {
         Ok(()) => serial::write_line("sync: diskfs metadata saved"),
