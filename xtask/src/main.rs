@@ -2002,7 +2002,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         for marker in [
             "ls", "ps", "kill", "cat", "echo", "fm", "doom", "terminal", "link", "symlink",
         ] {
-            if !bin_lines.iter().any(|line| *line == marker) {
+            if !bin_lines.contains(&marker) {
                 bail!("missing `{marker}` in ls /bin output: {bin_lines:?}");
             }
         }
@@ -2047,7 +2047,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         let proc_snapshot = snapshot_log(&log);
         let proc_lines = lines_after_matching_until_prompt(&proc_snapshot, "ls /proc");
         for marker in ["self", "mounts", "uptime"] {
-            if !proc_lines.iter().any(|line| *line == marker) {
+            if !proc_lines.contains(&marker) {
                 bail!("missing `{marker}` in ls /proc output: {proc_lines:?}");
             }
         }
@@ -2538,7 +2538,7 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
         let ls_snapshot = snapshot_log(&log);
         let ls_lines = lines_after_matching_until_prompt(&ls_snapshot, "ls /bin");
         for marker in ["netstat", "ifconfig", "ip"] {
-            if !ls_lines.iter().any(|line| *line == marker) {
+            if !ls_lines.contains(&marker) {
                 bail!("missing `{marker}` in ls /bin output: {ls_lines:?}");
             }
         }
@@ -2662,7 +2662,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         thread::sleep(Duration::from_millis(250));
         let home_snapshot = snapshot_log(&log);
         let home_lines = lines_after_matching_until_prompt(&home_snapshot, "ls -a");
-        if !home_lines.iter().any(|line| *line == ".history") {
+        if !home_lines.contains(&".history") {
             bail!("expected .history in ls -a output, got {home_lines:?}");
         }
 
