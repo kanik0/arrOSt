@@ -7,13 +7,13 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ## M11: Kernel Page-Table Isolation (KPTI)
 
-**Status**: In Progress
-**Limitation**: Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
+**Status**: Complete
+**Limitation**: Resolved in M11 (kernel mappings are no longer cloned wholesale into ring-3 roots).
 **Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
 
 ### Context
 
-Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables that include all kernel mappings as supervisor-only entries. A user-mode process cannot read kernel memory (the NX/supervisor bits prevent it), but Meltdown-class side-channel attacks can still leak data through speculative execution. KPTI eliminates this by unmapping kernel pages entirely from user page tables.
+M11 delivered KPTI-oriented page-table isolation groundwork and transition wiring: ring-3 roots no longer clone the full kernel root, transitions are routed through arch trampoline entry/exit paths, and runtime smoke coverage includes explicit lower-EL fault handling checks.
 
 
 ### Incremental progress (this branch)
@@ -52,9 +52,10 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 - `xtask` now provides a dedicated `smoke-kpti-m11` battery that runs `smoke-ring3`, `smoke-ring3-run`, and `smoke-fs` on both architectures plus explicit `smoke-ring3-fault --arch aarch64` kernel-address fault coverage.
 
-### Remaining to close M11
+### Completion summary
 
-- Finalize docs (`README.md`, `docs/MEMORY.md`, `docs/PROC.md`, `docs/INTERRUPTS.md`) to mark M11 complete.
+- M11 closure is recorded: trampoline infrastructure, gate/vector wiring, scratch consumption, and dedicated M11 smoke battery are in place.
+- Follow-up work is tracked under later milestones (e.g. broader memory-model evolution in M13+) rather than as open M11 checklist items.
 
 ### Dependencies
 - M14 (Timer-Driven Hard Preemption) is recommended but not required.

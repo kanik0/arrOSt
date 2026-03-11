@@ -82,17 +82,12 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 
 ## KPTI status note (M11)
 
-- Ring-3 process page tables include a dedicated trampoline virtual page (`mem::TRAMPOLINE_VADDR`) as groundwork.
-- Syscall/fault gates are not yet redirected to trampoline entry stubs, so full KPTI isolation is still pending.
-- `proc` now maintains KPTI scratch root-table state for future trampoline code, but interrupt/syscall gates still use existing non-trampoline entries.
-- Architecture-specific trampoline groundwork modules now exist and currently export gateway addresses that mirror active entries.
-- x86_64 IDT syscall gate and page-fault entry, plus aarch64 vector-base installation, now fetch addresses through the trampoline modules (same effective targets for now).
-- Ring-3 syscall entry paths now also update KPTI scratch RSP fields to feed future trampoline entry/exit save-restore logic.
-- Fault/sync dispatch policy now also routes through trampoline helpers (same effective handling paths for now).
-- x86_64 now uses concrete trampoline entry wrappers for syscall/page-fault entry while keeping existing handler behavior.
-- aarch64 lower-EL sync vector now branches to a trampoline-owned dispatch symbol before running existing sync policy logic.
-- Current trampoline wrappers now perform provisional CR3/TTBR root switches using KPTI scratch roots while reusing existing policy handlers.
-- x86_64 and aarch64 trampoline wrappers now include dedicated trampoline-side exit helpers in their transition flow.
+- M11 KPTI transition wiring is complete for the current runtime model.
+- Ring-3 page tables include a dedicated trampoline virtual page (`mem::TRAMPOLINE_VADDR`) and avoid full kernel-root cloning.
+- x86_64 syscall/page-fault gates and aarch64 lower-EL sync flow route through architecture trampoline entry symbols.
+- Trampoline paths use per-CPU KPTI scratch roots/RSP fields (`kernel_root_table`, `user_root_table`, `user_rsp_scratch`, `kernel_rsp_scratch`) to drive transition sequencing.
+- x86_64 trampoline flow includes dedicated syscall/fault entry and exit helpers; aarch64 trampoline flow owns lower-EL sync classification/dispatch and trampoline-side exit restore.
+- Validation is consolidated under `cargo xtask smoke-kpti-m11` (ring3 + ring3-run + fs on both arches plus explicit aarch64 fault smoke).
 
 ## Relevant files
 

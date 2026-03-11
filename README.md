@@ -120,7 +120,7 @@ Useful runtime commands:
 
 ## Known limitations
 
-- Ring-3 page-table creation now preserves only upper-half root-table mappings and installs a fixed trampoline user page as KPTI groundwork, but full trampoline gate wiring is still pending (scheduler-side KPTI scratch tracking is in place (including RSP scratch updates on syscall entry), and gate/vector setup and fault/sync dispatch hooks now route through trampoline modules (same effective handlers for now, with dedicated x86/aarch64 trampoline wrapper entry/exit paths that now include provisional CR3/TTBR root switching)).
+- KPTI milestone M11 is complete: ring-3 roots preserve only upper-half kernel mappings, each process maps a dedicated trampoline page, and syscall/fault/sync transition flow is routed through architecture trampoline entry/exit paths with per-CPU KPTI scratch root/RSP tracking.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
