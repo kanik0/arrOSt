@@ -44,10 +44,11 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 - x86_64 trampoline flow now includes dedicated syscall/fault exit helpers (`trampoline_syscall_exit`, `trampoline_fault_exit`) and aarch64 sync flow now enters via `__arrost_aarch64_sync_trampoline_entry` with explicit trampoline-side exit helper before returning.
 
+- aarch64 lower-EL sync/fault vector flow is now redirected end-to-end through dedicated trampoline entry symbols before shared dispatch (`kernel/src/arch/aarch64/interrupts.rs`, `kernel/src/arch/aarch64/trampoline.rs`).
+
 ### Remaining to close M11
 
 - Replace remaining forwarding paths with fully dedicated trampoline entry/exit stubs (including explicit syscall/fault exit stubs and per-CPU save areas) while preserving current runtime guarantees.
-- Redirect aarch64 lower-EL sync/fault vector flow to dedicated trampoline entry stubs.
 - Complete per-CPU scratch consumption in trampoline assembly paths (`user_rsp_scratch`, `kernel_rsp_scratch`, root tables).
 - Validate with full ring3/fs smoke on both arches and add explicit kernel-address access fault smoke.
 - Finalize docs (`README.md`, `docs/MEMORY.md`, `docs/PROC.md`, `docs/INTERRUPTS.md`) to mark M11 complete.
