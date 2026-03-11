@@ -2268,12 +2268,15 @@ fn handle_serial_escape(shell: &mut ShellState, byte: u8) -> bool {
             false
         }
         SerialEscapeState::Esc => {
-            shell.serial_escape = if byte == b'[' {
-                SerialEscapeState::Csi
+            if byte == b'[' {
+                shell.serial_escape = SerialEscapeState::Csi;
+                true
             } else {
-                SerialEscapeState::None
-            };
-            true
+                // Treat a bare ESC as ignorable and let the following byte flow
+                // through normal command handling instead of dropping it.
+                shell.serial_escape = SerialEscapeState::None;
+                false
+            }
         }
         SerialEscapeState::Csi => {
             shell.serial_escape = SerialEscapeState::None;

@@ -3848,7 +3848,7 @@ fn smoke_doom_impl(
 
         wait_for_music_pcm_activity(&log, stdin, Duration::from_secs(10))?;
 
-        send_serial_shell_command(stdin, "doom audio off\n")?;
+        send_serial_command(stdin, "doom audio off\n")?;
         wait_for_log(
             &log,
             "doom: audio mode set to off",
@@ -3856,7 +3856,7 @@ fn smoke_doom_impl(
             "doom audio off",
         )?;
 
-        send_serial_shell_command(stdin, "doom audio on\n")?;
+        send_serial_command(stdin, "doom audio on\n")?;
         wait_for_log(
             &log,
             "doom: audio mode set to ",
@@ -3865,7 +3865,7 @@ fn smoke_doom_impl(
         )?;
 
         if !long_run {
-            send_serial_shell_command(stdin, "doom audio test\n")?;
+            send_serial_command(stdin, "doom audio test\n")?;
             wait_for_log(
                 &log,
                 "doom: audio test tone queued",
@@ -3874,7 +3874,7 @@ fn smoke_doom_impl(
             )?;
         }
 
-        send_serial_shell_command(stdin, "doom capture on\n")?;
+        send_serial_command(stdin, "doom capture on\n")?;
         wait_for_log(
             &log,
             "doom: capture enabled (press ESC to exit)",
@@ -3899,7 +3899,7 @@ fn smoke_doom_impl(
             "ui focus advance after doom capture escape",
         )?;
 
-        send_serial_shell_command(stdin, "doom status\n")?;
+        send_serial_command(stdin, "doom status\n")?;
         wait_for_log(
             &log,
             "doom: app=doom engine=",
@@ -3913,6 +3913,12 @@ fn smoke_doom_impl(
             "last_key=",
             Duration::from_secs(4),
             "doom status line complete post-capture",
+        )?;
+        wait_for_prompt_after(
+            &log,
+            "doom status",
+            Duration::from_secs(4),
+            "doom status prompt post-capture",
         )?;
         let capture_snapshot = snapshot_log(&log);
         let Some(capture_status_line) =
@@ -3939,6 +3945,12 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom mouse y on",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom mouse y on",
+            Duration::from_secs(4),
+            "doom mouse y on prompt",
+        )?;
 
         send_serial_shell_command(stdin, "doom mouse turn 5\n")?;
         wait_for_log(
@@ -3947,6 +3959,12 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom mouse turn",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom mouse turn 5",
+            Duration::from_secs(4),
+            "doom mouse turn prompt",
+        )?;
 
         send_serial_shell_command(stdin, "doom mouse move 7\n")?;
         wait_for_log(
@@ -3954,6 +3972,12 @@ fn smoke_doom_impl(
             "doom: mouse move threshold set to 7",
             Duration::from_secs(8),
             "doom mouse move",
+        )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom mouse move 7",
+            Duration::from_secs(4),
+            "doom mouse move prompt",
         )?;
 
         send_serial_shell_command(stdin, "doom status\n")?;
@@ -3969,6 +3993,13 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom mouse config status",
         )?;
+        wait_for_prompt_after(
+            &log,
+            "doom status",
+            Duration::from_secs(8),
+            "doom mouse config prompt",
+        )?;
+        thread::sleep(Duration::from_millis(80));
 
         send_serial_shell_command(stdin, "doom key left\n")?;
         wait_for_log(
@@ -3976,6 +4007,12 @@ fn smoke_doom_impl(
             "doom: injected key 0x61",
             Duration::from_secs(8),
             "doom key injection",
+        )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom key left",
+            Duration::from_secs(4),
+            "doom key prompt",
         )?;
 
         send_serial_shell_command(stdin, "doom keyup left\n")?;
@@ -3985,6 +4022,12 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom keyup injection",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom keyup left",
+            Duration::from_secs(4),
+            "doom keyup prompt",
+        )?;
 
         send_serial_shell_command(stdin, "doom key fire\n")?;
         wait_for_log(
@@ -3992,6 +4035,12 @@ fn smoke_doom_impl(
             "doom: injected key 0x20",
             Duration::from_secs(8),
             "doom fire injection",
+        )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom key fire",
+            Duration::from_secs(4),
+            "doom fire prompt",
         )?;
         thread::sleep(Duration::from_millis(220));
 
@@ -4002,6 +4051,12 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom fire keyup injection",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom keyup fire",
+            Duration::from_secs(4),
+            "doom fire keyup prompt",
+        )?;
 
         send_serial_shell_command(stdin, "doom key enter\n")?;
         wait_for_log(
@@ -4009,6 +4064,12 @@ fn smoke_doom_impl(
             "doom: injected key 0x0a",
             Duration::from_secs(8),
             "doom enter injection",
+        )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom key enter",
+            Duration::from_secs(4),
+            "doom enter prompt",
         )?;
 
         send_serial_shell_command(stdin, "doom keyup enter\n")?;
@@ -4018,6 +4079,12 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom enter keyup injection",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom keyup enter",
+            Duration::from_secs(4),
+            "doom enter keyup prompt",
+        )?;
 
         send_serial_shell_command(stdin, "doom status\n")?;
         wait_for_log(
@@ -4026,6 +4093,13 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom status post-input",
         )?;
+        wait_for_prompt_after(
+            &log,
+            "doom status",
+            Duration::from_secs(8),
+            "doom status prompt post-input",
+        )?;
+        thread::sleep(Duration::from_millis(80));
         let status_snapshot = snapshot_log(&log);
         let Some(status_line) = last_matching_line(&status_snapshot, "last_key=0x0a") else {
             bail!("missing doom status line after input injections");
@@ -4124,12 +4198,24 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom right injection",
         )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom key right",
+            Duration::from_secs(4),
+            "doom right prompt",
+        )?;
         send_serial_shell_command(stdin, "doom keyup right\n")?;
         wait_for_log(
             &log,
             "doom: injected keyup 0x64",
             Duration::from_secs(8),
             "doom right keyup injection",
+        )?;
+        wait_for_prompt_settle_after(
+            &log,
+            "doom keyup right",
+            Duration::from_secs(4),
+            "doom right keyup prompt",
         )?;
 
         send_serial_shell_command(stdin, "doom status\n")?;
@@ -4139,6 +4225,13 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "doom status frame progression",
         )?;
+        wait_for_prompt_after(
+            &log,
+            "doom status",
+            Duration::from_secs(8),
+            "doom status prompt frame progression",
+        )?;
+        thread::sleep(Duration::from_millis(80));
         let progression_snapshot = snapshot_log(&log);
         let Some(progression_line) = last_matching_line(&progression_snapshot, "last_key=0x64")
         else {
@@ -4271,6 +4364,8 @@ fn smoke_doom_impl(
             Duration::from_secs(8),
             "ui diagnostics line",
         )?;
+        wait_for_prompt_after(&log, "ui", Duration::from_secs(8), "ui diagnostics prompt")?;
+        thread::sleep(Duration::from_millis(80));
 
         let log_snapshot = snapshot_log(&log);
         if let Some(ui_line) = last_matching_line(&log_snapshot, "ui: backend=uefi-gop ready=true")
@@ -4359,12 +4454,17 @@ fn default_ring3_elf_groundwork_enabled() -> bool {
 
 fn send_serial_command(stdin: &mut ChildStdin, command: &str) -> Result<()> {
     let normalized = command.replace('\n', "\r");
-    stdin
-        .write_all(normalized.as_bytes())
-        .with_context(|| format!("failed to send command `{}`", command.trim_end()))?;
-    stdin
-        .flush()
-        .with_context(|| format!("failed to flush command `{}`", command.trim_end()))?;
+    for byte in normalized.bytes() {
+        stdin
+            .write_all(&[byte])
+            .with_context(|| format!("failed to send command `{}`", command.trim_end()))?;
+        stdin
+            .flush()
+            .with_context(|| format!("failed to flush command `{}`", command.trim_end()))?;
+        // QEMU serial input is polled in-guest; pacing bytes avoids dropping
+        // characters when the smoke drives a noisy Doom session over stdio.
+        thread::sleep(Duration::from_millis(2));
+    }
     Ok(())
 }
 
@@ -4437,6 +4537,52 @@ fn wait_for_new_matching_line(
     }
 }
 
+fn wait_for_prompt_after(
+    log: &Arc<Mutex<Vec<u8>>>,
+    marker: &str,
+    timeout: Duration,
+    stage: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = snapshot_log(log);
+        let lines: Vec<&str> = snapshot.lines().collect();
+        let mut found_marker = false;
+        for index in (0..lines.len()).rev() {
+            let line = lines[index];
+            if command_line_matches_marker(line, marker) || line.contains(marker) {
+                found_marker = true;
+                if lines
+                    .iter()
+                    .skip(index + 1)
+                    .any(|line| line.trim().starts_with("user@arrost "))
+                {
+                    return Ok(());
+                }
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            if found_marker {
+                bail!("timeout waiting for {stage}: expected prompt after `{marker}`");
+            }
+            bail!("timeout waiting for {stage}: expected marker `{marker}` before prompt");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_prompt_settle_after(
+    log: &Arc<Mutex<Vec<u8>>>,
+    marker: &str,
+    timeout: Duration,
+    stage: &str,
+) -> Result<()> {
+    wait_for_prompt_after(log, marker, timeout, stage)?;
+    thread::sleep(Duration::from_millis(80));
+    Ok(())
+}
+
 fn wait_for_status_with_frame_progress(
     log: &Arc<Mutex<Vec<u8>>>,
     min_frames: u64,
@@ -4467,12 +4613,18 @@ fn wait_for_music_pcm_activity(
 ) -> Result<u64> {
     let deadline = Instant::now() + timeout;
     loop {
-        send_serial_shell_command(stdin, "doom audio status\n")?;
+        send_serial_command(stdin, "doom audio status\n")?;
         wait_for_log(
             log,
             "doom: audio mode=",
             Duration::from_secs(8),
             "doom audio status",
+        )?;
+        wait_for_prompt_after(
+            log,
+            "doom audio status",
+            Duration::from_secs(8),
+            "doom audio status prompt",
         )?;
         let snapshot = snapshot_log(log);
         if let Some(line) = last_matching_line(&snapshot, "doom: audio mode=")
