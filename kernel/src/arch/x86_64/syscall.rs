@@ -26,7 +26,7 @@ struct SavedRegs {
 }
 
 #[repr(C)]
-struct Int80Frame {
+pub(crate) struct Int80Frame {
     regs: SavedRegs,
     rip: u64,
     cs: u64,

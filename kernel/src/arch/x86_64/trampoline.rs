@@ -73,7 +73,6 @@ extern "C" fn trampoline_syscall_exit() -> ! {
 }
 
 /// Groundwork entry address used for ring-3 fault containment transitions.
-
 pub fn trampoline_page_fault_entry_addr() -> u64 {
     trampoline_fault_entry as *const () as usize as u64
 }
