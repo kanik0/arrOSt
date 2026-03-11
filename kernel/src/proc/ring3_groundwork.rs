@@ -26,6 +26,8 @@ const USER_STACK_GAP_BYTES: u64 = 64 * 1024;
 // 32 KiB is too tight once deeper VFS resolution and the syscall dispatcher stack up.
 const KERNEL_STACK_BYTES: usize = 64 * 1024;
 const MAX_LOADABLE_SEGMENT_BYTES: usize = 128 * 1024;
+const PAGE_TABLE_ENTRY_COUNT: usize = 512;
+const PAGE_TABLE_UPPER_HALF_START: usize = PAGE_TABLE_ENTRY_COUNT / 2;
 const SMOKE_SEGMENT_SCRATCH_BYTES: usize = 512;
 const SMOKE_ELF_SEGMENT_OFFSET: usize = 0x100;
 #[cfg(target_arch = "x86_64")]
@@ -539,6 +541,9 @@ fn load_process_image(
     let mut loaded_user_pages = Vec::<LoadedUserPage>::new();
     let (address_space, mut address_space_owner) =
         create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
+    mem::trampoline_phys_addr().ok_or(Ring3ElfLoadError::AddressSpaceCreate(
+        "failed to resolve trampoline frame",
+    ))?;
 
     for index in 0..header.program_header_count {
         let ph = parse_program_header(elf_bytes, &header, index)?;
@@ -700,6 +705,19 @@ fn load_process_image(
         argv,
     )?;
 
+    let trampoline_page = boxed_zeroed_user_page();
+    map_user_page(
+        &mut address_space_owner,
+        address_space,
+        mem::TRAMPOLINE_VADDR,
+        &trampoline_page,
+        false,
+        true,
+    )
+    .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
+    mapped_pages = mapped_pages.saturating_add(1);
+    owned_user_pages.push(trampoline_page);
+
     let kernel_stack = vec![0u8; KERNEL_STACK_BYTES].into_boxed_slice();
     let kernel_stack_top = align_down(
         (kernel_stack.as_ptr() as u64).saturating_add(kernel_stack.len() as u64),
@@ -859,7 +877,9 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_x86_page_table();
     // SAFETY: current_table points to active P4 mapped in kernel address space.
     let current_table_ref = unsafe { &*current_table };
-    for index in 0..512 {
+    // Groundwork for M11/KPTI: start each process from a clean user half and
+    // inherit only the upper-half kernel mappings.
+    for index in PAGE_TABLE_UPPER_HALF_START..PAGE_TABLE_ENTRY_COUNT {
         process_root[index] = current_table_ref[index].clone();
     }
 
@@ -893,9 +913,11 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_aarch64_page_table();
     // SAFETY: current TTBR0 root is mapped in the kernel address space and remains valid.
     let current_table_ref = unsafe { &*current_table };
-    process_root
-        .entries
-        .copy_from_slice(&current_table_ref.entries);
+    // Groundwork for M11/KPTI: preserve only upper-half mappings instead of
+    // cloning the whole root table verbatim.
+    for index in PAGE_TABLE_UPPER_HALF_START..PAGE_TABLE_ENTRY_COUNT {
+        process_root.entries[index] = current_table_ref.entries[index];
+    }
 
     let process_root_virt = (&*process_root as *const Aarch64PageTable) as usize;
     let Some(process_root_phys) = mem::virt_to_phys(process_root_virt) else {

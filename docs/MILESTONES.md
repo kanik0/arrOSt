@@ -7,13 +7,55 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ## M11: Kernel Page-Table Isolation (KPTI)
 
-**Status**: Planned
-**Limitation**: Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
+**Status**: Complete
+**Limitation**: Resolved in M11 (kernel mappings are no longer cloned wholesale into ring-3 roots).
 **Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
 
 ### Context
 
-Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables that include all kernel mappings as supervisor-only entries. A user-mode process cannot read kernel memory (the NX/supervisor bits prevent it), but Meltdown-class side-channel attacks can still leak data through speculative execution. KPTI eliminates this by unmapping kernel pages entirely from user page tables.
+M11 delivered KPTI-oriented page-table isolation groundwork and transition wiring: ring-3 roots no longer clone the full kernel root, transitions are routed through arch trampoline entry/exit paths, and runtime smoke coverage includes explicit lower-EL fault handling checks.
+
+
+### Incremental progress (this branch)
+
+- `kernel/src/proc/ring3_groundwork.rs` now clones only the upper-half root-table entries (indices `256..512`) when creating a ring-3 address space.
+- Ring-3 image loading now maps a fixed trampoline user page at `mem::TRAMPOLINE_VADDR` (RX, non-writable) into each process address space.
+- `kernel/src/mem/mod.rs` now exports `TRAMPOLINE_VADDR` and `trampoline_phys_addr()` for follow-up trampoline entry/exit work.
+- This remains groundwork toward Step 3/4: syscall/fault gates are still on existing paths until trampoline stubs are wired.
+- `kernel/src/proc/mod.rs` now keeps a per-CPU KPTI scratch snapshot (`kernel_root_table`, `user_root_table`, `user_rsp_scratch`, `kernel_rsp_scratch`) and updates root-table fields on ring-3 address-space switch/restore (Step 5/6 groundwork).
+
+- Added `kernel/src/arch/x86_64/trampoline.rs` and `kernel/src/arch/aarch64/trampoline.rs` groundwork modules exporting trampoline entry addresses backed by current gate/vector entrypoints.
+
+- `kernel/src/arch/*/interrupts.rs` now sources syscall/vector gate base addresses through `arch/*/trampoline.rs` helpers, keeping runtime behavior unchanged while preparing Step 4 gate redirection.
+
+- Syscall entry paths now populate KPTI scratch RSP fields (`user_rsp_scratch`, `kernel_rsp_scratch`) from live ring-3 transitions on both `x86_64` (`int 0x80`) and `aarch64` (`SVC`) as Step 5 groundwork.
+
+- `kernel/src/arch/x86_64/interrupts.rs` now sources the page-fault IDT entry address through `arch::x86_64::trampoline::trampoline_page_fault_entry_addr()` (same effective handler, Step 4 groundwork).
+
+- Fault/sync transition policy now also routes through `arch/*/trampoline.rs` helpers (`x86_64` page-fault transition hook, `aarch64` SVC/lower-sync hooks) while preserving current behavior.
+
+- `kernel/src/arch/x86_64/trampoline.rs` now provides concrete trampoline entry wrappers (`trampoline_syscall_entry`, `trampoline_page_fault_entry`) that currently tail-call/forward to existing handlers, replacing pure address pass-throughs on x86_64.
+
+- `kernel/src/arch/aarch64/trampoline.rs` now includes a concrete sync-dispatch wrapper (`sync_dispatch_transition`) used by `__arrost_aarch64_sync_dispatch`, replacing direct interrupt-path coupling while keeping behavior unchanged.
+
+- aarch64 lower-EL sync vector assembly now branches to a trampoline-owned dispatch symbol (`__arrost_aarch64_sync_trampoline_dispatch`) before entering shared sync policy logic.
+
+- x86_64 trampoline entry wrappers now perform provisional CR3 switches using KPTI scratch roots on syscall/page-fault entry/exit paths, and aarch64 sync trampoline now performs TTBR0 switch+barrier sequencing around sync dispatch.
+
+- x86_64 trampoline flow now includes dedicated syscall/fault exit helpers (`trampoline_syscall_exit`, `trampoline_fault_exit`) and aarch64 sync flow now enters via `__arrost_aarch64_sync_trampoline_entry` with explicit trampoline-side exit helper before returning.
+
+- aarch64 lower-EL sync/fault vector flow is now redirected end-to-end through dedicated trampoline entry symbols before shared dispatch (`kernel/src/arch/aarch64/interrupts.rs`, `kernel/src/arch/aarch64/trampoline.rs`).
+
+- `kernel/src/arch/aarch64/trampoline.rs` now captures/restores `SP_EL0` and kernel `SP` through per-CPU KPTI scratch (`user_rsp_scratch`, `kernel_rsp_scratch`) during sync trampoline entry/exit, completing scratch consumption for active trampoline paths.
+
+- `kernel/src/arch/aarch64/trampoline.rs` now owns lower-EL sync classification/dispatch directly (SVC + fault policy + unhandled sync halt path) with trampoline-side TTBR0 entry/exit sequencing, replacing the previous interrupts-side forwarding path.
+
+- `xtask` now provides a dedicated `smoke-kpti-m11` battery that runs `smoke-ring3`, `smoke-ring3-run`, and `smoke-fs` on both architectures plus explicit `smoke-ring3-fault --arch aarch64` kernel-address fault coverage.
+
+### Completion summary
+
+- M11 closure is recorded: trampoline infrastructure, gate/vector wiring, scratch consumption, and dedicated M11 smoke battery are in place.
+- Follow-up work is tracked under later milestones (e.g. broader memory-model evolution in M13+) rather than as open M11 checklist items.
 
 ### Dependencies
 - M14 (Timer-Driven Hard Preemption) is recommended but not required.

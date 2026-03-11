@@ -7,6 +7,7 @@ pub mod framebuffer;
 pub mod interrupts;
 pub mod port;
 pub mod syscall;
+pub mod trampoline;
 
 #[unsafe(no_mangle)]
 pub(crate) static AARCH64_TIMER_COUNTS_PER_TICK: AtomicU64 = AtomicU64::new(0);
