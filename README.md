@@ -59,10 +59,12 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
 - Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
 - Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
+- Default user home is `/home/user`, and shell history persists in `/home/user/.history`.
+- `Tab` completion works for `/bin` commands and for relative/absolute file paths in the current working directory.
 
 Representative commands:
 
-- `pwd`, `cd <dir>`, `ls [<path>]`
+- `pwd`, `cd <dir>`, `ls [-als] [<path>]`
 - `cat <file>`, `echo <text> > <file>`
 - `mkdir <dir>`, `mv <src> <dst>`
 - `link <src> <dst>`, `symlink <target> <linkpath>`
@@ -82,7 +84,7 @@ Representative commands:
 - `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
 - User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
-- ABI revision is `5`. Shell prompt is context-aware: `user@arrost /path> ` in both serial and GUI terminals.
+- ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
 
 Current syscall surface includes:
 

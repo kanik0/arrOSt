@@ -24,6 +24,12 @@ const SERIAL_CAPTURE_HOLD_TICKS_MOVE: u64 = 12;
 const SERIAL_CAPTURE_HOLD_TICKS_ACTION: u64 = 14;
 const FILE_MANAGER_LIST_LINES: usize = 5;
 const FILE_MANAGER_PREVIEW_BYTES: usize = 180;
+const DEFAULT_HOME_DIR: &str = "/home/user";
+const HISTORY_PATH: &str = "/home/user/.history";
+const HISTORY_MAX_ENTRIES: usize = 200;
+const HISTORY_ENTRY_MAX_BYTES: usize = MAX_LINE_LEN - 1;
+const HISTORY_FILE_MAX_BYTES: usize = HISTORY_MAX_ENTRIES * (HISTORY_ENTRY_MAX_BYTES + 1);
+const COMPLETION_MATCH_LIMIT: usize = 32;
 const SERIAL_BIN_LS: &str = "/bin/ls";
 const SERIAL_BIN_PS: &str = "/bin/ps";
 const SERIAL_BIN_KILL: &str = "/bin/kill";
@@ -56,11 +62,158 @@ const VERSION_BUILD: &str = match option_env!("ARROST_BUILD_COUNT") {
 };
 
 struct ShellCell(UnsafeCell<ShellState>);
+struct HistoryCell(UnsafeCell<HistoryStore>);
+struct HistoryFileBufferCell(UnsafeCell<[u8; HISTORY_FILE_MAX_BYTES]>);
 
 // SAFETY: shell state is accessed only on the main loop thread.
 unsafe impl Sync for ShellCell {}
+// SAFETY: shell/history state is accessed only on the main loop thread.
+unsafe impl Sync for HistoryCell {}
+// SAFETY: shell/history state is accessed only on the main loop thread.
+unsafe impl Sync for HistoryFileBufferCell {}
 
 static SHELL_STATE: ShellCell = ShellCell(UnsafeCell::new(ShellState::new()));
+static COMMAND_HISTORY: HistoryCell = HistoryCell(UnsafeCell::new(HistoryStore::new()));
+static HISTORY_FILE_BUFFER: HistoryFileBufferCell =
+    HistoryFileBufferCell(UnsafeCell::new([0; HISTORY_FILE_MAX_BYTES]));
+
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryBrowseState {
+    active: bool,
+    history_index: usize,
+    saved_line: [u8; HISTORY_ENTRY_MAX_BYTES],
+    saved_len: usize,
+}
+
+impl HistoryBrowseState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            active: false,
+            history_index: 0,
+            saved_line: [0; HISTORY_ENTRY_MAX_BYTES],
+            saved_len: 0,
+        }
+    }
+
+    fn remember_current_line(&mut self, line: &[u8], len: usize) {
+        let copy_len = len.min(HISTORY_ENTRY_MAX_BYTES).min(line.len());
+        self.saved_line[..copy_len].copy_from_slice(&line[..copy_len]);
+        self.saved_line[copy_len..].fill(0);
+        self.saved_len = copy_len;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SerialEscapeState {
+    None,
+    Esc,
+    Csi,
+}
+
+impl SerialEscapeState {
+    const fn new() -> Self {
+        Self::None
+    }
+}
+
+struct HistoryStore {
+    entries: [[u8; HISTORY_ENTRY_MAX_BYTES]; HISTORY_MAX_ENTRIES],
+    lens: [u8; HISTORY_MAX_ENTRIES],
+    count: usize,
+}
+
+impl HistoryStore {
+    const fn new() -> Self {
+        Self {
+            entries: [[0; HISTORY_ENTRY_MAX_BYTES]; HISTORY_MAX_ENTRIES],
+            lens: [0; HISTORY_MAX_ENTRIES],
+            count: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lens.fill(0);
+        self.count = 0;
+    }
+
+    fn load_from_fs(&mut self) {
+        self.clear();
+        // SAFETY: shell/history access is single-threaded on the main loop.
+        let buffer = unsafe { &mut *HISTORY_FILE_BUFFER.0.get() };
+        let len = match fs::read_file(HISTORY_PATH, buffer) {
+            Ok(len) => len.min(buffer.len()),
+            Err(fs::FsError::NotFound) => 0,
+            Err(err) => {
+                serial::write_fmt(format_args!("history: read failed ({})\n", err.as_str()));
+                0
+            }
+        };
+
+        let mut start = 0usize;
+        for index in 0..=len {
+            if index != len && buffer[index] != b'\n' {
+                continue;
+            }
+            if index > start {
+                self.append_bytes(&buffer[start..index]);
+            }
+            start = index.saturating_add(1);
+        }
+    }
+
+    fn append_command(&mut self, command: &str) {
+        self.append_bytes(command.as_bytes());
+    }
+
+    fn append_bytes(&mut self, command: &[u8]) {
+        let mut len = command.len().min(HISTORY_ENTRY_MAX_BYTES);
+        while len > 0 && matches!(command[len - 1], b'\n' | b'\r') {
+            len -= 1;
+        }
+        if len == 0 {
+            return;
+        }
+
+        if self.count == HISTORY_MAX_ENTRIES {
+            for index in 1..self.count {
+                self.entries[index - 1] = self.entries[index];
+                self.lens[index - 1] = self.lens[index];
+            }
+            self.count -= 1;
+        }
+
+        self.entries[self.count][..len].copy_from_slice(&command[..len]);
+        self.entries[self.count][len..].fill(0);
+        self.lens[self.count] = len as u8;
+        self.count += 1;
+    }
+
+    fn persist_to_fs(&self) -> Result<(), fs::FsError> {
+        // SAFETY: shell/history access is single-threaded on the main loop.
+        let buffer = unsafe { &mut *HISTORY_FILE_BUFFER.0.get() };
+        let mut used = 0usize;
+        for index in 0..self.count {
+            let len = self.lens[index] as usize;
+            let next = used.saturating_add(len).saturating_add(1);
+            if next > buffer.len() {
+                break;
+            }
+            buffer[used..used + len].copy_from_slice(&self.entries[index][..len]);
+            used += len;
+            buffer[used] = b'\n';
+            used += 1;
+        }
+        fs::write_file(HISTORY_PATH, &buffer[..used]).map(|_| ())
+    }
+
+    fn entry(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.count {
+            return None;
+        }
+        let len = self.lens[index] as usize;
+        Some(&self.entries[index][..len])
+    }
+}
 
 #[derive(Clone, Copy)]
 struct HeldCaptureKey {
@@ -84,8 +237,10 @@ struct ShellState {
     len: usize,
     cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
     cwd_len: usize,
+    history_nav: HistoryBrowseState,
     waiting_vfs_pid: Option<u32>,
     doom_capture: bool,
+    serial_escape: SerialEscapeState,
     held_serial_capture_keys: [HeldCaptureKey; SERIAL_CAPTURE_HELD_KEYS],
 }
 
@@ -98,14 +253,18 @@ impl ShellState {
             len: 0,
             cwd,
             cwd_len: 1,
+            history_nav: HistoryBrowseState::new(),
             waiting_vfs_pid: None,
             doom_capture: false,
+            serial_escape: SerialEscapeState::new(),
             held_serial_capture_keys: [HeldCaptureKey::inactive(); SERIAL_CAPTURE_HELD_KEYS],
         }
     }
 
     fn clear(&mut self) {
         self.len = 0;
+        self.history_nav = HistoryBrowseState::new();
+        self.serial_escape = SerialEscapeState::new();
     }
 
     fn cwd(&self) -> &str {
@@ -201,8 +360,12 @@ fn serial_capture_hold_ticks(byte: u8) -> u64 {
 }
 
 pub fn init() {
+    // SAFETY: shell init happens on the main thread before interactive input starts.
+    let shell = unsafe { &mut *SHELL_STATE.0.get() };
+    shell.set_cwd(default_working_directory());
+    load_command_history();
     serial::write_line(
-        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, netstat, ifconfig, route, arp, ss, nc, ip, sync, reload, watch on|off; /bin exec: /bin/ls [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink|/bin/netstat|/bin/ifconfig|/bin/route|/bin/arp|/bin/ss|/bin/nc|/bin/ip; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
+        "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [-als] [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, netstat, ifconfig, route, arp, ss, nc, ip, sync, reload, watch on|off; /bin exec: /bin/ls [-als] [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink|/bin/netstat|/bin/ifconfig|/bin/route|/bin/arp|/bin/ss|/bin/nc|/bin/ip; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
     );
     refresh_file_manager_list_view();
     print_prompt();
@@ -244,9 +407,37 @@ pub fn poll() {
 }
 
 fn process_keyboard_event(event: keyboard::KeyEvent) {
+    if !event.pressed {
+        if doom_capture_enabled() {
+            if let Some(byte) = map_doom_capture_key(event.code) {
+                let _ = doom::inject_key_release(byte);
+            }
+            return;
+        }
+        let _ = gfx::on_key_event(event);
+        return;
+    }
+
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
+    if !shell.doom_capture && gfx::on_key_event(event) {
+        return;
+    }
+
     if !shell.doom_capture {
+        match event.code {
+            keyboard::KeyCode::ArrowUp => {
+                if history_previous(&mut shell.line, &mut shell.len, &mut shell.history_nav) {
+                    redraw_serial_line(shell);
+                }
+            }
+            keyboard::KeyCode::ArrowDown => {
+                if history_next(&mut shell.line, &mut shell.len, &mut shell.history_nav) {
+                    redraw_serial_line(shell);
+                }
+            }
+            _ => {}
+        }
         return;
     }
 
@@ -262,11 +453,7 @@ fn process_keyboard_event(event: keyboard::KeyEvent) {
         return;
     }
 
-    if event.pressed {
-        let _ = doom::inject_key(byte);
-    } else {
-        let _ = doom::inject_key_release(byte);
-    }
+    let _ = doom::inject_key(byte);
 }
 
 fn map_doom_capture_key(code: keyboard::KeyCode) -> Option<u8> {
@@ -341,6 +528,9 @@ fn process_byte(byte: u8) {
         shell.refresh_serial_capture_key(byte, time::ticks());
         return;
     }
+    if handle_serial_escape(shell, byte) {
+        return;
+    }
     match byte {
         b'\n' | b'\r' => {
             serial::write_str("\n");
@@ -352,12 +542,29 @@ fn process_byte(byte: u8) {
         }
         0x08 | 0x7f => {
             if shell.len > 0 {
+                history_cancel(&mut shell.history_nav);
                 shell.len -= 1;
                 serial::write_str("\x08 \x08");
             }
         }
+        b'\t' => {
+            history_cancel(&mut shell.history_nav);
+            let cwd = String::from(shell.cwd());
+            match complete_command_line(&mut shell.line, &mut shell.len, cwd.as_str()) {
+                CompletionOutcome::None => {}
+                CompletionOutcome::Updated => redraw_serial_line(shell),
+                CompletionOutcome::Listed(listing) => {
+                    serial::write_str("\n");
+                    serial::write_str(listing.as_str());
+                    serial::write_str("\n");
+                    print_prompt();
+                    write_serial_line_bytes(&shell.line[..shell.len]);
+                }
+            }
+        }
         0x20..=0x7e => {
             if shell.len < MAX_LINE_LEN.saturating_sub(1) {
+                history_cancel(&mut shell.history_nav);
                 shell.line[shell.len] = byte;
                 shell.len += 1;
                 serial::write_byte(byte);
@@ -404,6 +611,7 @@ fn run_command(shell: &mut ShellState) {
             return;
         }
     };
+    record_command_in_history(&input_owned);
     if input_owned == "symlink" {
         serial::write_line("usage: symlink <target> <linkpath>");
         return;
@@ -425,7 +633,7 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
     if input == "cd" {
-        shell.set_cwd("/");
+        shell.set_cwd(default_working_directory());
         refresh_file_manager_list_view();
         return;
     }
@@ -453,48 +661,36 @@ fn run_command(shell: &mut ShellState) {
         return;
     }
 
-    if input == "ls /bin" || input == "/bin/ls /bin" {
-        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, "/bin"]) {
-            Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
-                return;
-            }
-            Ok(None) => {}
-            Err(()) => return,
-        }
-        with_shell_bin_process(SERIAL_BIN_LS, run_shell_bin_dir_listing);
-        return;
-    }
-    if input == "ls" || input == SERIAL_BIN_LS {
-        let cwd = String::from(shell.cwd());
-        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, cwd.as_str()]) {
-            Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
-                return;
-            }
-            Ok(None) => {}
-            Err(()) => return,
-        }
-        with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&cwd, pid));
-        return;
-    }
-    if let Some(path) = input
-        .strip_prefix("ls ")
-        .or_else(|| input.strip_prefix("/bin/ls "))
-    {
-        let path = path.trim();
-        if path.is_empty() {
-            serial::write_line("usage: ls [<path>]");
-            return;
-        }
-        let resolved = match shell.resolve_path(path) {
-            Ok(path) => path,
-            Err(err) => {
-                serial::write_fmt(format_args!("ls: {} ({})\n", path, err.as_str()));
+    if let Some(parsed) = parse_ls_command(input) {
+        let (options, path) = match parsed {
+            Ok(parsed) => parsed,
+            Err(usage) => {
+                serial::write_line(usage);
                 return;
             }
         };
-        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &[SERIAL_BIN_LS, resolved.as_str()]) {
+        let target = match path {
+            Some(path) => match shell.resolve_path(path) {
+                Ok(path) => path,
+                Err(err) => {
+                    serial::write_fmt(format_args!("ls: {} ({})\n", path, err.as_str()));
+                    return;
+                }
+            },
+            None => String::from(shell.cwd()),
+        };
+        let mut option_buf = [0u8; 5];
+        let option_arg = render_ls_option_arg(options, &mut option_buf);
+        let mut argv = [SERIAL_BIN_LS, "", ""];
+        let mut argc = 1usize;
+        if let Some(option_arg) = option_arg {
+            argv[argc] = option_arg;
+            argc += 1;
+        }
+        argv[argc] = target.as_str();
+        argc += 1;
+
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &argv[..argc]) {
             Ok(Some(pid)) => {
                 shell.waiting_vfs_pid = Some(pid);
                 return;
@@ -502,7 +698,11 @@ fn run_command(shell: &mut ShellState) {
             Ok(None) => {}
             Err(()) => return,
         }
-        with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&resolved, pid));
+        if options.any() {
+            serial::write_line("ls: flags require ring3 /bin/ls support");
+            return;
+        }
+        with_shell_bin_process(SERIAL_BIN_LS, |pid| run_shell_ls_command(&target, pid));
         return;
     }
 
@@ -1008,7 +1208,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | netstat | ifconfig | route | arp | ss | nc <host> <port> | ip [addr|link|route] | sync | reload | watch on | watch off | /bin/ls [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath> | /bin/netstat | /bin/ifconfig | /bin/route | /bin/arp | /bin/ss | /bin/nc <host> <port> | /bin/ip [addr|link|route]",
+                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [-als] [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | netstat | ifconfig | route | arp | ss | nc <host> <port> | ip [addr|link|route] | sync | reload | watch on | watch off | /bin/ls [-als] [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath> | /bin/netstat | /bin/ifconfig | /bin/route | /bin/arp | /bin/ss | /bin/nc <host> <port> | /bin/ip [addr|link|route]",
             );
         }
         "version" => {
@@ -1550,21 +1750,6 @@ fn run_shell_ls_command(path: &str, current_pid: Option<u32>) {
     refresh_file_manager_list_view();
 }
 
-fn run_shell_bin_dir_listing(current_pid: Option<u32>) {
-    let mut entries = [fs::VfsDirEntry::empty(); 32];
-    let count = match fs::list_dir("/bin", &mut entries, current_pid) {
-        Ok(count) => count,
-        Err(err) => {
-            serial::write_fmt(format_args!("ls: /bin ({})\n", err.as_str()));
-            return;
-        }
-    };
-    serial::write_fmt(format_args!("ls: entries={} path=/bin\n", count));
-    for entry in entries.iter().take(count) {
-        serial::write_fmt(format_args!("/bin/{} (exec)\n", entry.name_str()));
-    }
-}
-
 fn run_shell_symlink_command(shell: &ShellState, rest: &str) {
     match parse_two_args(rest) {
         Some((target, link_path)) => {
@@ -1683,6 +1868,455 @@ fn current_shell_cwd() -> String {
     String::from(shell.cwd())
 }
 
+pub(crate) fn default_working_directory() -> &'static str {
+    DEFAULT_HOME_DIR
+}
+
+fn load_command_history() {
+    // SAFETY: history state is accessed only on the main loop thread.
+    let history = unsafe { &mut *COMMAND_HISTORY.0.get() };
+    history.load_from_fs();
+}
+
+pub(crate) fn record_command_in_history(command: &str) {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // SAFETY: history state is accessed only on the main loop thread.
+    let history = unsafe { &mut *COMMAND_HISTORY.0.get() };
+    history.append_command(trimmed);
+    if let Err(err) = history.persist_to_fs() {
+        serial::write_fmt(format_args!("history: persist failed ({})\n", err.as_str()));
+    }
+}
+
+pub(crate) fn history_cancel(nav: &mut HistoryBrowseState) {
+    *nav = HistoryBrowseState::new();
+}
+
+fn set_editor_line(line: &mut [u8], len: &mut usize, bytes: &[u8]) {
+    let copy_len = bytes.len().min(line.len().saturating_sub(1));
+    line[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    line[copy_len..].fill(0);
+    *len = copy_len;
+}
+
+pub(crate) fn history_previous(
+    line: &mut [u8],
+    len: &mut usize,
+    nav: &mut HistoryBrowseState,
+) -> bool {
+    // SAFETY: history state is accessed only on the main loop thread.
+    let history = unsafe { &*COMMAND_HISTORY.0.get() };
+    if history.count == 0 {
+        return false;
+    }
+
+    if !nav.active {
+        nav.remember_current_line(line, *len);
+        nav.history_index = history.count - 1;
+        nav.active = true;
+    } else if nav.history_index > 0 {
+        nav.history_index -= 1;
+    }
+
+    if let Some(entry) = history.entry(nav.history_index) {
+        set_editor_line(line, len, entry);
+        return true;
+    }
+    false
+}
+
+pub(crate) fn history_next(line: &mut [u8], len: &mut usize, nav: &mut HistoryBrowseState) -> bool {
+    if !nav.active {
+        return false;
+    }
+
+    // SAFETY: history state is accessed only on the main loop thread.
+    let history = unsafe { &*COMMAND_HISTORY.0.get() };
+    if nav.history_index + 1 < history.count {
+        nav.history_index += 1;
+        if let Some(entry) = history.entry(nav.history_index) {
+            set_editor_line(line, len, entry);
+            return true;
+        }
+        return false;
+    }
+
+    set_editor_line(line, len, &nav.saved_line[..nav.saved_len]);
+    *nav = HistoryBrowseState::new();
+    true
+}
+
+pub(crate) enum CompletionOutcome {
+    None,
+    Updated,
+    Listed(String),
+}
+
+#[derive(Clone, Copy)]
+struct LsOptions {
+    all: bool,
+    long: bool,
+    blocks: bool,
+}
+
+impl LsOptions {
+    const fn empty() -> Self {
+        Self {
+            all: false,
+            long: false,
+            blocks: false,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.all || self.long || self.blocks
+    }
+}
+
+pub(crate) fn complete_command_line(
+    line: &mut [u8],
+    len: &mut usize,
+    cwd: &str,
+) -> CompletionOutcome {
+    let Ok(input) = str::from_utf8(&line[..*len]) else {
+        return CompletionOutcome::None;
+    };
+    let input = String::from(input);
+    let input = input.as_str();
+    if input.is_empty() {
+        return CompletionOutcome::None;
+    }
+
+    if let Some(outcome) = complete_path_token(line, len, input, cwd) {
+        return outcome;
+    }
+    if input.starts_with('.') || input.contains('/') || input.chars().any(char::is_whitespace) {
+        return CompletionOutcome::None;
+    }
+
+    let (prefix, explicit_bin) = if let Some(rest) = input.strip_prefix("/bin/") {
+        (rest, true)
+    } else if input.starts_with('/') {
+        return CompletionOutcome::None;
+    } else {
+        (input, false)
+    };
+    if prefix.is_empty() {
+        return CompletionOutcome::None;
+    }
+
+    let mut entries = [fs::VfsDirEntry::empty(); COMPLETION_MATCH_LIMIT];
+    let count = match fs::list_dir("/bin", &mut entries, None) {
+        Ok(count) => count,
+        Err(_) => return CompletionOutcome::None,
+    };
+
+    let mut matches = [usize::MAX; COMPLETION_MATCH_LIMIT];
+    let mut match_count = 0usize;
+    for (index, entry) in entries.iter().take(count).enumerate() {
+        if entry.name_str().starts_with(prefix) {
+            if match_count >= matches.len() {
+                break;
+            }
+            matches[match_count] = index;
+            match_count += 1;
+        }
+    }
+    if match_count == 0 {
+        return CompletionOutcome::None;
+    }
+
+    for left in 0..match_count {
+        for right in (left + 1)..match_count {
+            if entries[matches[right]].name_str() < entries[matches[left]].name_str() {
+                matches.swap(left, right);
+            }
+        }
+    }
+
+    let mut common_prefix_len = entries[matches[0]].name_str().len();
+    for slot in matches.iter().take(match_count).skip(1) {
+        let name = entries[*slot].name_str().as_bytes();
+        let common = entries[matches[0]]
+            .name_str()
+            .as_bytes()
+            .iter()
+            .zip(name.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common_prefix_len = common_prefix_len.min(common);
+    }
+
+    if match_count == 1 {
+        let prefix = if explicit_bin { "/bin/" } else { "" };
+        write_completion_into_line(
+            line,
+            len,
+            prefix,
+            entries[matches[0]].name_str(),
+            Some(b' '),
+        );
+        return CompletionOutcome::Updated;
+    }
+
+    if common_prefix_len > prefix.len() {
+        let shared = &entries[matches[0]].name_str()[..common_prefix_len];
+        let prefix = if explicit_bin { "/bin/" } else { "" };
+        write_completion_into_line(line, len, prefix, shared, None);
+        return CompletionOutcome::Updated;
+    }
+
+    let mut listing = String::new();
+    for (index, slot) in matches.iter().take(match_count).enumerate() {
+        if index > 0 {
+            if index % 4 == 0 {
+                listing.push('\n');
+            } else {
+                listing.push_str("  ");
+            }
+        }
+        listing.push_str(entries[*slot].name_str());
+    }
+    CompletionOutcome::Listed(listing)
+}
+
+fn complete_path_token(
+    line: &mut [u8],
+    len: &mut usize,
+    input: &str,
+    cwd: &str,
+) -> Option<CompletionOutcome> {
+    let token_start = completion_token_start(input);
+    let token = &input[token_start..];
+    if token_start == 0 && !input.starts_with('.') && !input.contains('/') {
+        return None;
+    }
+
+    let before = &input[..token_start];
+    let (raw_dir_prefix, dir_input, name_prefix) = match token.rfind('/') {
+        Some(index) => (&token[..index + 1], &token[..index], &token[index + 1..]),
+        None => ("", "", token),
+    };
+
+    let list_path = if raw_dir_prefix.is_empty() {
+        String::from(cwd)
+    } else {
+        let resolve_input = if token.starts_with('/') && dir_input.is_empty() {
+            "/"
+        } else {
+            dir_input
+        };
+        match fs::resolve_path_from(cwd, resolve_input) {
+            Ok(path) => path,
+            Err(_) => return Some(CompletionOutcome::None),
+        }
+    };
+
+    let mut entries = [fs::VfsDirEntry::empty(); COMPLETION_MATCH_LIMIT];
+    let count = match fs::list_dir(&list_path, &mut entries, proc::shell_pid()) {
+        Ok(count) => count,
+        Err(_) => return Some(CompletionOutcome::None),
+    };
+
+    let include_hidden = name_prefix.starts_with('.');
+    let mut matches = [usize::MAX; COMPLETION_MATCH_LIMIT];
+    let mut match_count = 0usize;
+    for (index, entry) in entries.iter().take(count).enumerate() {
+        let name = entry.name_str();
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
+        if name.starts_with(name_prefix) {
+            if match_count >= matches.len() {
+                break;
+            }
+            matches[match_count] = index;
+            match_count += 1;
+        }
+    }
+    if match_count == 0 {
+        return Some(CompletionOutcome::None);
+    }
+
+    sort_completion_matches(&entries, &mut matches, match_count);
+    let common_prefix_len = common_completion_prefix_len(&entries, &matches, match_count);
+
+    if match_count == 1 {
+        let entry = &entries[matches[0]];
+        let delimiter = if entry.file_type == fs::FileType::Directory {
+            Some(b'/')
+        } else {
+            Some(b' ')
+        };
+        let mut prefix = String::from(before);
+        prefix.push_str(raw_dir_prefix);
+        write_completion_into_line(line, len, prefix.as_str(), entry.name_str(), delimiter);
+        return Some(CompletionOutcome::Updated);
+    }
+
+    if common_prefix_len > name_prefix.len() {
+        let shared = &entries[matches[0]].name_str()[..common_prefix_len];
+        let mut prefix = String::from(before);
+        prefix.push_str(raw_dir_prefix);
+        write_completion_into_line(line, len, prefix.as_str(), shared, None);
+        return Some(CompletionOutcome::Updated);
+    }
+
+    let mut listing = String::new();
+    for (index, slot) in matches.iter().take(match_count).enumerate() {
+        if index > 0 {
+            if index % 4 == 0 {
+                listing.push('\n');
+            } else {
+                listing.push_str("  ");
+            }
+        }
+        if !raw_dir_prefix.is_empty() {
+            listing.push_str(raw_dir_prefix);
+        }
+        let entry = &entries[*slot];
+        listing.push_str(entry.name_str());
+        if entry.file_type == fs::FileType::Directory {
+            listing.push('/');
+        }
+    }
+    Some(CompletionOutcome::Listed(listing))
+}
+
+fn completion_token_start(input: &str) -> usize {
+    input
+        .rfind(|ch: char| ch.is_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn sort_completion_matches(
+    entries: &[fs::VfsDirEntry; COMPLETION_MATCH_LIMIT],
+    matches: &mut [usize; COMPLETION_MATCH_LIMIT],
+    match_count: usize,
+) {
+    for left in 0..match_count {
+        for right in (left + 1)..match_count {
+            if entries[matches[right]].name_str() < entries[matches[left]].name_str() {
+                matches.swap(left, right);
+            }
+        }
+    }
+}
+
+fn common_completion_prefix_len(
+    entries: &[fs::VfsDirEntry; COMPLETION_MATCH_LIMIT],
+    matches: &[usize; COMPLETION_MATCH_LIMIT],
+    match_count: usize,
+) -> usize {
+    let mut common_prefix_len = entries[matches[0]].name_str().len();
+    for slot in matches.iter().take(match_count).skip(1) {
+        let name = entries[*slot].name_str().as_bytes();
+        let common = entries[matches[0]]
+            .name_str()
+            .as_bytes()
+            .iter()
+            .zip(name.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common_prefix_len = common_prefix_len.min(common);
+    }
+    common_prefix_len
+}
+
+fn write_completion_into_line(
+    line: &mut [u8],
+    len: &mut usize,
+    prefix: &str,
+    suffix: &str,
+    trailing_byte: Option<u8>,
+) {
+    let available_for_prefix = line.len().saturating_sub(1);
+    let prefix_bytes = prefix.as_bytes();
+    let prefix_len = prefix_bytes.len().min(available_for_prefix);
+    line[..prefix_len].copy_from_slice(&prefix_bytes[..prefix_len]);
+    let mut used = prefix_len;
+
+    let available = line.len().saturating_sub(1).saturating_sub(used);
+    let suffix_bytes = suffix.as_bytes();
+    let copy_len = suffix_bytes.len().min(available);
+    line[used..used + copy_len].copy_from_slice(&suffix_bytes[..copy_len]);
+    used += copy_len;
+
+    if let Some(byte) = trailing_byte
+        && used < line.len().saturating_sub(1)
+    {
+        line[used] = byte;
+        used += 1;
+    }
+
+    line[used..].fill(0);
+    *len = used;
+}
+
+fn handle_serial_escape(shell: &mut ShellState, byte: u8) -> bool {
+    match shell.serial_escape {
+        SerialEscapeState::None => {
+            if byte == 0x1b {
+                shell.serial_escape = SerialEscapeState::Esc;
+                return true;
+            }
+            false
+        }
+        SerialEscapeState::Esc => {
+            shell.serial_escape = if byte == b'[' {
+                SerialEscapeState::Csi
+            } else {
+                SerialEscapeState::None
+            };
+            true
+        }
+        SerialEscapeState::Csi => {
+            shell.serial_escape = SerialEscapeState::None;
+            match byte {
+                b'A' => {
+                    if history_previous(&mut shell.line, &mut shell.len, &mut shell.history_nav) {
+                        redraw_serial_line(shell);
+                    }
+                }
+                b'B' => {
+                    if history_next(&mut shell.line, &mut shell.len, &mut shell.history_nav) {
+                        redraw_serial_line(shell);
+                    }
+                }
+                _ => {}
+            }
+            true
+        }
+    }
+}
+
+fn write_prompt_prefix(cwd: &str) {
+    serial::write_fmt(format_args!("user@arrost {}> ", cwd));
+}
+
+fn write_serial_line_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        serial::write_byte(byte);
+    }
+}
+
+fn redraw_serial_line(shell: &ShellState) {
+    serial::write_str("\r");
+    write_prompt_prefix(shell.cwd());
+    write_serial_line_bytes(&shell.line[..shell.len]);
+    for _ in shell.len..MAX_LINE_LEN {
+        serial::write_byte(b' ');
+    }
+    serial::write_str("\r");
+    write_prompt_prefix(shell.cwd());
+    write_serial_line_bytes(&shell.line[..shell.len]);
+}
+
 fn parse_mode(input: &str) -> Option<u16> {
     let trimmed = input.trim();
     let mode = u16::from_str_radix(trimmed, 8).ok()?;
@@ -1690,6 +2324,69 @@ fn parse_mode(input: &str) -> Option<u16> {
         return None;
     }
     Some(mode)
+}
+
+fn parse_ls_command(input: &str) -> Option<Result<(LsOptions, Option<&str>), &'static str>> {
+    let rest = if input == "ls" || input == SERIAL_BIN_LS {
+        ""
+    } else if let Some(rest) = input.strip_prefix("ls ") {
+        rest
+    } else if let Some(rest) = input.strip_prefix("/bin/ls ") {
+        rest
+    } else {
+        return None;
+    };
+
+    let mut options = LsOptions::empty();
+    let mut path = None;
+    let mut parse_options = true;
+
+    for token in rest.split_whitespace() {
+        if parse_options && token == "--" {
+            parse_options = false;
+            continue;
+        }
+        if parse_options && token.starts_with('-') && token.len() > 1 {
+            for flag in token[1..].bytes() {
+                match flag {
+                    b'a' => options.all = true,
+                    b'l' => options.long = true,
+                    b's' => options.blocks = true,
+                    _ => return Some(Err("usage: ls [-als] [<path>]")),
+                }
+            }
+            continue;
+        }
+        if path.replace(token).is_some() {
+            return Some(Err("usage: ls [-als] [<path>]"));
+        }
+        parse_options = false;
+    }
+
+    Some(Ok((options, path)))
+}
+
+fn render_ls_option_arg<'a>(options: LsOptions, out: &'a mut [u8; 5]) -> Option<&'a str> {
+    if !options.any() {
+        return None;
+    }
+
+    let mut used = 0usize;
+    out[used] = b'-';
+    used += 1;
+    if options.all {
+        out[used] = b'a';
+        used += 1;
+    }
+    if options.long {
+        out[used] = b'l';
+        used += 1;
+    }
+    if options.blocks {
+        out[used] = b's';
+        used += 1;
+    }
+    str::from_utf8(&out[..used]).ok()
 }
 
 fn normalize_shell_bin_command(input: &str) -> String {
@@ -2053,5 +2750,5 @@ fn refresh_file_manager_preview_view(path: &str, bytes: &[u8]) {
 fn print_prompt() {
     // SAFETY: shell state is read on the main loop thread.
     let shell = unsafe { &*SHELL_STATE.0.get() };
-    serial::write_fmt(format_args!("user@arrost {}> ", shell.cwd()));
+    write_prompt_prefix(shell.cwd());
 }

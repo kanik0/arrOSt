@@ -64,6 +64,8 @@ pub const BIN_EXEC_PATHS: [&str; 18] = [
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
+const DEFAULT_HOME_DIRS: [&str; 2] = ["/home", "/home/user"];
+const DEFAULT_HISTORY_PATH: &str = "/home/user/.history";
 
 #[derive(Clone, Copy)]
 pub struct BinCommand<'a> {
@@ -133,8 +135,16 @@ pub struct Stat {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum OpenFile {
-    File { mount: MountKind, ino: InodeNum },
+    File {
+        mount: MountKind,
+        ino: InodeNum,
+    },
     Proc(ProcOpenFile),
+    ProcDir {
+        path: [u8; MAX_OPEN_PATH_BYTES],
+        path_len: usize,
+        current_pid: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1291,7 +1301,14 @@ impl FsState {
             Ok(ResolvedPath::Inode(node)) => {
                 let stat = self.inode_stat(node)?;
                 if stat.file_type == FileType::Directory {
-                    return Err(FsError::IsADirectory);
+                    if access != O_RDONLY {
+                        return Err(FsError::IsADirectory);
+                    }
+                    require_inode_permission(identity, &stat, 0o4)?;
+                    return Ok(OpenFile::File {
+                        mount: node.mount,
+                        ino: node.ino,
+                    });
                 }
                 let required = match access {
                     O_RDONLY => 0o4,
@@ -1316,9 +1333,27 @@ impl FsState {
             }
             Ok(ResolvedPath::Proc(canonical)) => {
                 let resolved = resolve_mount(&canonical);
-                self.procfs
-                    .open_file(resolved.local_path(), self.procfs_context(current_pid))
-                    .map(OpenFile::Proc)
+                let local_path = resolved.local_path();
+                let ctx = self.procfs_context(current_pid);
+                match self.procfs.open_file(local_path, ctx) {
+                    Ok(file) => Ok(OpenFile::Proc(file)),
+                    Err(FsError::IsADirectory) => {
+                        if access != O_RDONLY {
+                            return Err(FsError::IsADirectory);
+                        }
+                        let stat = self.procfs.stat_path(local_path, ctx)?;
+                        if stat.file_type != FileType::Directory {
+                            return Err(FsError::IsADirectory);
+                        }
+                        let (path, path_len) = copy_open_path_bytes(local_path)?;
+                        Ok(OpenFile::ProcDir {
+                            path,
+                            path_len,
+                            current_pid,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Err(FsError::NotFound) if (flags & O_CREAT) != 0 => {
                 let canonical = canonicalize(path)?;
@@ -1375,6 +1410,7 @@ impl FsState {
                 Ok(read)
             }
             OpenFile::Proc(file) => self.proc_generated_read(file, offset, out),
+            OpenFile::ProcDir { .. } => Err(FsError::IsADirectory),
         }
     }
 
@@ -1394,6 +1430,7 @@ impl FsState {
                 MountKind::Proc => Err(FsError::ReadOnly),
             },
             OpenFile::Proc(_) => Err(FsError::ReadOnly),
+            OpenFile::ProcDir { .. } => Err(FsError::ReadOnly),
         }
     }
 
@@ -1408,6 +1445,14 @@ impl FsState {
                 MountKind::Proc => Err(FsError::InvalidPath),
             },
             OpenFile::Proc(file) => self.proc_generated_stat(file),
+            OpenFile::ProcDir {
+                path,
+                path_len,
+                current_pid,
+            } => self.procfs.stat_path(
+                proc_dir_path(&path, path_len),
+                self.procfs_context(current_pid),
+            ),
         }
     }
 
@@ -1436,6 +1481,15 @@ impl FsState {
                 }
             }
             OpenFile::Proc(_) => Err(FsError::NotADirectory),
+            OpenFile::ProcDir {
+                path,
+                path_len,
+                current_pid,
+            } => self.procfs.readdir(
+                proc_dir_path(&path, path_len),
+                self.procfs_context(current_pid),
+                out,
+            ),
         }
     }
 
@@ -1448,6 +1502,7 @@ impl FsState {
             .ramfs
             .write("/MILESTONE.TXT", b"M2: inode-based diskfs-v2\n");
         self.ensure_builtin_bins();
+        self.ensure_default_home_tree();
     }
 
     fn seed_defaults_diskfs(&mut self) {
@@ -1462,6 +1517,7 @@ impl FsState {
             b"M2: inode-based diskfs-v2\n",
         );
         self.ensure_builtin_bins();
+        self.ensure_default_home_tree();
         let _ = self.diskfs_v2.sync_metadata();
     }
 
@@ -1485,6 +1541,48 @@ impl FsState {
                     err.as_str()
                 ));
             }
+        }
+    }
+
+    fn ensure_default_home_tree(&mut self) {
+        for path in DEFAULT_HOME_DIRS {
+            match self.mkdir_path(path, 0o755, None) {
+                Ok(()) | Err(FsError::AlreadyExists) => {}
+                Err(err) => {
+                    serial::write_fmt(format_args!(
+                        "FS: seed {} mkdir failed ({})\n",
+                        path,
+                        err.as_str()
+                    ));
+                    return;
+                }
+            }
+        }
+
+        match self.stat_path(DEFAULT_HISTORY_PATH, None) {
+            Ok(_) => {}
+            Err(FsError::NotFound) => {
+                if let Err(err) = self.write_path(DEFAULT_HISTORY_PATH, b"") {
+                    serial::write_fmt(format_args!(
+                        "FS: seed {} failed ({})\n",
+                        DEFAULT_HISTORY_PATH,
+                        err.as_str()
+                    ));
+                    return;
+                }
+                if let Err(err) = self.chmod_path(DEFAULT_HISTORY_PATH, 0o644, None) {
+                    serial::write_fmt(format_args!(
+                        "FS: chmod {} failed ({})\n",
+                        DEFAULT_HISTORY_PATH,
+                        err.as_str()
+                    ));
+                }
+            }
+            Err(err) => serial::write_fmt(format_args!(
+                "FS: stat {} failed ({})\n",
+                DEFAULT_HISTORY_PATH,
+                err.as_str()
+            )),
         }
     }
 
@@ -2315,6 +2413,20 @@ fn write_inode_file(
         return Err(FsError::FileTooLarge);
     };
     vfs.write_data(ino, offset, data)
+}
+
+fn copy_open_path_bytes(path: &str) -> Result<([u8; MAX_OPEN_PATH_BYTES], usize), FsError> {
+    if path.len() > MAX_OPEN_PATH_BYTES {
+        return Err(FsError::InvalidPath);
+    }
+    let mut out = [0u8; MAX_OPEN_PATH_BYTES];
+    let len = path.len();
+    out[..len].copy_from_slice(path.as_bytes());
+    Ok((out, len))
+}
+
+fn proc_dir_path(path: &[u8; MAX_OPEN_PATH_BYTES], path_len: usize) -> &str {
+    core::str::from_utf8(&path[..path_len.min(path.len())]).unwrap_or("")
 }
 
 struct SpinLock {

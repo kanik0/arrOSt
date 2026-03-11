@@ -1533,7 +1533,12 @@ fn smoke_proc_caps_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         wait_for_log(
             &log,
             "[init] caps smoke: PASS",
@@ -1649,7 +1654,12 @@ fn smoke_proc_spawn_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         wait_for_log(
             &log,
             "[init] spawn/wait smoke: PASS",
@@ -1944,7 +1954,12 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         wait_for_log(
             &log,
             "mount: / type=",
@@ -1981,24 +1996,15 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
             .context("failed to capture qemu stdin")?;
 
         send_serial_command(stdin, "ls /bin\n")?;
+        thread::sleep(Duration::from_millis(250));
+        let bin_snapshot = snapshot_log(&log);
+        let bin_lines = lines_after_matching_until_prompt(&bin_snapshot, "ls /bin");
         for marker in [
-            "/bin/ls (exec)",
-            "/bin/ps (exec)",
-            "/bin/kill (exec)",
-            "/bin/cat (exec)",
-            "/bin/echo (exec)",
-            "/bin/fm (exec)",
-            "/bin/doom (exec)",
-            "/bin/terminal (exec)",
-            "/bin/link (exec)",
-            "/bin/symlink (exec)",
+            "ls", "ps", "kill", "cat", "echo", "fm", "doom", "terminal", "link", "symlink",
         ] {
-            wait_for_log(
-                &log,
-                marker,
-                Duration::from_secs(8),
-                "virtual /bin listing output",
-            )?;
+            if !bin_lines.iter().any(|line| *line == marker) {
+                bail!("missing `{marker}` in ls /bin output: {bin_lines:?}");
+            }
         }
 
         send_serial_command(stdin, "ps\n")?;
@@ -2037,14 +2043,13 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         )?;
 
         send_serial_command(stdin, "ls /proc\n")?;
-        wait_for_log(
-            &log,
-            "path=/proc",
-            Duration::from_secs(8),
-            "procfs listing header",
-        )?;
-        for marker in ["self/", "mounts", "uptime"] {
-            wait_for_log(&log, marker, Duration::from_secs(8), "procfs listing entry")?;
+        thread::sleep(Duration::from_millis(250));
+        let proc_snapshot = snapshot_log(&log);
+        let proc_lines = lines_after_matching_until_prompt(&proc_snapshot, "ls /proc");
+        for marker in ["self", "mounts", "uptime"] {
+            if !proc_lines.iter().any(|line| *line == marker) {
+                bail!("missing `{marker}` in ls /proc output: {proc_lines:?}");
+            }
         }
 
         send_serial_command(stdin, "cat /proc/self/pid\n")?;
@@ -2289,7 +2294,7 @@ fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {
         }
         wait_for_log(
             &log,
-            "arrost /",
+            "arrost /home/user",
             Duration::from_secs(6),
             "shell prompt before doom kill",
         )?;
@@ -2458,7 +2463,12 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         let stdin = child
             .stdin
             .as_mut()
@@ -2524,24 +2534,14 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
 
         // Verify /bin/netstat is in ls /bin output
         send_serial_command(stdin, "ls /bin\n")?;
-        wait_for_log(
-            &log,
-            "/bin/netstat (exec)",
-            Duration::from_secs(8),
-            "/bin/netstat in ls /bin",
-        )?;
-        wait_for_log(
-            &log,
-            "/bin/ifconfig (exec)",
-            Duration::from_secs(8),
-            "/bin/ifconfig in ls /bin",
-        )?;
-        wait_for_log(
-            &log,
-            "/bin/ip (exec)",
-            Duration::from_secs(8),
-            "/bin/ip in ls /bin",
-        )?;
+        thread::sleep(Duration::from_millis(250));
+        let ls_snapshot = snapshot_log(&log);
+        let ls_lines = lines_after_matching_until_prompt(&ls_snapshot, "ls /bin");
+        for marker in ["netstat", "ifconfig", "ip"] {
+            if !ls_lines.iter().any(|line| *line == marker) {
+                bail!("missing `{marker}` in ls /bin output: {ls_lines:?}");
+            }
+        }
 
         Ok(())
     })();
@@ -2638,7 +2638,12 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         let stdin = child
             .stdin
             .as_mut()
@@ -2648,10 +2653,29 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         wait_for_line_after(
             &log,
             "pwd",
-            "/",
+            "/home/user",
             Duration::from_secs(8),
             "initial pwd output",
         )?;
+
+        send_serial_command(stdin, "ls -a\n")?;
+        thread::sleep(Duration::from_millis(250));
+        let home_snapshot = snapshot_log(&log);
+        let home_lines = lines_after_matching_until_prompt(&home_snapshot, "ls -a");
+        if !home_lines.iter().any(|line| *line == ".history") {
+            bail!("expected .history in ls -a output, got {home_lines:?}");
+        }
+
+        send_serial_command(stdin, "ls -lsa\n")?;
+        thread::sleep(Duration::from_millis(250));
+        let long_snapshot = snapshot_log(&log);
+        let long_lines = lines_after_matching_until_prompt(&long_snapshot, "ls -lsa");
+        if !long_lines.iter().any(|line| line.starts_with("total ")) {
+            bail!("expected total line in ls -lsa output, got {long_lines:?}");
+        }
+        if !long_lines.iter().any(|line| line.contains(".history")) {
+            bail!("expected .history in ls -lsa output, got {long_lines:?}");
+        }
 
         send_serial_command(stdin, "cd /bin\n")?;
         wait_for_log(&log, "cd /bin", Duration::from_secs(8), "cd /bin echo")?;
@@ -2664,25 +2688,23 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
             "pwd after cd /bin",
         )?;
 
-        send_serial_command(stdin, "ls\n")?;
+        send_serial_command(stdin, "sy\t\n")?;
         wait_for_log(
             &log,
-            "ls: entries=",
+            "usage: symlink <target> <linkpath>",
             Duration::from_secs(8),
-            "ls in /bin header",
+            "tab completion symlink usage",
         )?;
+
+        send_serial_command(stdin, "ls -ls\n")?;
+        thread::sleep(Duration::from_millis(250));
         let ls_bin_snapshot = snapshot_log(&log);
-        let Some(ls_bin_header) = last_matching_line(&ls_bin_snapshot, "ls: entries=") else {
-            bail!("missing ls output header for /bin");
-        };
-        if !ls_bin_header.contains("path=/bin") {
-            bail!("expected ls header for /bin, got `{ls_bin_header}`");
+        let ls_bin_lines = lines_after_matching_until_prompt(&ls_bin_snapshot, "ls -ls");
+        if !ls_bin_lines.iter().any(|line| line.starts_with("total ")) {
+            bail!("expected total line in ls -ls output, got {ls_bin_lines:?}");
         }
-        let Some(first_bin_entry) = line_after_matching(&ls_bin_snapshot, "ls: entries=") else {
-            bail!("missing ls output entry for /bin");
-        };
-        if first_bin_entry.trim() != "ls" {
-            bail!("expected first /bin entry to be `ls`, got `{first_bin_entry}`");
+        if !ls_bin_lines.iter().any(|line| line.contains("ls")) {
+            bail!("expected ls entry in ls -ls output, got {ls_bin_lines:?}");
         }
 
         send_serial_command(stdin, "cd ..\n")?;
@@ -2690,33 +2712,79 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "pwd\n")?;
         wait_for_line_after(&log, "pwd", "/", Duration::from_secs(8), "pwd after cd ..")?;
 
-        send_serial_command(stdin, "mkdir /home\n")?;
+        send_serial_command(stdin, "cd\n")?;
+        send_serial_command(stdin, "pwd\n")?;
+        wait_for_line_after(
+            &log,
+            "pwd",
+            "/home/user",
+            Duration::from_secs(8),
+            "pwd after cd home",
+        )?;
+
+        send_serial_command(stdin, "echo test > file.txt\n")?;
         wait_for_log(
             &log,
-            "mkdir: /home mode=0o755",
+            "file.txt",
             Duration::from_secs(8),
-            "mkdir output",
+            "echo file.txt output",
         )?;
-        send_serial_command(stdin, "echo test > /home/file.txt\n")?;
+        send_serial_command(stdin, "cat file.txt\n")?;
         wait_for_log(
             &log,
-            "/home/file.txt",
+            "file.txt",
             Duration::from_secs(8),
-            "echo /home/file.txt output",
+            "cat file.txt header",
         )?;
-        send_serial_command(stdin, "cat /home/file.txt\n")?;
+        wait_for_log(&log, "test", Duration::from_secs(8), "cat file.txt payload")?;
+
+        send_serial_command(stdin, "echo tab-smoke > lol.txt\n")?;
         wait_for_log(
             &log,
-            "/home/file.txt",
+            "lol.txt",
             Duration::from_secs(8),
-            "cat /home/file.txt header",
+            "echo lol.txt output",
+        )?;
+        send_serial_command(stdin, "cat lo\t\n")?;
+        wait_for_log(
+            &log,
+            "cat: /home/user/lol.txt",
+            Duration::from_secs(8),
+            "path completion cat header",
         )?;
         wait_for_log(
             &log,
-            "test",
+            "tab-smoke",
             Duration::from_secs(8),
-            "cat /home/file.txt payload",
+            "path completion cat payload",
         )?;
+
+        send_serial_command(stdin, "cat /home/user/.history\n")?;
+        wait_for_log(
+            &log,
+            "cat: /home/user/.history",
+            Duration::from_secs(8),
+            "history cat header",
+        )?;
+        thread::sleep(Duration::from_millis(250));
+        let history_snapshot = snapshot_log(&log);
+        let Some((_, history_output)) = history_snapshot.rsplit_once("cat: /home/user/.history")
+        else {
+            bail!("missing cat /home/user/.history output in log");
+        };
+        for marker in [
+            "pwd",
+            "ls -a",
+            "ls -lsa",
+            "cd /bin",
+            "symlink",
+            "echo test > file.txt",
+            "cat lol.txt",
+        ] {
+            if !history_output.lines().any(|line| line.trim() == marker) {
+                bail!("expected `{marker}` in history output: {history_output:?}");
+            }
+        }
 
         send_serial_command(stdin, "echo cache-smoke > /DCACHE.TXT\n")?;
         wait_for_log(
@@ -2728,7 +2796,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "cat /DCACHE.TXT\n")?;
         wait_for_log(
             &log,
-            "cat: 11 bytes from /DCACHE.TXT",
+            "cat: /DCACHE.TXT",
             Duration::from_secs(8),
             "DCACHE first cat header",
         )?;
@@ -2750,7 +2818,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "cat /DENTRYOLD.TXT\n")?;
         wait_for_log(
             &log,
-            "cat: 12 bytes from /DENTRYOLD.TXT",
+            "cat: /DENTRYOLD.TXT",
             Duration::from_secs(8),
             "DENTRYOLD first cat header",
         )?;
@@ -2784,7 +2852,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "cat /DENTRYNEW.TXT\n")?;
         wait_for_log(
             &log,
-            "cat: 12 bytes from /DENTRYNEW.TXT",
+            "cat: /DENTRYNEW.TXT",
             Duration::from_secs(8),
             "DENTRYNEW cat header",
         )?;
@@ -2799,7 +2867,7 @@ fn smoke_fs_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "cat /DENTRYUNLINK.TXT\n")?;
         wait_for_log(
             &log,
-            "cat: 12 bytes from /DENTRYUNLINK.TXT",
+            "cat: /DENTRYUNLINK.TXT",
             Duration::from_secs(8),
             "DENTRYUNLINK first cat header",
         )?;
@@ -3100,7 +3168,12 @@ fn smoke_ring3_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         let stdin = child
             .stdin
             .as_mut()
@@ -3263,7 +3336,12 @@ fn smoke_ring3_run_impl(arch: RuntimeArch) -> Result<()> {
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         let stdin = child
             .stdin
             .as_mut()
@@ -3490,7 +3568,7 @@ fn smoke_ring3_fault_impl(arch: RuntimeArch) -> Result<()> {
         )?;
         wait_for_log(
             &log,
-            "arrost /",
+            "arrost /home/user",
             Duration::from_secs(30),
             "shell prompt after fault fallback resume",
         )?;
@@ -3608,7 +3686,12 @@ fn smoke_doom_impl(
     let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
 
     let smoke_result = (|| -> Result<()> {
-        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        wait_for_log(
+            &log,
+            "arrost /home/user",
+            Duration::from_secs(40),
+            "shell prompt",
+        )?;
         let startup_snapshot = snapshot_log(&log);
         let software_accel_mode = startup_snapshot.contains("Using QEMU acceleration: tcg")
             || startup_snapshot.contains("Using QEMU acceleration: none");
@@ -4321,9 +4404,8 @@ fn wait_for_line_after(
     let deadline = Instant::now() + timeout;
     loop {
         let snapshot = snapshot_log(log);
-        if let Some(line) = line_after_matching(&snapshot, marker)
-            && line.trim() == expected_line
-        {
+        let lines = lines_after_matching_until_prompt(&snapshot, marker);
+        if lines.iter().any(|line| line.trim() == expected_line) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -4447,6 +4529,54 @@ fn line_after_matching<'a>(log: &'a str, marker: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn lines_after_matching_until_prompt<'a>(log: &'a str, marker: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = log.lines().collect();
+    for index in (0..lines.len()).rev() {
+        if command_line_matches_marker(lines[index], marker) {
+            let mut captured = Vec::new();
+            for line in lines.iter().skip(index + 1) {
+                let trimmed = line.trim();
+                if trimmed.starts_with("user@arrost ") {
+                    break;
+                }
+                if !trimmed.is_empty() {
+                    captured.push(trimmed);
+                }
+            }
+            return captured;
+        }
+    }
+    for index in (0..lines.len()).rev() {
+        if lines[index].contains(marker) {
+            let mut captured = Vec::new();
+            for line in lines.iter().skip(index + 1) {
+                let trimmed = line.trim();
+                if trimmed.starts_with("user@arrost ") {
+                    break;
+                }
+                if !trimmed.is_empty() {
+                    captured.push(trimmed);
+                }
+            }
+            return captured;
+        }
+    }
+    Vec::new()
+}
+
+fn command_line_matches_marker(line: &str, marker: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == marker {
+        return true;
+    }
+    if trimmed.starts_with("user@arrost ") {
+        let mut suffix = String::from("> ");
+        suffix.push_str(marker);
+        return trimmed.ends_with(suffix.as_str());
+    }
+    false
 }
 
 fn parse_metric_value(line: &str, key: &str) -> Option<u64> {

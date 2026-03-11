@@ -1,6 +1,7 @@
 use arrostd::runtime;
 use arrostd::syscall::errno;
 
+#[allow(dead_code)]
 static mut IO_BUFFER: [u8; 256] = [0; 256];
 static mut LINE_BUFFER: [u8; 256] = [0; 256];
 #[allow(dead_code)]
@@ -83,6 +84,7 @@ pub fn stable_path(path: &str) -> Option<&'static str> {
     Some(unsafe { core::str::from_utf8_unchecked(&buffer[..bytes.len()]) })
 }
 
+#[allow(dead_code)]
 pub fn open_and_copy_to_stdout(prefix: &str, path: &str) -> i32 {
     let fd = runtime::open_readonly(path);
     if fd < 0 {

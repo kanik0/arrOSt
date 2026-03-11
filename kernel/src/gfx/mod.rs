@@ -4,6 +4,7 @@ mod font;
 use crate::arch;
 use crate::doom;
 use crate::fs;
+use crate::keyboard;
 use crate::mouse;
 use crate::net;
 use crate::proc;
@@ -327,24 +328,29 @@ struct TerminalProcess {
     line_len: usize,
     cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
     cwd_len: usize,
+    history_nav: shell::HistoryBrowseState,
 }
 
 impl TerminalProcess {
-    const fn new(pid: u32, tty: u32) -> Self {
+    fn new(pid: u32, tty: u32) -> Self {
         let mut cwd = [0; fs::MAX_OPEN_PATH_BYTES];
-        cwd[0] = b'/';
+        let default_cwd = shell::default_working_directory().as_bytes();
+        let cwd_len = default_cwd.len().min(fs::MAX_OPEN_PATH_BYTES);
+        cwd[..cwd_len].copy_from_slice(&default_cwd[..cwd_len]);
         Self {
             pid,
             tty,
             line: [0; TERMINAL_LINE_MAX],
             line_len: 0,
             cwd,
-            cwd_len: 1,
+            cwd_len,
+            history_nav: shell::HistoryBrowseState::new(),
         }
     }
 
     fn clear_line(&mut self) {
         self.line_len = 0;
+        self.history_nav = shell::HistoryBrowseState::new();
     }
 
     fn cwd(&self) -> &str {
@@ -994,6 +1000,11 @@ impl GfxState {
         self.handle_key(byte)
     }
 
+    fn on_key_event(&mut self, event: keyboard::KeyEvent) -> bool {
+        self.events = self.events.saturating_add(1);
+        self.handle_key_event(event)
+    }
+
     fn process_events(&mut self) {
         while serial::pop_mirror_byte().is_some() {
             self.stdout_events = self.stdout_events.saturating_add(1);
@@ -1011,7 +1022,18 @@ impl GfxState {
 
     fn handle_key(&mut self, byte: u8) -> bool {
         if byte == b'\t' {
-            self.focus_next_internal();
+            let Some(index) = self.focused_terminal_window() else {
+                return false;
+            };
+            let line_len = self
+                .terminal_process_for_window(index)
+                .map(|process| process.line_len)
+                .unwrap_or(0);
+            if line_len == 0 {
+                self.focus_next_internal();
+            } else {
+                self.complete_terminal_input(index);
+            }
             if self.damage_len > 0 {
                 self.flush_damage();
             }
@@ -1026,6 +1048,107 @@ impl GfxState {
             self.flush_damage();
         }
         true
+    }
+
+    fn handle_key_event(&mut self, event: keyboard::KeyEvent) -> bool {
+        let Some(index) = self.focused_terminal_window() else {
+            return false;
+        };
+        match event.code {
+            keyboard::KeyCode::ArrowUp => {
+                if event.pressed {
+                    self.navigate_terminal_history(index, true);
+                }
+                if self.damage_len > 0 {
+                    self.flush_damage();
+                }
+                true
+            }
+            keyboard::KeyCode::ArrowDown => {
+                if event.pressed {
+                    self.navigate_terminal_history(index, false);
+                }
+                if self.damage_len > 0 {
+                    self.flush_damage();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn replace_terminal_input_line(&mut self, index: usize, previous_len: usize) {
+        let Some(process) = self.terminal_process_for_window(index).copied() else {
+            return;
+        };
+        for _ in 0..previous_len {
+            self.windows[index].append_byte(0x08);
+        }
+        for &byte in process.line[..process.line_len].iter() {
+            self.windows[index].append_byte(byte);
+        }
+        if self.damage_len > 0 {
+            self.flush_damage();
+        }
+    }
+
+    fn navigate_terminal_history(&mut self, index: usize, previous: bool) {
+        let mut old_len = 0usize;
+        let mut changed = false;
+        if let Some(process) = self.terminal_process_for_window_mut(index) {
+            old_len = process.line_len;
+            changed = if previous {
+                shell::history_previous(
+                    &mut process.line,
+                    &mut process.line_len,
+                    &mut process.history_nav,
+                )
+            } else {
+                shell::history_next(
+                    &mut process.line,
+                    &mut process.line_len,
+                    &mut process.history_nav,
+                )
+            };
+        }
+        if changed {
+            self.replace_terminal_input_line(index, old_len);
+            self.invalidate_window(index);
+        }
+    }
+
+    fn complete_terminal_input(&mut self, index: usize) {
+        let mut old_len = 0usize;
+        let mut outcome = shell::CompletionOutcome::None;
+        if let Some(process) = self.terminal_process_for_window_mut(index) {
+            old_len = process.line_len;
+            shell::history_cancel(&mut process.history_nav);
+            let cwd = String::from(process.cwd());
+            outcome = shell::complete_command_line(
+                &mut process.line,
+                &mut process.line_len,
+                cwd.as_str(),
+            );
+        }
+
+        match outcome {
+            shell::CompletionOutcome::None => {}
+            shell::CompletionOutcome::Updated => {
+                self.replace_terminal_input_line(index, old_len);
+                self.invalidate_window(index);
+            }
+            shell::CompletionOutcome::Listed(listing) => {
+                self.push_terminal_text(index, "\n");
+                self.push_terminal_text(index, listing.as_str());
+                self.push_terminal_text(index, "\n");
+                self.push_terminal_prompt(index);
+                if let Some(process) = self.terminal_process_for_window(index).copied() {
+                    let text =
+                        core::str::from_utf8(&process.line[..process.line_len]).unwrap_or("");
+                    self.push_terminal_text(index, text);
+                }
+            }
+        }
     }
 
     fn window_visible(&self, index: usize) -> bool {
@@ -1668,28 +1791,6 @@ impl GfxState {
         self.refresh_file_manager_list_view();
     }
 
-    fn run_terminal_bin_dir_listing(&mut self, index: usize) {
-        let mut entries = [fs::VfsDirEntry::empty(); 16];
-        let current_pid = self
-            .terminal_process_for_window(index)
-            .map(|process| process.pid);
-        let count = match fs::list_dir("/bin", &mut entries, current_pid) {
-            Ok(count) => count,
-            Err(err) => {
-                let mut line = String::new();
-                let _ = writeln!(line, "ls: /bin ({})", err.as_str());
-                self.push_terminal_text(index, &line);
-                return;
-            }
-        };
-        let mut text = String::new();
-        let _ = writeln!(text, "ls: entries={} path=/bin", count);
-        for entry in entries.iter().take(count) {
-            let _ = writeln!(text, "/bin/{} (exec)", entry.name_str());
-        }
-        self.push_terminal_text(index, &text);
-    }
-
     fn run_terminal_kill_command(&mut self, index: usize, pid: u32) {
         if self.kill_ui_process(pid) {
             self.push_terminal_text(index, "kill: ok\n");
@@ -1993,6 +2094,7 @@ impl GfxState {
                 if let Some(process) = self.terminal_processes[slot].as_mut()
                     && process.line_len > 0
                 {
+                    shell::history_cancel(&mut process.history_nav);
                     process.line_len -= 1;
                     changed = true;
                 }
@@ -2006,6 +2108,7 @@ impl GfxState {
                 if let Some(process) = self.terminal_processes[slot].as_mut()
                     && process.line_len < TERMINAL_LINE_MAX.saturating_sub(1)
                 {
+                    shell::history_cancel(&mut process.history_nav);
                     process.line[process.line_len] = byte;
                     process.line_len += 1;
                     accepted = true;
@@ -2024,6 +2127,7 @@ impl GfxState {
         if command.is_empty() {
             return true;
         }
+        shell::record_command_in_history(command);
         let normalized_command = normalize_terminal_bin_command(command);
         let command = normalized_command.as_str();
         if is_missing_terminal_bin_command(command) {
@@ -2034,7 +2138,7 @@ impl GfxState {
         if command == "help" {
             self.push_terminal_text(
                 index,
-                "help: help version ticks uptime pid tty pwd cd clear terminal ls [<path>] cat echo > stat chmod mkdir mv link symlink fm [list|cd|open|copy|delete] doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal link symlink)\n",
+                "help: help version ticks uptime pid tty pwd cd clear terminal ls [-als] [<path>] cat echo > stat chmod mkdir mv link symlink fm [list|cd|open|copy|delete] doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal link symlink)\n",
             );
             return true;
         }
@@ -2087,9 +2191,12 @@ impl GfxState {
             return true;
         }
         if command == "cd" {
-            let changed = self.set_terminal_cwd(index, "/");
+            let home = shell::default_working_directory();
+            let changed = self.set_terminal_cwd(index, home);
             if changed {
-                self.push_terminal_text(index, "cd: /\n");
+                let mut line = String::new();
+                let _ = writeln!(line, "cd: {}", home);
+                self.push_terminal_text(index, &line);
             }
             return true;
         }
@@ -2817,52 +2924,17 @@ impl GfxState {
             return true;
         }
 
-        if command == "ls /bin" || command == "/bin/ls /bin" {
-            if self
-                .try_launch_terminal_vfs_user_bin(
-                    index,
-                    TERMINAL_BIN_LS,
-                    &[TERMINAL_BIN_LS, "/bin"],
-                )
-                .is_some()
-            {
-                return true;
-            }
-            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                state.run_terminal_bin_dir_listing(index);
-            }) {
-                self.run_terminal_bin_dir_listing(index);
-            }
-            return true;
-        }
-        if command == "ls" || command == TERMINAL_BIN_LS {
-            let cwd = String::from(self.terminal_cwd(index).unwrap_or("/"));
-            if self
-                .try_launch_terminal_vfs_user_bin(
-                    index,
-                    TERMINAL_BIN_LS,
-                    &[TERMINAL_BIN_LS, cwd.as_str()],
-                )
-                .is_some()
-            {
-                return true;
-            }
-            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                state.run_terminal_ls_command(index, &cwd);
-            }) {
-                self.run_terminal_ls_command(index, &cwd);
-            }
-            return true;
-        }
-        if let Some(path) = command
-            .strip_prefix("ls ")
-            .or_else(|| command.strip_prefix("/bin/ls "))
-        {
-            let path = path.trim();
-            if path.is_empty() {
-                self.push_terminal_text(index, "usage: ls [<path>]\n");
-            } else {
-                let resolved = match self.resolve_terminal_path(index, path) {
+        if let Some(parsed) = parse_ls_command(command) {
+            let (options, path) = match parsed {
+                Ok(parsed) => parsed,
+                Err(usage) => {
+                    self.push_terminal_text(index, usage);
+                    self.push_terminal_text(index, "\n");
+                    return true;
+                }
+            };
+            let resolved = match path {
+                Some(path) => match self.resolve_terminal_path(index, path) {
                     Ok(path) => path,
                     Err(err) => {
                         let mut line = String::new();
@@ -2870,22 +2942,34 @@ impl GfxState {
                         self.push_terminal_text(index, &line);
                         return true;
                     }
-                };
-                if self
-                    .try_launch_terminal_vfs_user_bin(
-                        index,
-                        TERMINAL_BIN_LS,
-                        &[TERMINAL_BIN_LS, resolved.as_str()],
-                    )
-                    .is_some()
-                {
-                    return true;
-                }
-                if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
-                    state.run_terminal_ls_command(index, &resolved);
-                }) {
-                    self.run_terminal_ls_command(index, &resolved);
-                }
+                },
+                None => String::from(self.terminal_cwd(index).unwrap_or("/")),
+            };
+            let mut option_buf = [0u8; 5];
+            let option_arg = render_ls_option_arg(options, &mut option_buf);
+            let mut argv = [TERMINAL_BIN_LS, "", ""];
+            let mut argc = 1usize;
+            if let Some(option_arg) = option_arg {
+                argv[argc] = option_arg;
+                argc += 1;
+            }
+            argv[argc] = resolved.as_str();
+            argc += 1;
+
+            if self
+                .try_launch_terminal_vfs_user_bin(index, TERMINAL_BIN_LS, &argv[..argc])
+                .is_some()
+            {
+                return true;
+            }
+            if options.any() {
+                self.push_terminal_text(index, "ls: flags require ring3 /bin/ls support\n");
+                return true;
+            }
+            if !self.with_terminal_bin_process(index, TERMINAL_BIN_LS, |state| {
+                state.run_terminal_ls_command(index, &resolved);
+            }) {
+                self.run_terminal_ls_command(index, &resolved);
             }
             return true;
         }
@@ -4882,7 +4966,7 @@ impl GfxState {
                 .saturating_add(system_rect.w)
                 .saturating_add(14),
             9,
-            "ARR0ST M9 | apps/system | tab switches focus",
+            "ARR0ST M9 | apps/system | tab completes",
             bar_text,
             Some(bar),
         );
@@ -5721,6 +5805,10 @@ pub fn on_input_byte(byte: u8) -> bool {
     with_state_mut(|state| state.on_input_byte(byte)).unwrap_or(false)
 }
 
+pub fn on_key_event(event: keyboard::KeyEvent) -> bool {
+    with_state_mut(|state| state.on_key_event(event)).unwrap_or(false)
+}
+
 pub fn kill_process(pid: u32) -> bool {
     with_state_mut(|state| {
         let killed = state.kill_ui_process(pid);
@@ -6000,6 +6088,90 @@ fn parse_mode(text: &str) -> Option<u16> {
         return None;
     }
     Some(mode)
+}
+
+#[derive(Clone, Copy)]
+struct LsOptions {
+    all: bool,
+    long: bool,
+    blocks: bool,
+}
+
+impl LsOptions {
+    const fn empty() -> Self {
+        Self {
+            all: false,
+            long: false,
+            blocks: false,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.all || self.long || self.blocks
+    }
+}
+
+fn parse_ls_command(input: &str) -> Option<Result<(LsOptions, Option<&str>), &'static str>> {
+    let rest = if input == "ls" || input == TERMINAL_BIN_LS {
+        ""
+    } else if let Some(rest) = input.strip_prefix("ls ") {
+        rest
+    } else if let Some(rest) = input.strip_prefix("/bin/ls ") {
+        rest
+    } else {
+        return None;
+    };
+
+    let mut options = LsOptions::empty();
+    let mut path = None;
+    let mut parse_options = true;
+
+    for token in rest.split_whitespace() {
+        if parse_options && token == "--" {
+            parse_options = false;
+            continue;
+        }
+        if parse_options && token.starts_with('-') && token.len() > 1 {
+            for flag in token[1..].bytes() {
+                match flag {
+                    b'a' => options.all = true,
+                    b'l' => options.long = true,
+                    b's' => options.blocks = true,
+                    _ => return Some(Err("usage: ls [-als] [<path>]")),
+                }
+            }
+            continue;
+        }
+        if path.replace(token).is_some() {
+            return Some(Err("usage: ls [-als] [<path>]"));
+        }
+        parse_options = false;
+    }
+
+    Some(Ok((options, path)))
+}
+
+fn render_ls_option_arg<'a>(options: LsOptions, out: &'a mut [u8; 5]) -> Option<&'a str> {
+    if !options.any() {
+        return None;
+    }
+
+    let mut used = 0usize;
+    out[used] = b'-';
+    used += 1;
+    if options.all {
+        out[used] = b'a';
+        used += 1;
+    }
+    if options.long {
+        out[used] = b'l';
+        used += 1;
+    }
+    if options.blocks {
+        out[used] = b's';
+        used += 1;
+    }
+    str::from_utf8(&out[..used]).ok()
 }
 
 fn map_external_exit_code(code: i32) -> i32 {
