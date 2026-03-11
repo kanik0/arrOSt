@@ -154,10 +154,6 @@ pub fn init() -> InterruptInitReport {
     }
 }
 
-pub fn page_fault_entry_addr() -> u64 {
-    page_fault_handler as usize as u64
-}
-
 pub fn ring3_gate_info() -> Option<(u16, u16, u8)> {
     let user_cs = USER_CODE_SELECTOR.load(Ordering::Acquire);
     let user_ds = USER_DATA_SELECTOR.load(Ordering::Acquire);
@@ -228,13 +224,6 @@ pub(crate) fn page_fault_dispatch(
     ));
     serial::write_fmt(format_args!("{stack_frame:#?}\n"));
     crate::arch::halt_forever();
-}
-
-extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
-    page_fault_dispatch(&stack_frame, error_code)
 }
 
 extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, error_code: u64) {

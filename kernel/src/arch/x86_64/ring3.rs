@@ -516,7 +516,7 @@ pub fn dispatch_int80(
                     user_rsp,
                     number,
                     arrostd::syscall::name(number),
-                    arg0 as i32
+                    arg0 as i32,
                 ));
             }
         } else {

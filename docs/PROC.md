@@ -68,7 +68,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 
 ## Limits
 
-- Ring-3 address-space roots preserve only upper-half root-table entries and map a fixed trampoline user page; syscall/fault/sync transitions consume trampoline entry/exit paths with KPTI scratch-assisted CR3/TTBR switching.
+- Ring-3 address-space roots currently clone the active kernel root table and map a fixed trampoline user page; syscall/fault/sync transitions consume trampoline entry/exit paths with KPTI scratch-assisted CR3/TTBR switching while full kernel-mapping trimming remains deferred.
 - No `fork`, copy-on-write, demand paging, or swap.
 - No `execve` syscall yet: `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).

@@ -7,18 +7,18 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ## M11: Kernel Page-Table Isolation (KPTI)
 
-**Status**: Complete
-**Limitation**: Resolved in M11 (kernel mappings are no longer cloned wholesale into ring-3 roots).
+**Status**: Partially complete
+**Limitation**: Trampoline/KPTI groundwork is in place, but ring-3 roots still clone the active kernel root table while the kernel depends on low virtual addresses during CR3/TTBR switches.
 **Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
 
 ### Context
 
-M11 delivered KPTI-oriented page-table isolation groundwork and transition wiring: ring-3 roots no longer clone the full kernel root, transitions are routed through arch trampoline entry/exit paths, and runtime smoke coverage includes explicit lower-EL fault handling checks.
+M11 delivered KPTI-oriented transition wiring and page-table groundwork: transitions are routed through arch trampoline entry/exit paths, runtime smoke coverage includes explicit lower-EL fault handling checks, and the remaining isolation gap is limited to root-table cloning while the kernel still executes from low virtual addresses.
 
 
 ### Incremental progress (this branch)
 
-- `kernel/src/proc/ring3_groundwork.rs` now clones only the upper-half root-table entries (indices `256..512`) when creating a ring-3 address space.
+- `kernel/src/proc/ring3_groundwork.rs` currently clones the active root table when creating a ring-3 address space so syscall/fault CR3/TTBR switches keep current kernel code, stacks, and heap mapped.
 - Ring-3 image loading now maps a fixed trampoline user page at `mem::TRAMPOLINE_VADDR` (RX, non-writable) into each process address space.
 - `kernel/src/mem/mod.rs` now exports `TRAMPOLINE_VADDR` and `trampoline_phys_addr()` for follow-up trampoline entry/exit work.
 - This remains groundwork toward Step 3/4: syscall/fault gates are still on existing paths until trampoline stubs are wired.

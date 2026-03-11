@@ -65,14 +65,6 @@ static FS_IDENTITY_OVERRIDE: FsIdentityOverrideCell = FsIdentityOverrideCell(Uns
 // SAFETY: single-core kernel; written only from scheduler context, read-only from ISR.
 pub static RING3_ACTIVE_PID: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Clone, Copy)]
-pub struct KptiScratchSnapshot {
-    pub kernel_root_table: u64,
-    pub user_root_table: u64,
-    pub user_rsp_scratch: u64,
-    pub kernel_rsp_scratch: u64,
-}
-
 struct KptiScratch {
     kernel_root_table: AtomicU64,
     user_root_table: AtomicU64,
@@ -89,15 +81,6 @@ impl KptiScratch {
             kernel_rsp_scratch: AtomicU64::new(0),
         }
     }
-
-    fn snapshot(&self) -> KptiScratchSnapshot {
-        KptiScratchSnapshot {
-            kernel_root_table: self.kernel_root_table.load(Ordering::Acquire),
-            user_root_table: self.user_root_table.load(Ordering::Acquire),
-            user_rsp_scratch: self.user_rsp_scratch.load(Ordering::Acquire),
-            kernel_rsp_scratch: self.kernel_rsp_scratch.load(Ordering::Acquire),
-        }
-    }
 }
 
 static KPTI_SCRATCH: KptiScratch = KptiScratch::new();
@@ -107,13 +90,11 @@ pub static KPTI_KERNEL_ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 pub static KPTI_USER_ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
+pub static KPTI_USER_RAX_SCRATCH: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
 pub static KPTI_USER_RSP_SCRATCH: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 pub static KPTI_KERNEL_RSP_SCRATCH: AtomicU64 = AtomicU64::new(0);
-
-pub fn kpti_scratch_snapshot() -> KptiScratchSnapshot {
-    KPTI_SCRATCH.snapshot()
-}
 
 pub fn kpti_set_user_rsp_scratch(rsp: u64) {
     KPTI_SCRATCH.user_rsp_scratch.store(rsp, Ordering::Release);
@@ -5516,7 +5497,6 @@ fn prepare_ring3_vfs_bin(path: &'static str, argv: &[&str]) -> Result<PreparedRi
             ));
             errno::ENOEXEC
         })?;
-
     Ok(PreparedRing3VfsBin {
         path,
         worker_name: contract.worker_name,

@@ -23,11 +23,11 @@ const USER_PAGE_BYTES: usize = 4096;
 const USER_STACK_BYTES: usize = 16 * 1024;
 const USER_STACK_GAP_BYTES: u64 = 64 * 1024;
 // x86_64 user traps execute the kernel syscall path on this per-process stack.
-// 32 KiB is too tight once deeper VFS resolution and the syscall dispatcher stack up.
-const KERNEL_STACK_BYTES: usize = 64 * 1024;
+// Deep VFS recursion (for example symlink-loop detection) plus timer interrupts
+// can exceed smaller stacks and corrupt adjacent heap-backed process state.
+const KERNEL_STACK_BYTES: usize = 256 * 1024;
 const MAX_LOADABLE_SEGMENT_BYTES: usize = 128 * 1024;
 const PAGE_TABLE_ENTRY_COUNT: usize = 512;
-const PAGE_TABLE_UPPER_HALF_START: usize = PAGE_TABLE_ENTRY_COUNT / 2;
 const SMOKE_SEGMENT_SCRATCH_BYTES: usize = 512;
 const SMOKE_ELF_SEGMENT_OFFSET: usize = 0x100;
 #[cfg(target_arch = "x86_64")]
@@ -877,9 +877,9 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_x86_page_table();
     // SAFETY: current_table points to active P4 mapped in kernel address space.
     let current_table_ref = unsafe { &*current_table };
-    // Groundwork for M11/KPTI: start each process from a clean user half and
-    // inherit only the upper-half kernel mappings.
-    for index in PAGE_TABLE_UPPER_HALF_START..PAGE_TABLE_ENTRY_COUNT {
+    // The current kernel still executes from low canonical virtual addresses,
+    // so switching CR3 before iretq must preserve the full active root table.
+    for index in 0..PAGE_TABLE_ENTRY_COUNT {
         process_root[index] = current_table_ref[index].clone();
     }
 
@@ -913,9 +913,9 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_aarch64_page_table();
     // SAFETY: current TTBR0 root is mapped in the kernel address space and remains valid.
     let current_table_ref = unsafe { &*current_table };
-    // Groundwork for M11/KPTI: preserve only upper-half mappings instead of
-    // cloning the whole root table verbatim.
-    for index in PAGE_TABLE_UPPER_HALF_START..PAGE_TABLE_ENTRY_COUNT {
+    // The current kernel still executes from low virtual addresses, so TTBR0
+    // switches must preserve the full active root table for kernel code/stack access.
+    for index in 0..PAGE_TABLE_ENTRY_COUNT {
         process_root.entries[index] = current_table_ref.entries[index];
     }
 

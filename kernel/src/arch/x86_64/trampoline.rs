@@ -13,16 +13,12 @@ pub fn trampoline_syscall_entry_addr() -> u64 {
 #[unsafe(naked)]
 unsafe extern "C" fn trampoline_syscall_entry() -> ! {
     core::arch::naked_asm!(
+        // Save the user `rax` before using it as scratch for trampoline bookkeeping.
+        "xchg rax, qword ptr [rip + {user_rax}]",
         // Cache ring3 user rsp from interrupt frame (RIP,CS,RFLAGS,RSP,SS) and current kernel rsp.
         "mov rax, qword ptr [rsp + 24]",
         "mov qword ptr [rip + {user_rsp}], rax",
         "mov qword ptr [rip + {kernel_rsp}], rsp",
-        // Switch to kernel CR3 if configured.
-        "mov rax, qword ptr [rip + {kernel_root}]",
-        "test rax, rax",
-        "jz 2f",
-        "mov cr3, rax",
-        "2:",
         // Mirror int80 frame save/dispatch.
         "push r15",
         "push r14",
@@ -38,10 +34,23 @@ unsafe extern "C" fn trampoline_syscall_entry() -> ! {
         "push rdx",
         "push rcx",
         "push rbx",
-        "push rax",
+        "push qword ptr [rip + {user_rax}]",
+        // Switch to the kernel root only after the full user register frame is saved.
+        "mov rax, qword ptr [rip + {kernel_root}]",
+        "test rax, rax",
+        "jz 2f",
+        "mov cr3, rax",
+        "2:",
         "mov rdi, rsp",
         "call {dispatch}",
         "mov [rsp], rax",
+        // Restore the user root before reloading the saved user registers so
+        // the syscall return value in `rax` is not clobbered by a Rust helper call.
+        "mov rax, qword ptr [rip + {user_root}]",
+        "test rax, rax",
+        "jz 3f",
+        "mov cr3, rax",
+        "3:",
         "pop rax",
         "pop rbx",
         "pop rcx",
@@ -57,19 +66,14 @@ unsafe extern "C" fn trampoline_syscall_entry() -> ! {
         "pop r13",
         "pop r14",
         "pop r15",
-        "jmp {exit}",
+        "iretq",
+        user_rax = sym proc::KPTI_USER_RAX_SCRATCH,
         user_rsp = sym proc::KPTI_USER_RSP_SCRATCH,
         kernel_rsp = sym proc::KPTI_KERNEL_RSP_SCRATCH,
         kernel_root = sym proc::KPTI_KERNEL_ROOT_TABLE,
+        user_root = sym proc::KPTI_USER_ROOT_TABLE,
         dispatch = sym syscall::int80_dispatch,
-        exit = sym trampoline_syscall_exit,
     );
-}
-
-extern "C" fn trampoline_syscall_exit() -> ! {
-    unsafe { switch_to_user_root_from_scratch() };
-    // SAFETY: exit path restores user context via iretq after CR3 restore.
-    unsafe { asm!("iretq", options(noreturn)) }
 }
 
 /// Groundwork entry address used for ring-3 fault containment transitions.
