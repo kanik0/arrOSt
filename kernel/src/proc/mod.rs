@@ -27,10 +27,11 @@ use arrostd::syscall::{
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ring3_groundwork::{
     AddressSpaceToken, MAX_USER_RANGES, Ring3ProcessImage, Ring3ProcessState, Ring3TrapFrame,
     UserMemoryRange, copy_from_user, copy_from_user_bytes, copy_to_user_bytes,
+    current_address_space_token,
 };
 
 const MAX_TASKS: usize = 4;
@@ -65,6 +66,49 @@ static FS_IDENTITY_OVERRIDE: FsIdentityOverrideCell = FsIdentityOverrideCell(Uns
 /// Written/cleared by the scheduler, read from the timer ISR without holding the scheduler lock.
 // SAFETY: single-core kernel; written only from scheduler context, read-only from ISR.
 pub static RING3_ACTIVE_PID: AtomicU32 = AtomicU32::new(0);
+
+struct KptiScratch {
+    kernel_root_table: AtomicU64,
+    user_root_table: AtomicU64,
+    user_rsp_scratch: AtomicU64,
+    kernel_rsp_scratch: AtomicU64,
+}
+
+impl KptiScratch {
+    const fn new() -> Self {
+        Self {
+            kernel_root_table: AtomicU64::new(0),
+            user_root_table: AtomicU64::new(0),
+            user_rsp_scratch: AtomicU64::new(0),
+            kernel_rsp_scratch: AtomicU64::new(0),
+        }
+    }
+}
+
+static KPTI_SCRATCH: KptiScratch = KptiScratch::new();
+
+#[unsafe(no_mangle)]
+pub static KPTI_KERNEL_ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static KPTI_USER_ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static KPTI_USER_RAX_SCRATCH: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static KPTI_USER_RSP_SCRATCH: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static KPTI_KERNEL_RSP_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn kpti_set_user_rsp_scratch(rsp: u64) {
+    KPTI_SCRATCH.user_rsp_scratch.store(rsp, Ordering::Release);
+    KPTI_USER_RSP_SCRATCH.store(rsp, Ordering::Release);
+}
+
+pub fn kpti_set_kernel_rsp_scratch(rsp: u64) {
+    KPTI_SCRATCH
+        .kernel_rsp_scratch
+        .store(rsp, Ordering::Release);
+    KPTI_KERNEL_RSP_SCRATCH.store(rsp, Ordering::Release);
+}
 
 #[derive(Clone, Copy)]
 pub struct ProcInitReport {
@@ -2476,9 +2520,18 @@ impl Scheduler {
         if process_space.root_table == 0 {
             return Ok(());
         }
+        let kernel_space = current_address_space_token();
         match ring3_groundwork::switch_to_address_space(process_space) {
             Ok(previous) => {
                 self.ring3_previous_address_space = Some(previous);
+                KPTI_SCRATCH
+                    .kernel_root_table
+                    .store(kernel_space.root_table, Ordering::Release);
+                KPTI_SCRATCH
+                    .user_root_table
+                    .store(process_space.root_table, Ordering::Release);
+                KPTI_KERNEL_ROOT_TABLE.store(kernel_space.root_table, Ordering::Release);
+                KPTI_USER_ROOT_TABLE.store(process_space.root_table, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -2596,7 +2649,12 @@ impl Scheduler {
             serial::write_fmt(format_args!(
                 "ring3 run: address-space restore failed: {error}\n"
             ));
+            return;
         }
+        KPTI_SCRATCH
+            .kernel_root_table
+            .store(previous.root_table, Ordering::Release);
+        KPTI_KERNEL_ROOT_TABLE.store(previous.root_table, Ordering::Release);
     }
 
     fn first_writable_ring3_pointer(&self, offset: u64, len: usize) -> Option<u64> {
@@ -5703,7 +5761,6 @@ fn prepare_ring3_vfs_bin(path: &'static str, argv: &[&str]) -> Result<PreparedRi
             ));
             errno::ENOEXEC
         })?;
-
     Ok(PreparedRing3VfsBin {
         path,
         worker_name: contract.worker_name,

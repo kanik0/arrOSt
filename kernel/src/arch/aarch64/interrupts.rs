@@ -1,5 +1,5 @@
 // kernel/src/arch/aarch64/interrupts.rs: aarch64 EL1 vectors + GIC/timer + SVC groundwork.
-use crate::arch::aarch64::{self, syscall};
+use crate::arch::aarch64::{self, syscall, trampoline};
 use crate::{serial, time};
 use arrostd::syscall::errno;
 use core::arch::{asm, global_asm};
@@ -79,7 +79,7 @@ __arrost_sync_lower_aarch64:
     stp x18, x30, [sp, #144]
 
     mov x0, sp
-    bl __arrost_aarch64_sync_dispatch
+    bl __arrost_aarch64_sync_trampoline_entry
     str x0, [sp, #0]
 
     ldp x18, x30, [sp, #144]
@@ -289,51 +289,7 @@ extern "C" fn __arrost_aarch64_irq_el0_dispatch(frame_ptr: *mut syscall::El0Pree
 
 #[unsafe(no_mangle)]
 extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame) -> u64 {
-    let Some(frame) = (unsafe { frame_ptr.as_mut() }) else {
-        return errno::ENOSYS as u64;
-    };
-
-    let esr = read_esr_el1();
-    let elr = read_elr_el1();
-    let spsr = read_spsr_el1();
-    let sp_el0 = read_sp_el0();
-    let from_el0 = syscall::is_from_el0(spsr);
-
-    if syscall::is_svc64(esr) {
-        let svc_imm = (esr & 0xffff) as u16;
-        let call = syscall::SvcCall::from_sync_frame(frame);
-        if let Some(result) = syscall::dispatch_svc(call, svc_imm, elr, sp_el0, from_el0) {
-            return result as u64;
-        }
-        syscall::log_svc_fallback_once(call.number, svc_imm, elr, sp_el0, from_el0);
-        return errno::ENOSYS as u64;
-    }
-
-    // Data/instruction abort from EL0: attempt CoW copy or demand-page allocation first.
-    if from_el0 {
-        let ec = syscall::exception_class(esr);
-        if (ec == 0x24 || ec == 0x20) && syscall::handle_lower_el0_page_fault(esr, elr, sp_el0) {
-            // Fault handled: return 0 so the dispatcher's `eret` re-executes the instruction.
-            return 0;
-        }
-    }
-
-    if from_el0 && syscall::handle_lower_sync_fault_if_smoke(esr, elr, spsr, sp_el0) {
-        // This branch is unreachable because active smoke faults resume directly to kernel path.
-        return errno::ENOSYS as u64;
-    }
-
-    let ec = syscall::exception_class(esr);
-    serial::write_fmt(format_args!(
-        "Interrupts(a64): unhandled sync ec={:#04x} ({}) esr={:#018x} elr={:#018x} spsr={:#018x} sp_el0={:#018x}\n",
-        ec,
-        syscall::ec_name(ec),
-        esr,
-        elr,
-        spsr,
-        sp_el0
-    ));
-    crate::arch::halt_forever();
+    trampoline::sync_dispatch_transition(frame_ptr)
 }
 
 #[derive(Clone, Copy)]
@@ -403,8 +359,12 @@ pub fn enable_runtime_irqs() {
     }
 }
 
+pub fn vector_base_addr() -> u64 {
+    core::ptr::addr_of!(__arrost_aarch64_vectors) as u64
+}
+
 unsafe fn install_vector_base() {
-    let vectors = core::ptr::addr_of!(__arrost_aarch64_vectors) as u64;
+    let vectors = trampoline::trampoline_vector_base_addr();
     // SAFETY: vector base points to 2KiB-aligned static table for EL1.
     unsafe {
         asm!("msr vbar_el1, {0}", in(reg) vectors, options(nostack, preserves_flags));
@@ -473,42 +433,6 @@ unsafe fn timer_start_periodic(counts_per_tick: u64) {
         asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nostack, preserves_flags));
         asm!("isb", options(nomem, nostack, preserves_flags));
     }
-}
-
-fn read_esr_el1() -> u64 {
-    let mut value: u64;
-    // SAFETY: reading ESR_EL1 is side-effect free.
-    unsafe {
-        asm!("mrs {value}, esr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
-
-fn read_elr_el1() -> u64 {
-    let mut value: u64;
-    // SAFETY: reading ELR_EL1 is side-effect free.
-    unsafe {
-        asm!("mrs {value}, elr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
-
-fn read_spsr_el1() -> u64 {
-    let mut value: u64;
-    // SAFETY: reading SPSR_EL1 is side-effect free.
-    unsafe {
-        asm!("mrs {value}, spsr_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
-
-fn read_sp_el0() -> u64 {
-    let mut value: u64;
-    // SAFETY: reading SP_EL0 is side-effect free.
-    unsafe {
-        asm!("mrs {value}, sp_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
 }
 
 #[inline]

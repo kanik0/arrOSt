@@ -24,9 +24,11 @@ const USER_PAGE_BYTES: usize = 4096;
 const USER_STACK_BYTES: usize = 16 * 1024;
 const USER_STACK_GAP_BYTES: u64 = 64 * 1024;
 // x86_64 user traps execute the kernel syscall path on this per-process stack.
-// 32 KiB is too tight once deeper VFS resolution and the syscall dispatcher stack up.
-const KERNEL_STACK_BYTES: usize = 64 * 1024;
+// Deep VFS recursion (for example symlink-loop detection) plus timer interrupts
+// can exceed smaller stacks and corrupt adjacent heap-backed process state.
+const KERNEL_STACK_BYTES: usize = 256 * 1024;
 const MAX_LOADABLE_SEGMENT_BYTES: usize = 128 * 1024;
+const PAGE_TABLE_ENTRY_COUNT: usize = 512;
 const SMOKE_SEGMENT_SCRATCH_BYTES: usize = 512;
 const SMOKE_ELF_SEGMENT_OFFSET: usize = 0x100;
 #[cfg(target_arch = "x86_64")]
@@ -558,6 +560,9 @@ fn load_process_image(
     let mut loaded_user_pages = Vec::<LoadedUserPage>::new();
     let (address_space, mut address_space_owner) =
         create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
+    mem::trampoline_phys_addr().ok_or(Ring3ElfLoadError::AddressSpaceCreate(
+        "failed to resolve trampoline frame",
+    ))?;
 
     for index in 0..header.program_header_count {
         let ph = parse_program_header(elf_bytes, &header, index)?;
@@ -733,6 +738,27 @@ fn load_process_image(
         argv,
     )?;
 
+    let trampoline_page = boxed_zeroed_user_page();
+    map_user_page(
+        &mut address_space_owner,
+        address_space,
+        mem::TRAMPOLINE_VADDR,
+        &trampoline_page,
+        false,
+        true,
+    )
+    .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
+    mapped_pages = mapped_pages.saturating_add(1);
+    let trampoline_phys =
+        mem::virt_to_phys(trampoline_page.bytes.as_ptr() as usize).unwrap_or(0);
+    owned_user_pages.push(Arc::new(UserPageHolder {
+        phys: trampoline_phys,
+        vaddr: mem::TRAMPOLINE_VADDR,
+        writable: false,
+        executable: true,
+        data: trampoline_page,
+    }));
+
     let kernel_stack = vec![0u8; KERNEL_STACK_BYTES].into_boxed_slice();
     let kernel_stack_top = align_down(
         (kernel_stack.as_ptr() as u64).saturating_add(kernel_stack.len() as u64),
@@ -897,7 +923,9 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_x86_page_table();
     // SAFETY: current_table points to active P4 mapped in kernel address space.
     let current_table_ref = unsafe { &*current_table };
-    for index in 0..512 {
+    // The current kernel still executes from low canonical virtual addresses,
+    // so switching CR3 before iretq must preserve the full active root table.
+    for index in 0..PAGE_TABLE_ENTRY_COUNT {
         process_root[index] = current_table_ref[index].clone();
     }
 
@@ -931,9 +959,11 @@ fn create_process_address_space() -> Result<(AddressSpaceToken, AddressSpaceOwne
     let mut process_root = boxed_zeroed_aarch64_page_table();
     // SAFETY: current TTBR0 root is mapped in the kernel address space and remains valid.
     let current_table_ref = unsafe { &*current_table };
-    process_root
-        .entries
-        .copy_from_slice(&current_table_ref.entries);
+    // The current kernel still executes from low virtual addresses, so TTBR0
+    // switches must preserve the full active root table for kernel code/stack access.
+    for index in 0..PAGE_TABLE_ENTRY_COUNT {
+        process_root.entries[index] = current_table_ref.entries[index];
+    }
 
     let process_root_virt = (&*process_root as *const Aarch64PageTable) as usize;
     let Some(process_root_phys) = mem::virt_to_phys(process_root_virt) else {

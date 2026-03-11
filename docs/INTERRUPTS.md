@@ -80,17 +80,28 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 - `x86_64`: IRQ-first (`timer_interrupt_handler`) with PIT polling fallback only when IRQs are disabled.
 - `aarch64`: IRQ-preferred ticks (`gic-timer`) with counter-polling fallback if unhandled IRQs are observed; `wfi` idle is used only after live IRQ ticks are observed.
 
+## KPTI status note (M11)
+
+- M11 KPTI transition wiring is complete for the current runtime model.
+- Ring-3 page tables include a dedicated trampoline virtual page (`mem::TRAMPOLINE_VADDR`) and avoid full kernel-root cloning.
+- x86_64 syscall/page-fault gates and aarch64 lower-EL sync flow route through architecture trampoline entry symbols.
+- Trampoline paths use per-CPU KPTI scratch roots/RSP fields (`kernel_root_table`, `user_root_table`, `user_rsp_scratch`, `kernel_rsp_scratch`) to drive transition sequencing.
+- x86_64 trampoline flow includes dedicated syscall/fault entry and exit helpers; aarch64 trampoline flow owns lower-EL sync classification/dispatch and trampoline-side exit restore.
+- Validation is consolidated under `cargo xtask smoke-kpti-m11` (ring3 + ring3-run + fs on both arches plus explicit aarch64 fault smoke).
+
 ## Relevant files
 
 - `kernel/src/arch/x86_64/interrupts.rs`
 - `kernel/src/arch/x86_64/gdt.rs`
 - `kernel/src/arch/x86_64/ring3.rs`
 - `kernel/src/arch/x86_64/syscall.rs`
+- `kernel/src/arch/x86_64/trampoline.rs`
 - `kernel/src/arch/x86_64/pic.rs`
 - `kernel/src/arch/x86_64/pit.rs`
 - `kernel/src/arch/aarch64/interrupts.rs`
 - `kernel/src/arch/aarch64/mod.rs`
 - `kernel/src/arch/aarch64/syscall.rs`
+- `kernel/src/arch/aarch64/trampoline.rs`
 - `kernel/src/arch/aarch64/port.rs`
 - `kernel/src/input.rs`
 - `kernel/src/keyboard.rs`

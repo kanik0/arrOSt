@@ -14,6 +14,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `.` / `..` handling in path walks
 - Path resolution across `/`, `/proc`, and `/tmp` mount boundaries
 - Per-process file-descriptor tables with `fd 0-2` reserved for serial stdin/stdout/stderr
+- Default user home directory and history file bootstrap (`/home/user`, `/home/user/.history`)
 - Read file (`cat`)
 - Write/overwrite file (`echo <text> > <file>`)
 - Delete file
@@ -24,22 +25,23 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - Symlink resolution across mount-aware path walks with `ELOOP` guard after 8 hops
 - Copy file
 - Rename/move (`mv <src> <dst>`)
-- Directory-aware listing (`ls <path>`)
+- Directory-aware listing (`ls [-als] [<path>]`)
 - Metadata inspection (`stat <path>`)
 - Mode changes (`chmod <mode> <path>`)
 - Inode metadata tracking (`uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, `ctime`)
 - Permission enforcement for filesystem opens/listing/reads/writes against inode mode bits
 - Metadata sync/reload operations through shell commands
-- Metadata-only journal replay on mount for `diskfs-v2`
+- Journal replay on mount for `diskfs-v2`, with `Ordered` default mode and `Full` data+metadata mode
 - Dentry cache for repeated mount-aware path resolution with conservative invalidation on namespace mutations
 - Automatic shell/terminal dispatch from bare commands (`ls`, `cat`, `ps`, `link`, `symlink`, `fm`, ...) to `/bin/<cmd>` when the file exists
 - Synthetic process/runtime inspection through `/proc/self/pid`, `/proc/mounts`, `/proc/uptime`
 - Syscall-facing file handles for `open/close/fread/fwrite/seek/fstat/dup/dup2`
+- Shared shell history persisted in `/home/user/.history`, with up/down navigation and `Tab` completion for `/bin` commands plus relative/absolute file paths
 
 ## Limits
 
 - Fixed-size `diskfs-v2` metadata layout: 256 inodes, 16 MiB virtio disk image, 512-byte blocks.
-- Metadata journaling is redo-only; file data uses ordered writes and is not journaled.
+- Journal supports `MetadataOnly`, `Ordered` (default), and `Full` data+metadata modes; fixed capacity is 63 staged sectors per transaction.
 - Intended for deterministic kernel bring-up and tooling support, not full POSIX compatibility.
 - Filesystem descriptors are separate from the current UDP socket syscall namespace.
 - `procfs` is read-only and currently exposes a small fixed entry set.
@@ -53,11 +55,14 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `pwd`
 - `cd <dir>`
 - `ls`
+- `ls -a`
+- `ls -la /home/user`
+- `ls -ls /bin`
 - `ls /proc`
 - `ls /tmp`
 - `ls /bin`
 - `/bin/ls`
-- `/bin/ls /proc`
+- `/bin/ls -la /proc`
 - `cat <file>`
 - `cat /proc/self/pid`
 - `cat /proc/mounts`
@@ -90,6 +95,8 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `/bin/terminal`
 - `sync`
 - `reload`
+- `journal`
+- `journal mode <metadata|ordered|full>`
 
 ## Relevant files
 

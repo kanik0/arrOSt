@@ -52,21 +52,24 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
   - automatic migration from `diskfs-v1`
   - fixed inode table plus block bitmap allocator
   - redo-only metadata journal with replay on mount
+  - journal modes: `MetadataOnly`, `Ordered` (default), and `Full` data journaling
 - Path resolution is mount-aware and supports `.` / `..`, hard links, symlinks, and `ELOOP` after 8 symlink hops.
 - File metadata tracks `uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, and `ctime`.
 - Permission enforcement is active in the VFS.
 - Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
 - Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
 - Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
+- Default user home is `/home/user`, and shell history persists in `/home/user/.history`.
+- `Tab` completion works for `/bin` commands and for relative/absolute file paths in the current working directory.
 
 Representative commands:
 
-- `pwd`, `cd <dir>`, `ls [<path>]`
+- `pwd`, `cd <dir>`, `ls [-als] [<path>]`
 - `cat <file>`, `echo <text> > <file>`
 - `mkdir <dir>`, `mv <src> <dst>`
 - `link <src> <dst>`, `symlink <target> <linkpath>`
 - `stat <path>`, `chmod <mode> <path>`
-- `sync`, `reload`
+- `sync`, `reload`, `journal`, `journal mode <metadata|ordered|full>`
 - `cat /proc/self/pid`, `cat /proc/mounts`, `cat /proc/uptime`
 
 ### Processes and syscalls
@@ -77,15 +80,16 @@ Representative commands:
 - Ring-3 scheduling is round-robin with timer-driven hard preemption (10-tick quantum via PIT IRQ0 on x86_64 / GIC virtual timer IRQ27 on aarch64) and syscall-timeslice preemption.
 - Ring-3 ELF segments and stacks are mapped into dedicated per-arch user virtual ranges owned by each process (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`).
 - Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
-- `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
-- `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
-- User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
+- `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`; aarch64 uses EL0 `SVC`.
+- KPTI (M11): ring-3 page tables preserve only upper-half kernel mappings; each process maps a dedicated trampoline page; syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU scratch root/RSP tracking.
+- `fork` (M13): `SYS_FORK` clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
+- User-mode CPU faults transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
-- ABI revision is `5`. Shell prompt is context-aware: `user@arrost /path> ` in both serial and GUI terminals.
+- ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
 
 Current syscall surface includes:
 
-- lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`
+- lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`, `fork`
 - capabilities: `cap_get`, `cap_drop`
 - networking: `socket`, `sendto`, `recvfrom`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`
 - filesystem: `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, `dup2`
@@ -119,12 +123,11 @@ Useful runtime commands:
 
 ## Known limitations
 
-- Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
-- No `fork`, copy-on-write, demand paging, or swap.
+- `fork` (M13) is implemented with CoW page sharing and demand-paged anonymous VMAs; swap to virtio-blk and `/proc/<pid>/maps` are remaining follow-ups.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
-- `diskfs-v2` journals metadata only; file data is not journaled.
+- `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
 - Storage, graphics, and device support remain QEMU/virtio-first.
 - Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.
 
@@ -267,6 +270,9 @@ Representative smoke commands:
 - `cargo xtask smoke-proc-spawn --arch aarch64`
 - `cargo xtask smoke-bin-exec --arch x86_64`
 - `cargo xtask smoke-bin-exec --arch aarch64`
+- `cargo xtask smoke-fork --arch x86_64`
+- `cargo xtask smoke-fork --arch aarch64`
+- `cargo xtask smoke-kpti-m11`
 - `cargo xtask smoke-fs --arch x86_64`
 - `cargo xtask smoke-fs --arch aarch64`
 - `cargo xtask smoke-ring3 --arch x86_64`

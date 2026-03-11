@@ -12,6 +12,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Per-task syscall capability masks (coarse-grained isolation step).
 - Per-process file-descriptor tables for cooperative and ring-3 execution contexts (`fd 0-2` = serial).
 - Per-process address-space ownership for ring-3 ELF tasks: each process gets its own root page table plus dedicated user mappings for ELF segments and stack.
+- Scheduler tracks KPTI scratch roots (`kernel_root_table`, `user_root_table`) during ring-3 address-space switch/restore and exposes per-CPU root/RSP scratch state consumed by trampoline transition paths.
 - Ring-3 ELFs are linked into dedicated per-arch user virtual ranges (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`), instead of reusing kernel heap virtual addresses.
 - Kernel/user copies for ring-3 syscalls always walk the process page tables and translate through kernel-visible physical aliases.
 - Runtime capability introspection/drop syscalls (`cap_get`, `cap_drop`) remain shared across cooperative and ring-3 paths.
@@ -67,7 +68,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 
 ## Limits
 
-- Kernel mappings are still present in each ring-3 page table, but remain supervisor-only.
+- Ring-3 address-space roots currently clone the active kernel root table and map a fixed trampoline user page; syscall/fault/sync transitions consume trampoline entry/exit paths with KPTI scratch-assisted CR3/TTBR switching while full kernel-mapping trimming remains deferred.
 - No `fork`, copy-on-write, demand paging, or swap.
 - No `execve` syscall yet: `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - Preemption currently occurs at syscall/trap boundaries (not arbitrary instruction-level hard preemption).

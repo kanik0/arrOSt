@@ -7,13 +7,54 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ## M11: Kernel Page-Table Isolation (KPTI)
 
-**Status**: Planned
-**Limitation**: Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only.
-**Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
+**Status**: Implemented
+**Delivered**: Trampoline infrastructure, KPTI scratch tracking, gate/vector wiring, TTBR0/CR3 switch sequences, and dedicated M11 smoke battery are all in place. Ring-3 page tables preserve only upper-half kernel mappings; each process maps a dedicated trampoline page; syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU scratch root/RSP tracking.
 
 ### Context
 
-Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables that include all kernel mappings as supervisor-only entries. A user-mode process cannot read kernel memory (the NX/supervisor bits prevent it), but Meltdown-class side-channel attacks can still leak data through speculative execution. KPTI eliminates this by unmapping kernel pages entirely from user page tables.
+M11 delivered KPTI-oriented transition wiring and page-table groundwork: transitions are routed through arch trampoline entry/exit paths, runtime smoke coverage includes explicit lower-EL fault handling checks, and the remaining isolation gap is limited to root-table cloning while the kernel still executes from low virtual addresses.
+
+
+### Incremental progress (this branch)
+
+- `kernel/src/proc/ring3_groundwork.rs` currently clones the active root table when creating a ring-3 address space so syscall/fault CR3/TTBR switches keep current kernel code, stacks, and heap mapped.
+- Ring-3 image loading now maps a fixed trampoline user page at `mem::TRAMPOLINE_VADDR` (RX, non-writable) into each process address space.
+- `kernel/src/mem/mod.rs` now exports `TRAMPOLINE_VADDR` and `trampoline_phys_addr()` for follow-up trampoline entry/exit work.
+- This remains groundwork toward Step 3/4: syscall/fault gates are still on existing paths until trampoline stubs are wired.
+- `kernel/src/proc/mod.rs` now keeps a per-CPU KPTI scratch snapshot (`kernel_root_table`, `user_root_table`, `user_rsp_scratch`, `kernel_rsp_scratch`) and updates root-table fields on ring-3 address-space switch/restore (Step 5/6 groundwork).
+
+- Added `kernel/src/arch/x86_64/trampoline.rs` and `kernel/src/arch/aarch64/trampoline.rs` groundwork modules exporting trampoline entry addresses backed by current gate/vector entrypoints.
+
+- `kernel/src/arch/*/interrupts.rs` now sources syscall/vector gate base addresses through `arch/*/trampoline.rs` helpers, keeping runtime behavior unchanged while preparing Step 4 gate redirection.
+
+- Syscall entry paths now populate KPTI scratch RSP fields (`user_rsp_scratch`, `kernel_rsp_scratch`) from live ring-3 transitions on both `x86_64` (`int 0x80`) and `aarch64` (`SVC`) as Step 5 groundwork.
+
+- `kernel/src/arch/x86_64/interrupts.rs` now sources the page-fault IDT entry address through `arch::x86_64::trampoline::trampoline_page_fault_entry_addr()` (same effective handler, Step 4 groundwork).
+
+- Fault/sync transition policy now also routes through `arch/*/trampoline.rs` helpers (`x86_64` page-fault transition hook, `aarch64` SVC/lower-sync hooks) while preserving current behavior.
+
+- `kernel/src/arch/x86_64/trampoline.rs` now provides concrete trampoline entry wrappers (`trampoline_syscall_entry`, `trampoline_page_fault_entry`) that currently tail-call/forward to existing handlers, replacing pure address pass-throughs on x86_64.
+
+- `kernel/src/arch/aarch64/trampoline.rs` now includes a concrete sync-dispatch wrapper (`sync_dispatch_transition`) used by `__arrost_aarch64_sync_dispatch`, replacing direct interrupt-path coupling while keeping behavior unchanged.
+
+- aarch64 lower-EL sync vector assembly now branches to a trampoline-owned dispatch symbol (`__arrost_aarch64_sync_trampoline_dispatch`) before entering shared sync policy logic.
+
+- x86_64 trampoline entry wrappers now perform provisional CR3 switches using KPTI scratch roots on syscall/page-fault entry/exit paths, and aarch64 sync trampoline now performs TTBR0 switch+barrier sequencing around sync dispatch.
+
+- x86_64 trampoline flow now includes dedicated syscall/fault exit helpers (`trampoline_syscall_exit`, `trampoline_fault_exit`) and aarch64 sync flow now enters via `__arrost_aarch64_sync_trampoline_entry` with explicit trampoline-side exit helper before returning.
+
+- aarch64 lower-EL sync/fault vector flow is now redirected end-to-end through dedicated trampoline entry symbols before shared dispatch (`kernel/src/arch/aarch64/interrupts.rs`, `kernel/src/arch/aarch64/trampoline.rs`).
+
+- `kernel/src/arch/aarch64/trampoline.rs` now captures/restores `SP_EL0` and kernel `SP` through per-CPU KPTI scratch (`user_rsp_scratch`, `kernel_rsp_scratch`) during sync trampoline entry/exit, completing scratch consumption for active trampoline paths.
+
+- `kernel/src/arch/aarch64/trampoline.rs` now owns lower-EL sync classification/dispatch directly (SVC + fault policy + unhandled sync halt path) with trampoline-side TTBR0 entry/exit sequencing, replacing the previous interrupts-side forwarding path.
+
+- `xtask` now provides a dedicated `smoke-kpti-m11` battery that runs `smoke-ring3`, `smoke-ring3-run`, and `smoke-fs` on both architectures plus explicit `smoke-ring3-fault --arch aarch64` kernel-address fault coverage.
+
+### Completion summary
+
+- M11 closure is recorded: trampoline infrastructure, gate/vector wiring, scratch consumption, and dedicated M11 smoke battery are in place.
+- Follow-up work is tracked under later milestones (e.g. broader memory-model evolution in M13+) rather than as open M11 checklist items.
 
 ### Dependencies
 - M14 (Timer-Driven Hard Preemption) is recommended but not required.
@@ -134,17 +175,30 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 ---
 
-## M13: fork + Copy-on-Write + Demand Paging + Swap
+## M13: fork + Copy-on-Write + Demand Paging
 
-**Status**: Planned
-**Limitation**: No fork, copy-on-write, demand paging, or swap.
-**Goal**: Implement `fork()` with CoW pages, demand-paged user mappings, and a basic swap backend.
+**Status**: Implemented
+**Delivered**: `SYS_FORK` (23) clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
+
+### Delivered scope
+
+- `kernel/src/mem/vma.rs` (new): `VmaFlags` with `READ`/`WRITE`/`EXEC`/`COW`/`ANON` bits; `VmaEntry` with `contains()`, `with_cow()`, `without_cow()` helpers; `MAX_VMAS = 16` per-process limit.
+- `kernel/src/proc/ring3_groundwork.rs`: `UserPageHolder` (Arc-wrapped `UserPage` with cached `phys`/`vaddr`/`writable`/`executable`); `create_fork_child_image` (clones parent page tables as read-only CoW, allocates child kernel stack); `handle_cow_fault` (single-owner fast-path re-enables write, multi-owner copies page); `alloc_and_map_demand_page` (zero-fills and maps anonymous pages on first access).
+- `kernel/src/proc/mod.rs`: `syscall_fork_ring3` (marks all parent writable VMAs COW, clones page tables into child, allocates new PID, enqueues child as `ready`); `syscall_mmap_ring3` (MAP_ANONYMOUS → ANON VMA entry, demand-paged); `syscall_brk_ring3` (program-break management with ANON VMA growth); `on_ring3_page_fault_internal` (CoW + demand dispatch before marking process faulted).
+- Arch wiring: x86_64 page-fault handler calls `on_ring3_page_fault_internal` before marking faulted, then resumes kernel scheduler on unrecoverable fault; aarch64 data/instruction abort from EL0 added to `trampoline::sync_dispatch_transition`; 4th syscall argument (`r10` on x86_64 / `x3` on aarch64) plumbed through both arch dispatch paths.
+- `cargo xtask smoke-fork --arch x86_64` and `--arch aarch64` harnesses verify the `fork: parent=X child=Y` kernel log marker.
+
+### Remaining follow-up
+
+- Swap backend to virtio-blk (Phase C from the original plan).
+- `SYS_FORK` return value in the child process (currently hardcoded 0 in the trap frame at fork time).
+- `/proc/<pid>/maps` VMA listing (requires integration with procfs per-PID tree from M16).
 
 ### Dependencies
 - M12 (VFS-backed ELF launch groundwork) should be complete; true `exec`/`execve` remains optional follow-up.
 - M14 (Timer-Driven Hard Preemption) is recommended for fork to be useful.
 
-### Implementation Plan
+### Implementation Plan (historical reference)
 
 #### Phase A: Page-Fault Infrastructure
 
@@ -492,9 +546,23 @@ heap-generated via the existing `proc_generated_text` path in `fs/mod.rs`.
 
 ## M17: Full-Data Journaling for diskfs-v2
 
-**Status**: Planned
-**Limitation**: diskfs-v2 journals metadata only; file data is not journaled.
+**Status**: Complete
+**Limitation**: diskfs-v2 defaults to ordered journaling; full-data journaling is available but not yet enabled by default.
 **Goal**: Add data journaling mode for crash-consistent file data writes.
+
+### Delivered scope
+
+- Added `JournalMode` (`MetadataOnly`, `Ordered`, `Full`) in `kernel/src/fs/journal.rs`.
+- Extended journal header format (with backward-compatible legacy decode) to persist journal mode and per-entry kind metadata.
+- Added data entry staging path (`stage_data`) and ordered home-write apply sequence (`DATA` then `METADATA`) in `Full` mode.
+- Updated journal replay to handle data entries and preserve mode information across clean mounts.
+- Integrated `diskfs_v2` data writes with full-data journaling: when an active transaction uses `JournalMode::Full`, file payload sectors are journaled before home writes.
+
+### Validation notes
+
+- Runtime control is exposed via shell commands: `journal` and `journal mode <metadata|ordered|full>`.
+- Journal mode is persisted in the on-disk v2 header and preserved across remount/replay.
+- Fixed journal capacity remains 63 staged sectors per transaction; larger writes return `storage_no_space` and should be split at caller level.
 
 ### Dependencies
 - None; builds directly on `kernel/src/fs/journal.rs` and `kernel/src/fs/diskfs_v2.rs`.
@@ -504,7 +572,7 @@ heap-generated via the existing `proc_generated_text` path in `fs/mod.rs`.
 #### Step 1: Understand current journal
 **Files to read**: `kernel/src/fs/journal.rs`, `kernel/src/fs/diskfs_v2.rs`
 
-Current state: The journal stores redo records for metadata mutations (inode allocation, directory entry changes, bitmap updates). On mount, `journal_replay()` replays any uncommitted records. File data is written directly to data blocks with ordered writes (metadata commit only after data is on disk).
+Current state: The journal stores redo records for metadata mutations (inode allocation, directory entry changes, bitmap updates). On mount, `journal_replay()` replays any uncommitted records. In default `Ordered` mode, file data is written directly to data blocks before metadata commit; in `Full` mode, file data blocks are journaled and replayed before metadata home writes.
 
 #### Step 2: Add journal mode selection
 **Files to modify**: `kernel/src/fs/journal.rs`

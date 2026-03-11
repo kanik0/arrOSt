@@ -32,7 +32,7 @@ Storage initialization report includes:
 
 - QEMU/virtio focused implementation.
 - No storage-device cache or journal below the filesystem layer.
-- `diskfs-v2` now provides its own metadata-only redo journal above sector I/O.
+- `diskfs-v2` now provides its own redo journal above sector I/O, with `Ordered` default mode and optional `Full` data journaling mode.
 - No multi-device scheduling yet.
 
 ## Relevant files

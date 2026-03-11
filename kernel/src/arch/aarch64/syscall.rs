@@ -304,6 +304,11 @@ pub fn dispatch_svc(
         return None;
     }
 
+    proc::kpti_set_user_rsp_scratch(sp_el0);
+
+    let kstack_anchor = &call as *const SvcCall as usize as u64;
+    proc::kpti_set_kernel_rsp_scratch(kstack_anchor);
+
     let hit = RING3_SMOKE_HITS
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
