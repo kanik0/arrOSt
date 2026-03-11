@@ -749,8 +749,7 @@ fn load_process_image(
     )
     .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
     mapped_pages = mapped_pages.saturating_add(1);
-    let trampoline_phys =
-        mem::virt_to_phys(trampoline_page.bytes.as_ptr() as usize).unwrap_or(0);
+    let trampoline_phys = mem::virt_to_phys(trampoline_page.bytes.as_ptr() as usize).unwrap_or(0);
     owned_user_pages.push(Arc::new(UserPageHolder {
         phys: trampoline_phys,
         vaddr: mem::TRAMPOLINE_VADDR,
