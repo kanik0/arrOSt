@@ -52,7 +52,7 @@ const USER_BIN_PS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PS_ELF_HINT";
 const USER_BIN_PS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PS_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-net [--arch <x86_64|aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -100,6 +100,7 @@ enum TopLevelCommand {
     SmokeRing3,
     SmokeRing3Run,
     SmokeRing3Fault,
+    SmokeKptiM11,
     SmokeNet,
 }
 
@@ -166,6 +167,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Fault) => smoke_ring3_fault(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeKptiM11) => smoke_kpti_m11(),
         Ok(TopLevelCommand::SmokeNet) => smoke_net(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
@@ -195,6 +197,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
         Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
         Some("smoke-ring3-fault") => Ok(TopLevelCommand::SmokeRing3Fault),
+        Some("smoke-kpti-m11") => Ok(TopLevelCommand::SmokeKptiM11),
         Some("smoke-net") => Ok(TopLevelCommand::SmokeNet),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
@@ -3520,6 +3523,30 @@ fn smoke_ring3_fault_impl(arch: RuntimeArch) -> Result<()> {
     Ok(())
 }
 
+fn smoke_kpti_m11() -> Result<()> {
+    let archs = [RuntimeArch::X86_64, RuntimeArch::Aarch64];
+
+    for arch in archs {
+        println!("smoke-kpti-m11: running smoke-ring3 ({})", arch.as_str());
+        smoke_ring3(Some(arch.as_str().to_owned()))?;
+
+        println!(
+            "smoke-kpti-m11: running smoke-ring3-run ({})",
+            arch.as_str()
+        );
+        smoke_ring3_run(Some(arch.as_str().to_owned()))?;
+
+        println!("smoke-kpti-m11: running smoke-fs ({})", arch.as_str());
+        smoke_fs(Some(arch.as_str().to_owned()))?;
+    }
+
+    println!("smoke-kpti-m11: running smoke-ring3-fault (aarch64)");
+    smoke_ring3_fault(Some(RuntimeArch::Aarch64.as_str().to_owned()))?;
+
+    println!("smoke-kpti-m11: PASS");
+    Ok(())
+}
+
 fn smoke_doom_impl(
     arch: RuntimeArch,
     long_run: bool,
@@ -4573,6 +4600,13 @@ mod tests {
         let parsed = parse_top_level_command(Some("smoke-ring3-fault"))
             .expect("smoke-ring3-fault should map to top-level command");
         assert!(parsed == TopLevelCommand::SmokeRing3Fault);
+    }
+
+    #[test]
+    fn top_level_command_supports_kpti_m11_smoke_subcommand() {
+        let parsed = parse_top_level_command(Some("smoke-kpti-m11"))
+            .expect("smoke-kpti-m11 should map to top-level command");
+        assert!(parsed == TopLevelCommand::SmokeKptiM11);
     }
 
     #[test]

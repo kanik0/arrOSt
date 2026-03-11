@@ -50,9 +50,10 @@ Currently, `kernel/src/proc/ring3_groundwork.rs` creates per-process page tables
 
 - `kernel/src/arch/aarch64/trampoline.rs` now owns lower-EL sync classification/dispatch directly (SVC + fault policy + unhandled sync halt path) with trampoline-side TTBR0 entry/exit sequencing, replacing the previous interrupts-side forwarding path.
 
+- `xtask` now provides a dedicated `smoke-kpti-m11` battery that runs `smoke-ring3`, `smoke-ring3-run`, and `smoke-fs` on both architectures plus explicit `smoke-ring3-fault --arch aarch64` kernel-address fault coverage.
+
 ### Remaining to close M11
 
-- Validate with full ring3/fs smoke on both arches and add explicit kernel-address access fault smoke.
 - Finalize docs (`README.md`, `docs/MEMORY.md`, `docs/PROC.md`, `docs/INTERRUPTS.md`) to mark M11 complete.
 
 ### Dependencies
