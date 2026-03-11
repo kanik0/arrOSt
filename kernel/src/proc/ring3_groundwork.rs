@@ -2,6 +2,7 @@ use crate::mem;
 use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error},
     boxed::Box,
+    sync::Arc,
     vec,
     vec::Vec,
 };
@@ -51,8 +52,24 @@ const AARCH64_TABLE_AF: u64 = 1 << 10;
 const AARCH64_TABLE_UXN: u64 = 1 << 54;
 
 #[repr(C, align(4096))]
-struct UserPage {
+pub(crate) struct UserPage {
     bytes: [u8; USER_PAGE_BYTES],
+}
+
+/// Owned physical backing page for a user VMA, reference-counted for CoW sharing.
+///
+/// `Arc::strong_count() == 1` means exclusively owned; `>= 2` means shared (CoW copy pending).
+pub(crate) struct UserPageHolder {
+    /// Physical address of the backing page (cached for fast CoW lookup).
+    pub phys: u64,
+    /// User virtual address this page was originally mapped at.
+    pub vaddr: u64,
+    /// Whether this page was mapped with user-write permission.
+    pub writable: bool,
+    /// Whether this page was mapped with execute permission.
+    pub executable: bool,
+    /// Owned backing page (kept alive as long as any Arc exists).
+    pub(crate) data: Box<UserPage>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -268,9 +285,11 @@ pub struct Ring3ProcessImage {
     pub user_range_count: usize,
     pub mapped_pages: usize,
     pub address_space: AddressSpaceToken,
+    /// Initial program break (end of loaded segments, page-aligned).
+    pub initial_brk_end: u64,
     _address_space_owner: AddressSpaceOwner,
     _owned_kernel_buffers: Vec<Box<[u8]>>,
-    _owned_user_pages: Vec<Box<UserPage>>,
+    pub(crate) _owned_user_pages: Vec<Arc<UserPageHolder>>,
 }
 
 struct LoadedUserPage {
@@ -535,7 +554,7 @@ fn load_process_image(
     let mut entry_mapped = false;
     let mut highest_user_end = header.entry;
     let mut owned_kernel_buffers = Vec::<Box<[u8]>>::new();
-    let mut owned_user_pages = Vec::<Box<UserPage>>::new();
+    let mut owned_user_pages = Vec::<Arc<UserPageHolder>>::new();
     let mut loaded_user_pages = Vec::<LoadedUserPage>::new();
     let (address_space, mut address_space_owner) =
         create_process_address_space().map_err(Ring3ElfLoadError::AddressSpaceCreate)?;
@@ -644,7 +663,14 @@ fn load_process_image(
         )
         .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
         mapped_pages = mapped_pages.saturating_add(1);
-        owned_user_pages.push(loaded_page.page);
+        let phys = mem::virt_to_phys(loaded_page.page.bytes.as_ptr() as usize).unwrap_or(0);
+        owned_user_pages.push(Arc::new(UserPageHolder {
+            phys,
+            vaddr: loaded_page.vaddr,
+            writable: loaded_page.writable,
+            executable: loaded_page.executable,
+            data: loaded_page.page,
+        }));
     }
     apply_dynamic_relocations(
         elf_bytes,
@@ -690,7 +716,14 @@ fn load_process_image(
         )
         .map_err(Ring3ElfLoadError::AddressSpaceMap)?;
         mapped_pages = mapped_pages.saturating_add(1);
-        owned_user_pages.push(page);
+        let phys = mem::virt_to_phys(page.bytes.as_ptr() as usize).unwrap_or(0);
+        owned_user_pages.push(Arc::new(UserPageHolder {
+            phys,
+            vaddr: page_vaddr,
+            writable: true,
+            executable: false,
+            data: page,
+        }));
     }
     let user_sp = populate_user_stack(
         &user_ranges,
@@ -707,6 +740,10 @@ fn load_process_image(
     );
     owned_kernel_buffers.push(kernel_stack);
 
+    // Initial brk is placed at the first page-aligned address after the loaded segments.
+    let initial_brk_end =
+        align_up(highest_user_end, USER_PAGE_BYTES as u64).unwrap_or(highest_user_end);
+
     Ok(Ring3ProcessImage {
         trap_frame: Ring3TrapFrame::new(entry_ip, user_sp),
         kernel_stack_top,
@@ -714,6 +751,7 @@ fn load_process_image(
         user_range_count,
         mapped_pages,
         address_space,
+        initial_brk_end,
         _address_space_owner: address_space_owner,
         _owned_kernel_buffers: owned_kernel_buffers,
         _owned_user_pages: owned_user_pages,
@@ -1748,4 +1786,299 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     let end = offset.saturating_add(8);
     bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+}
+
+// ── M13 CoW / fork helpers ──────────────────────────────────────────────────
+
+/// Return the physical address of the page containing `vaddr` in `token`'s address space.
+/// `vaddr` is aligned to page boundary before the lookup.
+pub(crate) fn get_page_phys_for_token(token: AddressSpaceToken, vaddr: u64) -> Option<u64> {
+    let page_base = vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    // translate_user_phys(token, page_base) returns phys+0 = page physical base.
+    translate_user_phys(token, page_base).ok()
+}
+
+/// Set or clear the user-writable bit on the PTE for `page_vaddr` in `token`'s address space.
+/// Performs a TLB shootdown for the affected virtual page.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn set_page_writable_for_token(
+    token: AddressSpaceToken,
+    page_vaddr: u64,
+    writable: bool,
+) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let Some(root_virt) = mem::phys_to_virt(token.root_table) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let p4 = &mut *(root_virt as *mut PageTable);
+        let p4e = &mut p4[page_table_index(page_base, 39)];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p3v) = mem::phys_to_virt(p4e.addr().as_u64()) else {
+            return;
+        };
+        let p3 = &mut *(p3v as *mut PageTable);
+        let p3e = &mut p3[page_table_index(page_base, 30)];
+        if !p3e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p2v) = mem::phys_to_virt(p3e.addr().as_u64()) else {
+            return;
+        };
+        let p2 = &mut *(p2v as *mut PageTable);
+        let p2e = &mut p2[page_table_index(page_base, 21)];
+        if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p1v) = mem::phys_to_virt(p2e.addr().as_u64()) else {
+            return;
+        };
+        let p1 = &mut *(p1v as *mut PageTable);
+        let p1e = &mut p1[page_table_index(page_base, 12)];
+        if !p1e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let phys = p1e.addr();
+        let mut flags = p1e.flags();
+        if writable {
+            flags |= PageTableFlags::WRITABLE;
+        } else {
+            flags &= !PageTableFlags::WRITABLE;
+        }
+        p1e.set_addr(phys, flags);
+        // Invalidate TLB for this user virtual address in the current address space.
+        core::arch::asm!("invlpg [{addr}]", addr = in(reg) page_base, options(nostack, preserves_flags));
+    }
+}
+
+/// Set or clear the user-writable bit on the PTE for `page_vaddr` in `token`'s address space.
+/// Performs a broadcast TLB invalidation for the affected virtual page.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn set_page_writable_for_token(
+    token: AddressSpaceToken,
+    page_vaddr: u64,
+    writable: bool,
+) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let table_phys = token.root_table & AARCH64_TABLE_ADDR_MASK;
+    let Some(l1v) = mem::phys_to_virt(table_phys) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let l1 = &mut *(l1v as *mut Aarch64PageTable);
+        let l1e = l1.entries[aarch64_table_index(page_base, 1)];
+        if (l1e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l2v) = mem::phys_to_virt(l1e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l2 = &mut *(l2v as *mut Aarch64PageTable);
+        let l2e = l2.entries[aarch64_table_index(page_base, 2)];
+        if (l2e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l3v) = mem::phys_to_virt(l2e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l3 = &mut *(l3v as *mut Aarch64PageTable);
+        let entry = &mut l3.entries[aarch64_table_index(page_base, 3)];
+        if (*entry & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let new_ap = if writable {
+            AARCH64_TABLE_AP_EL1_RW_EL0_RW
+        } else {
+            AARCH64_TABLE_AP_EL1_RO_EL0_RO
+        };
+        *entry = (*entry & !AARCH64_TABLE_AP_MASK) | new_ap;
+        // Broadcast TLB invalidation for this user virtual address.
+        let tlbi_val = page_base >> 12;
+        asm!(
+            "dsb ish",
+            "tlbi vaae1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) tlbi_val,
+            options(nostack)
+        );
+    }
+}
+
+/// Create a fork child image: new address space with all parent pages shared (CoW).
+///
+/// All writable pages in the parent are marked read-only in both parent and child PTEs.
+/// The caller is responsible for setting the COW flag on all writable VMAs.
+pub(crate) fn create_fork_child_image(
+    parent_image: &mut Ring3ProcessImage,
+    parent_trap_frame: Ring3TrapFrame,
+) -> Result<Ring3ProcessImage, &'static str> {
+    let (child_token, mut child_owner) = create_process_address_space()?;
+
+    let mut child_pages = Vec::<Arc<UserPageHolder>>::new();
+    child_pages
+        .try_reserve(parent_image._owned_user_pages.len())
+        .map_err(|_| "fork: OOM allocating child page list")?;
+
+    for holder in &parent_image._owned_user_pages {
+        // Mark parent PTE as read-only to trigger CoW on next write.
+        if holder.writable {
+            set_page_writable_for_token(parent_image.address_space, holder.vaddr, false);
+        }
+        // Map the same physical frame into the child (read-only for CoW).
+        map_user_page(
+            &mut child_owner,
+            child_token,
+            holder.vaddr,
+            &holder.data,
+            false, // read-only; CoW fault will upgrade
+            holder.executable,
+        )?;
+        // Share the Arc (ref-count increments to 2).
+        child_pages.push(Arc::clone(holder));
+    }
+
+    // Allocate a fresh kernel stack for the child.
+    let child_kstack = vec![0u8; KERNEL_STACK_BYTES].into_boxed_slice();
+    let child_kstack_top = align_down(
+        (child_kstack.as_ptr() as u64).saturating_add(child_kstack.len() as u64),
+        16,
+    );
+    let child_kernel_buffers = vec![child_kstack];
+
+    // The child returns 0 from fork().
+    let child_trap_frame =
+        Ring3TrapFrame::new_with_ret(parent_trap_frame.ip, parent_trap_frame.sp, 0);
+
+    Ok(Ring3ProcessImage {
+        trap_frame: child_trap_frame,
+        kernel_stack_top: child_kstack_top,
+        user_ranges: parent_image.user_ranges,
+        user_range_count: parent_image.user_range_count,
+        mapped_pages: child_pages.len(),
+        address_space: child_token,
+        initial_brk_end: parent_image.initial_brk_end,
+        _address_space_owner: child_owner,
+        _owned_kernel_buffers: child_kernel_buffers,
+        _owned_user_pages: child_pages,
+    })
+}
+
+/// Map a physical frame `phys` at `user_vaddr` in `owner`/`token`'s address space.
+///
+/// Used by the CoW write-fault handler to replace a shared read-only frame with a
+/// fresh writable copy.
+pub(crate) fn map_page_from_phys_in_owner(
+    owner: &mut Ring3ProcessImage,
+    user_vaddr: u64,
+    phys: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), &'static str> {
+    // We need a &UserPage for the aarch64 descriptor-template lookup.
+    // The physical address must correspond to a Box<UserPage> already in the image;
+    // look it up so we can pass a valid kernel alias.
+    let holder = owner
+        ._owned_user_pages
+        .iter()
+        .find(|h| h.phys == phys)
+        .ok_or("map_page_from_phys: physical frame not owned by process")?;
+    map_user_page(
+        &mut owner._address_space_owner,
+        owner.address_space,
+        user_vaddr,
+        &holder.data,
+        writable,
+        executable,
+    )
+}
+
+/// Allocate a fresh zeroed page and map it at `vaddr` with the given permissions.
+///
+/// Called on anonymous demand-page faults (VMA with `ANON` flag set).
+pub(crate) fn alloc_and_map_demand_page(
+    image: &mut Ring3ProcessImage,
+    vaddr: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), &'static str> {
+    let page = boxed_zeroed_user_page();
+    let phys = crate::mem::virt_to_phys(page.bytes.as_ptr() as usize).unwrap_or(0);
+    let holder = Arc::new(UserPageHolder {
+        phys,
+        vaddr,
+        writable,
+        executable,
+        data: page,
+    });
+    // Push holder first so map_page_from_phys_in_owner can find it by phys address.
+    image
+        ._owned_user_pages
+        .try_reserve(1)
+        .map_err(|_| "demand: OOM allocating user page")?;
+    image._owned_user_pages.push(holder);
+    // Map the page; on failure remove the holder we just pushed.
+    if let Err(e) = map_page_from_phys_in_owner(image, vaddr, phys, writable, executable) {
+        image._owned_user_pages.pop();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Handle a CoW write fault for the page containing `page_addr` in `token`'s address space.
+///
+/// * If the page is exclusively owned (Arc ref-count == 1), re-enable write permission.
+/// * If the page is shared (Arc ref-count >= 2), allocate a private copy and remap.
+///
+/// Returns `Ok(())` on success; the caller is responsible for clearing the COW flag in the VMA.
+pub(crate) fn handle_cow_fault(
+    image: &mut Ring3ProcessImage,
+    token: AddressSpaceToken,
+    page_addr: u64,
+) -> Result<(), &'static str> {
+    let phys = get_page_phys_for_token(token, page_addr).ok_or("cow: get_page_phys failed")?;
+    let holder_idx = image
+        ._owned_user_pages
+        .iter()
+        .position(|h| h.phys == phys)
+        .ok_or("cow: page not owned by process")?;
+
+    if Arc::strong_count(&image._owned_user_pages[holder_idx]) == 1 {
+        // Exclusively owned: just re-enable write permission in the PTE.
+        set_page_writable_for_token(token, page_addr, true);
+        Ok(())
+    } else {
+        // Shared: allocate a private copy and remap.
+        let old_exec;
+        let new_page;
+        {
+            let old_holder = &image._owned_user_pages[holder_idx];
+            old_exec = old_holder.executable;
+            new_page = boxed_zeroed_user_page();
+            // SAFETY: both src and dst are valid 4 KiB regions with identical layout.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    old_holder.data.bytes.as_ptr(),
+                    new_page.bytes.as_ptr() as *mut u8,
+                    USER_PAGE_BYTES,
+                );
+            }
+        }
+        let new_phys = crate::mem::virt_to_phys(new_page.bytes.as_ptr() as usize).unwrap_or(0);
+        let new_holder = Arc::new(UserPageHolder {
+            phys: new_phys,
+            vaddr: page_addr,
+            writable: true,
+            executable: old_exec,
+            data: new_page,
+        });
+        // Replace the shared holder with the new exclusive copy.
+        image._owned_user_pages[holder_idx] = new_holder;
+        // Remap the virtual address to the new physical page (writable).
+        map_page_from_phys_in_owner(image, page_addr, new_phys, true, old_exec)
+    }
 }

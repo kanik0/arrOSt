@@ -309,6 +309,15 @@ extern "C" fn __arrost_aarch64_sync_dispatch(frame_ptr: *mut syscall::SyncFrame)
         return errno::ENOSYS as u64;
     }
 
+    // Data/instruction abort from EL0: attempt CoW copy or demand-page allocation first.
+    if from_el0 {
+        let ec = syscall::exception_class(esr);
+        if (ec == 0x24 || ec == 0x20) && syscall::handle_lower_el0_page_fault(esr, elr, sp_el0) {
+            // Fault handled: return 0 so the dispatcher's `eret` re-executes the instruction.
+            return 0;
+        }
+    }
+
     if from_el0 && syscall::handle_lower_sync_fault_if_smoke(esr, elr, spsr, sp_el0) {
         // This branch is unreachable because active smoke faults resume directly to kernel path.
         return errno::ENOSYS as u64;

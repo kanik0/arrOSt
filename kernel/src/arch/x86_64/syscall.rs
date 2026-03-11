@@ -90,10 +90,11 @@ extern "C" fn int80_dispatch(frame_ptr: *mut Int80Frame) -> u64 {
     let arg0 = frame.regs.rdi;
     let arg1 = frame.regs.rsi;
     let arg2 = frame.regs.rdx;
+    let arg3 = frame.regs.r10; // Linux/POSIX convention: 4th syscall arg via r10
 
-    if let Some(result) =
-        ring3::dispatch_int80(number, arg0, arg1, arg2, frame.rip, frame.rsp, from_ring3)
-    {
+    if let Some(result) = ring3::dispatch_int80(
+        number, arg0, arg1, arg2, arg3, frame.rip, frame.rsp, from_ring3,
+    ) {
         return result as u64;
     }
 
