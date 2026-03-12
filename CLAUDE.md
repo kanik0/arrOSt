@@ -40,6 +40,8 @@ cargo xtask smoke-bin-exec --arch x86_64 # /bin exec smoke
 cargo xtask smoke-bin-exec --arch aarch64
 cargo xtask smoke-proc-caps --arch x86_64
 cargo xtask smoke-proc-spawn --arch x86_64
+cargo xtask smoke-fork --arch x86_64      # Fork/CoW smoke
+cargo xtask smoke-fork --arch aarch64
 ```
 
 ### Environment Variables
@@ -66,6 +68,7 @@ kernel/                     Rust no_std kernel crate
         interrupts.rs       GDT/IDT/PIC/PIT + int 0x80 gate
         gdt.rs              GDT/TSS setup
         ring3.rs            CPL3 user-mode transition
+        trampoline.rs       KPTI CR3 switch entry/exit stubs (M11)
         syscall.rs          x86_64 syscall entry
         pic.rs              PIC controller
         pit.rs              PIT timer
@@ -76,6 +79,7 @@ kernel/                     Rust no_std kernel crate
         syscall.rs          aarch64 SVC syscall dispatch
         port.rs             virtio-mmio I/O port shim (25K)
         framebuffer.rs      GOP framebuffer for aarch64
+        trampoline.rs       KPTI TTBR0 switch entry/exit stubs (M11)
         mod.rs              aarch64 module
     fs/
       mod.rs                VFS facade + mount-aware path resolution
@@ -95,6 +99,7 @@ kernel/                     Rust no_std kernel crate
       mod.rs                Memory subsystem + heap allocator
       x86_64.rs             x86_64 memory (bootloader memory map)
       aarch64.rs            aarch64 memory (UEFI map handoff)
+      vma.rs                VmaEntry / VmaFlags per-process VMA tracker (M13)
     proc/
       mod.rs                Process model + scheduler (150K)
       ring3_groundwork.rs   Ring-3 ELF loader + page-table setup
@@ -168,7 +173,7 @@ Three scheduler tables coexist:
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
 - Numbers:
-  - core: write(1) read(2) exit(3) yield(4) sleep(5) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14)
+  - core: write(1) read(2) exit(3) yield(4) sleep(5) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14) fork(23)
   - filesystem: open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22)
   - directory/path: mkdir(25) rmdir(26) unlink(27) rename(28) link(29) symlink(30) readlink(31) getcwd(32) chdir(33) getdents(34)
   - process identity: getppid(35) getuid(36) getgid(37) kill(38)
@@ -237,19 +242,29 @@ Three scheduler tables coexist:
 ## Current Milestones (from Known Limitations)
 
 ### M11: Kernel Page-Table Isolation (KPTI)
-**Status**: Planned
-**Limitation**: "Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only."
-**Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
+**Status**: Implemented
+**Summary**: Ring-3 page tables now preserve only upper-half kernel mappings; each process maps a dedicated trampoline page at a fixed user-accessible address. Syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU KPTI scratch root/RSP tracking.
+- `kernel/src/arch/x86_64/trampoline.rs`: CR3 switch on int 0x80 entry/exit; per-CPU KPTI scratch store
+- `kernel/src/arch/aarch64/trampoline.rs`: TTBR0 switch on SVC/fault entry/exit; SP_EL0 scratch save/restore
+- `proc/mod.rs`: `KPTI_KERNEL_ROOT_TABLE`, `KPTI_USER_ROOT_TABLE`, `KPTI_USER_RSP_SCRATCH`, `KPTI_KERNEL_RSP_SCRATCH` atomics; `kpti_set_*` helpers
+- `ring3_groundwork.rs`: trampoline page allocated and mapped into each ring-3 address space
+- `cargo xtask smoke-kpti-m11` harness verifies the trampoline roundtrip
+**Remaining**: full separation of kernel mappings beyond upper-half (deeper KPTI); per-CPU GS-based scratch on x86_64 (currently uses shared atomics).
 
 ### M12: Filesystem-backed execve [WORK IN PROGRESS]
 **Status**: In Progress
 **Limitation**: "There is no filesystem-backed execve path yet; ring-3 apps are still embedded artifacts (ring3_init, ring3_doom)."
 **Goal**: Implement `execve` syscall that loads ELF binaries from the VFS (e.g., `/bin/init`, `/bin/doom`) into a fresh ring-3 process with new address space.
 
-### M13: fork + Copy-on-Write + Demand Paging + Swap
-**Status**: Planned
-**Limitation**: "No fork, copy-on-write, demand paging, or swap."
-**Goal**: Implement `fork()` with CoW page sharing, demand-paged user mappings, and optionally a basic swap backend to virtio-blk.
+### M13: fork + Copy-on-Write + Demand Paging
+**Status**: Implemented
+**Summary**: `SYS_FORK` (23) clones the active ring-3 process with CoW-shared address space. Key components:
+- `kernel/src/mem/vma.rs`: `VmaEntry` / `VmaFlags` with READ/WRITE/EXEC/COW/ANON bits; `contains()`, `with_cow()`, `without_cow()` helpers
+- `ring3_groundwork.rs`: `UserPageHolder` (Arc-wrapped page + phys/vaddr/writable/executable), `create_fork_child_image`, `handle_cow_fault`, `alloc_and_map_demand_page`
+- `proc/mod.rs`: `syscall_fork_ring3` (CoW marking, child task allocation), `syscall_mmap_ring3` (ANON VMAs), `syscall_brk_ring3` (program break), `on_ring3_page_fault_internal` (CoW + demand-page dispatch)
+- Arch wiring: x86_64 page-fault handler tries CoW/demand before marking process faulted; aarch64 EL0 data/instruction abort handler added; 4th syscall arg (r10 / x3) wired through both arches
+- `cargo xtask smoke-fork` harness verifies the "fork: parent=X child=Y" kernel log marker
+**Remaining**: swap backend to virtio-blk; `SYS_FORK` return value in child (currently hardcoded 0 in trap frame); `/proc/<pid>/maps`.
 
 ### M14: Timer-Driven Hard Preemption
 **Status**: Implemented
@@ -276,9 +291,14 @@ Three scheduler tables coexist:
 **Remaining**: `/proc/<pid>/maps` (needs M13), `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`, `/proc/net/route`
 
 ### M17: Full-Data Journaling for diskfs-v2
-**Status**: Planned
-**Limitation**: "diskfs-v2 journals metadata only; file data is not journaled."
-**Goal**: Add data journaling mode (ordered or full journal) for crash-consistent file data writes.
+**Status**: Implemented
+**Summary**: `diskfs-v2` now supports three journal modes selectable at runtime:
+- `MetadataOnly`: original behavior — only inode/directory metadata journaled
+- `Ordered` (default): data written before metadata commit for crash-safe ordering
+- `Full`: both data blocks and metadata blocks staged in journal before final placement
+- Shell commands: `journal` (show current mode + stats), `journal mode <metadata|ordered|full>` (switch mode)
+- `kernel/src/fs/journal.rs`: `JournalMode` enum, full-data record type, mode-aware commit and replay
+**Remaining**: journal capacity expansion (currently capped at 63 staged sectors per transaction); checkpoint mechanism for reclaiming journal space.
 
 ### M18: Hardware Diversification Beyond QEMU/Virtio
 **Status**: Planned

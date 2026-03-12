@@ -52,7 +52,7 @@ const USER_BIN_PS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PS_ELF_HINT";
 const USER_BIN_PS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PS_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -97,6 +97,7 @@ enum TopLevelCommand {
     SmokeProcSpawn,
     SmokeBinExec,
     SmokeFs,
+    SmokeFork,
     SmokeRing3,
     SmokeRing3Run,
     SmokeRing3Fault,
@@ -163,6 +164,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeProcCaps) => smoke_proc_caps(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeProcSpawn) => smoke_proc_spawn(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeBinExec) => smoke_bin_exec(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeFork) => smoke_fork(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeFs) => smoke_fs(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3) => smoke_ring3(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRing3Run) => smoke_ring3_run(parse_run_arch_arg(args)?),
@@ -193,6 +195,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-proc-caps") => Ok(TopLevelCommand::SmokeProcCaps),
         Some("smoke-proc-spawn") => Ok(TopLevelCommand::SmokeProcSpawn),
         Some("smoke-bin-exec") => Ok(TopLevelCommand::SmokeBinExec),
+        Some("smoke-fork") => Ok(TopLevelCommand::SmokeFork),
         Some("smoke-fs") => Ok(TopLevelCommand::SmokeFs),
         Some("smoke-ring3") => Ok(TopLevelCommand::SmokeRing3),
         Some("smoke-ring3-run") => Ok(TopLevelCommand::SmokeRing3Run),
@@ -1911,6 +1914,135 @@ fn smoke_bin_exec(arch_override: Option<String>) -> Result<()> {
             Err(smoke_err)
         }
     }
+}
+
+fn smoke_fork(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    let restore_force_fallback = env_truthy(DOOM_FORCE_FALLBACK_ENV);
+    let restore_ring3_elf_groundwork = default_ring3_elf_groundwork_enabled();
+
+    build_impl(restore_force_fallback, false, false, Some(true), false)?;
+    let smoke_result = smoke_fork_impl(arch);
+    let restore_result = build_impl(
+        restore_force_fallback,
+        false,
+        false,
+        Some(restore_ring3_elf_groundwork),
+        false,
+    );
+    match smoke_result {
+        Ok(()) => {
+            restore_result?;
+            Ok(())
+        }
+        Err(smoke_err) => {
+            if let Err(restore_err) = restore_result {
+                return Err(smoke_err.context(format!(
+                    "fork smoke failed and restoring prior ELF groundwork state failed: {restore_err:#}"
+                )));
+            }
+            Err(smoke_err)
+        }
+    }
+}
+
+fn smoke_fork_impl(arch: RuntimeArch) -> Result<()> {
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-fork";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let launch_pattern = match arch {
+        RuntimeArch::X86_64 => "ring3 run: entering user mode",
+        RuntimeArch::Aarch64 => "ring3 run(a64): entering user mode",
+    };
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        send_serial_command(stdin, "ring3 run init\n")?;
+        wait_for_log(
+            &log,
+            "ring3(run): queued app=init pid=",
+            Duration::from_secs(8),
+            "ring3 init queue acknowledgement",
+        )?;
+        wait_for_log(
+            &log,
+            launch_pattern,
+            Duration::from_secs(8),
+            "ring3 init launch marker",
+        )?;
+        // The init binary calls SYS_FORK; the kernel emits "fork: parent=X child=Y" on success.
+        wait_for_log(
+            &log,
+            "fork: parent=",
+            Duration::from_secs(12),
+            "fork syscall kernel marker",
+        )?;
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "fork: parent=") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
 }
 
 fn smoke_bin_exec_impl(arch: RuntimeArch) -> Result<()> {

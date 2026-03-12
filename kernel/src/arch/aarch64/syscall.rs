@@ -318,6 +318,7 @@ pub fn dispatch_svc(
         call.args[0],
         call.args[1],
         call.args[2],
+        call.args[3],
     );
     let result = dispatch.result;
     if dispatch.action == proc::Ring3SyscallAction::ReturnKernel {
@@ -505,6 +506,50 @@ fn read_daif() -> u64 {
         core::arch::asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
     }
     daif
+}
+
+pub fn read_far_el1() -> u64 {
+    let far: u64;
+    // SAFETY: FAR_EL1 holds the virtual address that caused the last fault; read-only.
+    unsafe {
+        core::arch::asm!("mrs {far}, far_el1", far = out(reg) far, options(nomem, nostack, preserves_flags));
+    }
+    far
+}
+
+/// Called by the sync-exception dispatcher for data/instruction aborts from EL0.
+///
+/// Attempts to handle the fault via CoW copy or demand-page allocation.  Returns
+/// `true` when the fault was recovered (the dispatcher should return 0 so `eret`
+/// re-executes the faulting instruction).  If the fault is unrecoverable, marks
+/// the process as faulted and resumes the kernel — never returns in that case.
+/// Returns `false` when this handler is not applicable (not armed, wrong EC).
+pub fn handle_lower_el0_page_fault(esr: u64, elr: u64, sp_el0: u64) -> bool {
+    use arrostd::syscall::errno;
+    if RING3_SMOKE_STATE.load(Ordering::Acquire) != STATE_ARMED {
+        return false;
+    }
+    let ec = exception_class(esr);
+    // 0x24 = data abort from lower EL, 0x20 = instruction abort from lower EL
+    if ec != 0x24 && ec != 0x20 {
+        return false;
+    }
+    let fault_addr = read_far_el1();
+    // WnR bit (bit 6 of ESR_EL1) distinguishes write from read faults in data aborts.
+    let write_fault = ec == 0x24 && (esr >> 6) & 1 != 0;
+
+    if crate::proc::on_ring3_page_fault(fault_addr, write_fault) {
+        return true; // handled: eret will re-execute the faulting instruction
+    }
+
+    // Unrecoverable: mark the process faulted and resume the kernel scheduler.
+    crate::proc::mark_active_ring3_fault_with_info(elr, sp_el0);
+    RING3_SMOKE_STATE.store(STATE_FAILED, Ordering::Release);
+    RING3_SMOKE_TRAP_ELR.store(elr, Ordering::Release);
+    RING3_SMOKE_TRAP_SP_EL0.store(sp_el0, Ordering::Release);
+    RING3_SMOKE_TRAP_RET0.store(errno::EFAULT as u64, Ordering::Release);
+    RING3_SMOKE_TRAP_VALID.store(1, Ordering::Release);
+    resume_boot_smoke_to_kernel();
 }
 
 unsafe fn enter_el0(context: El0Context) -> ! {

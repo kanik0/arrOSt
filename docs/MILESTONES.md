@@ -7,9 +7,8 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ## M11: Kernel Page-Table Isolation (KPTI)
 
-**Status**: Partially complete
-**Limitation**: Trampoline/KPTI groundwork is in place, but ring-3 roots still clone the active kernel root table while the kernel depends on low virtual addresses during CR3/TTBR switches.
-**Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
+**Status**: Implemented
+**Delivered**: Trampoline infrastructure, KPTI scratch tracking, gate/vector wiring, TTBR0/CR3 switch sequences, and dedicated M11 smoke battery are all in place. Ring-3 page tables preserve only upper-half kernel mappings; each process maps a dedicated trampoline page; syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU scratch root/RSP tracking.
 
 ### Context
 
@@ -176,17 +175,30 @@ M11 delivered KPTI-oriented transition wiring and page-table groundwork: transit
 
 ---
 
-## M13: fork + Copy-on-Write + Demand Paging + Swap
+## M13: fork + Copy-on-Write + Demand Paging
 
-**Status**: Planned
-**Limitation**: No fork, copy-on-write, demand paging, or swap.
-**Goal**: Implement `fork()` with CoW pages, demand-paged user mappings, and a basic swap backend.
+**Status**: Implemented
+**Delivered**: `SYS_FORK` (23) clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
+
+### Delivered scope
+
+- `kernel/src/mem/vma.rs` (new): `VmaFlags` with `READ`/`WRITE`/`EXEC`/`COW`/`ANON` bits; `VmaEntry` with `contains()`, `with_cow()`, `without_cow()` helpers; `MAX_VMAS = 16` per-process limit.
+- `kernel/src/proc/ring3_groundwork.rs`: `UserPageHolder` (Arc-wrapped `UserPage` with cached `phys`/`vaddr`/`writable`/`executable`); `create_fork_child_image` (clones parent page tables as read-only CoW, allocates child kernel stack); `handle_cow_fault` (single-owner fast-path re-enables write, multi-owner copies page); `alloc_and_map_demand_page` (zero-fills and maps anonymous pages on first access).
+- `kernel/src/proc/mod.rs`: `syscall_fork_ring3` (marks all parent writable VMAs COW, clones page tables into child, allocates new PID, enqueues child as `ready`); `syscall_mmap_ring3` (MAP_ANONYMOUS → ANON VMA entry, demand-paged); `syscall_brk_ring3` (program-break management with ANON VMA growth); `on_ring3_page_fault_internal` (CoW + demand dispatch before marking process faulted).
+- Arch wiring: x86_64 page-fault handler calls `on_ring3_page_fault_internal` before marking faulted, then resumes kernel scheduler on unrecoverable fault; aarch64 data/instruction abort from EL0 added to `trampoline::sync_dispatch_transition`; 4th syscall argument (`r10` on x86_64 / `x3` on aarch64) plumbed through both arch dispatch paths.
+- `cargo xtask smoke-fork --arch x86_64` and `--arch aarch64` harnesses verify the `fork: parent=X child=Y` kernel log marker.
+
+### Remaining follow-up
+
+- Swap backend to virtio-blk (Phase C from the original plan).
+- `SYS_FORK` return value in the child process (currently hardcoded 0 in the trap frame at fork time).
+- `/proc/<pid>/maps` VMA listing (requires integration with procfs per-PID tree from M16).
 
 ### Dependencies
 - M12 (VFS-backed ELF launch groundwork) should be complete; true `exec`/`execve` remains optional follow-up.
 - M14 (Timer-Driven Hard Preemption) is recommended for fork to be useful.
 
-### Implementation Plan
+### Implementation Plan (historical reference)
 
 #### Phase A: Page-Fault Infrastructure
 
