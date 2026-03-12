@@ -1820,7 +1820,7 @@ impl Scheduler {
             // M13: real mmap / brk; munmap / mprotect remain ENOSYS
             SYS_MMAP => {
                 // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
-                self.syscall_mmap_ring3(ctx, arg1, arg2, arg3)
+                self.syscall_mmap_ring3(arg1, arg2, arg3)
             }
             SYS_MUNMAP | SYS_MPROTECT => errno::ENOSYS,
             SYS_BRK => {
@@ -1828,7 +1828,7 @@ impl Scheduler {
                 self.syscall_brk_ring3(arg0)
             }
             // M13: fork
-            SYS_FORK => self.syscall_fork_ring3(ctx),
+            SYS_FORK => self.syscall_fork_ring3(),
             // M15 Phase A4: pipe IPC
             SYS_PIPE => {
                 self.stats.pipe = self.stats.pipe.saturating_add(1);
@@ -1865,13 +1865,7 @@ impl Scheduler {
     // ── M13: mmap / brk / fork / page-fault ──────────────────────────────
 
     /// SYS_MMAP: anonymous demand-paged mapping (MAP_ANONYMOUS only).
-    fn syscall_mmap_ring3(
-        &mut self,
-        _ctx: Ring3ProcessContext,
-        len: u64,
-        prot: u64,
-        flags: u64,
-    ) -> isize {
+    fn syscall_mmap_ring3(&mut self, len: u64, prot: u64, flags: u64) -> isize {
         if flags & u64::from(MAP_ANONYMOUS) == 0 {
             return errno::ENOSYS; // file-backed mmap not implemented
         }
@@ -1941,7 +1935,7 @@ impl Scheduler {
     /// SYS_FORK: create a child process with CoW-shared address space.
     ///
     /// Returns the child PID to the parent; the child receives 0 via its trap frame.
-    fn syscall_fork_ring3(&mut self, ctx: Ring3ProcessContext) -> isize {
+    fn syscall_fork_ring3(&mut self) -> isize {
         let Some(slot) = self.ring3_active_slot else {
             return errno::EPERM;
         };
@@ -1952,16 +1946,17 @@ impl Scheduler {
         // SAFETY: parent_img_ptr is valid while the parent task is in ring3_tasks and the
         // scheduler lock is held; nothing else mutates the image concurrently.
         let parent_image = unsafe { &mut *parent_img_ptr };
-        let parent_ctx = self.ring3_context.process;
 
-        let child_image =
-            match ring3_groundwork::create_fork_child_image(parent_image, parent_ctx.trap_frame) {
-                Ok(img) => img,
-                Err(e) => {
-                    serial::write_fmt(format_args!("fork: child image failed: {e}\n"));
-                    return errno::ENOMEM;
-                }
-            };
+        let child_image = match ring3_groundwork::create_fork_child_image(
+            parent_image,
+            self.ring3_context.process.trap_frame,
+        ) {
+            Ok(img) => img,
+            Err(e) => {
+                serial::write_fmt(format_args!("fork: child image failed: {e}\n"));
+                return errno::ENOMEM;
+            }
+        };
 
         let Some(child_pid) = self.take_next_pid() else {
             return errno::ENOMEM;
@@ -1975,24 +1970,24 @@ impl Scheduler {
 
         let mut child_task = EMPTY_RING3_TASK;
         child_task.pid = child_pid;
-        child_task.parent_pid = ctx.pid;
-        child_task.name = ctx.name;
-        child_task.syscall_caps = ctx.syscall_caps;
+        child_task.parent_pid = self.ring3_context.process.pid;
+        child_task.name = self.ring3_context.process.name;
+        child_task.syscall_caps = self.ring3_context.process.syscall_caps;
         child_task.state = Ring3TaskState::Ready;
         child_task.image_ptr = child_img_ptr;
         // SAFETY: child_img_ptr is valid and exclusively owned.
         let child_img_ref = unsafe { &*child_img_ptr };
-        child_task.process = parent_ctx;
+        child_task.process = self.ring3_context.process;
         child_task.process.pid = child_pid;
         child_task.process.apply_process_image(child_img_ref);
         // Restore fd table and cwd (apply_process_image resets them to defaults).
-        child_task.process.fd_table = ctx.fd_table;
-        child_task.process.cwd = ctx.cwd;
-        child_task.process.cwd_len = ctx.cwd_len;
-        child_task.process.brk_end = parent_ctx.brk_end;
+        child_task.process.fd_table = self.ring3_context.process.fd_table;
+        child_task.process.cwd = self.ring3_context.process.cwd;
+        child_task.process.cwd_len = self.ring3_context.process.cwd_len;
+        child_task.process.brk_end = self.ring3_context.process.brk_end;
         // Copy parent VMA list; mark writable VMAs as CoW in child.
-        child_task.process.vma_list = parent_ctx.vma_list;
-        child_task.process.vma_count = parent_ctx.vma_count;
+        child_task.process.vma_list = self.ring3_context.process.vma_list;
+        child_task.process.vma_count = self.ring3_context.process.vma_count;
         for v in child_task.process.vma_list[..child_task.process.vma_count]
             .iter_mut()
             .flatten()
@@ -2018,7 +2013,7 @@ impl Scheduler {
         self.ring3_tasks[child_slot] = Some(child_task);
         serial::write_fmt(format_args!(
             "fork: parent={} child={}\n",
-            ctx.pid, child_pid
+            self.ring3_context.process.pid, child_pid
         ));
         child_pid as isize
     }
