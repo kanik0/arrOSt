@@ -2332,12 +2332,10 @@ fn parse_mode(input: &str) -> Option<u16> {
 fn parse_ls_command(input: &str) -> Option<Result<(LsOptions, Option<&str>), &'static str>> {
     let rest = if input == "ls" || input == SERIAL_BIN_LS {
         ""
-    } else if let Some(rest) = input.strip_prefix("ls ") {
-        rest
-    } else if let Some(rest) = input.strip_prefix("/bin/ls ") {
-        rest
     } else {
-        return None;
+        input
+            .strip_prefix("ls ")
+            .or_else(|| input.strip_prefix("/bin/ls "))?
     };
 
     let mut options = LsOptions::empty();
@@ -2369,7 +2367,7 @@ fn parse_ls_command(input: &str) -> Option<Result<(LsOptions, Option<&str>), &'s
     Some(Ok((options, path)))
 }
 
-fn render_ls_option_arg<'a>(options: LsOptions, out: &'a mut [u8; 5]) -> Option<&'a str> {
+fn render_ls_option_arg(options: LsOptions, out: &mut [u8; 5]) -> Option<&str> {
     if !options.any() {
         return None;
     }
