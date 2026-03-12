@@ -288,8 +288,20 @@ Three scheduler tables coexist:
 ### M19: Production TCP/IP Stack + Unix Network Utilities
 **Status**: In Progress
 **Limitation**: "Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack."
-**Delivered**: TCP state machine (SYN_SENT → ESTABLISHED → FIN_WAIT_1/CLOSE_WAIT), BSD socket syscalls (socket/bind/listen/accept/connect/send/recv), ABI revision 5, kernel-side Unix network utilities as shell commands and `/bin/*` entries (netstat, ifconfig, route, arp, ss, nc, ip, ping).
-**Remaining**: User-space ring-3 ELF binaries for each utility; congestion control; full TIME_WAIT/CLOSING states; traceroute, host, dig utilities.
+**Delivered**:
+- TCP state machine (SYN_SENT → ESTABLISHED → FIN_WAIT_1/CLOSE_WAIT → CLOSING/LAST_ACK)
+- BSD socket syscalls: socket/connect/send/recv (TCP), sendto/recvfrom (UDP), bind/listen/accept (stubs)
+- ABI revision 5 with `TcpConnectReq` / `TcpSendReq` / `TcpRecvReq` kernel structures
+- `arrostd::runtime` TCP shims: `tcp_connect()`, `tcp_send()`, `tcp_recv()`
+- Kernel-side shell commands and `/bin/*` stubs: netstat, ifconfig, route, arp, ss, nc, ip, ping
+- **User-space ring-3 ELF binaries** (M19 Phase 2): `/bin/netstat`, `/bin/ifconfig`, `/bin/arp`, `/bin/ss`, `/bin/nc`
+  - `netstat`: reads `/proc/net/tcp`, prints "Active Internet connections" header + table
+  - `ifconfig`: reads `/proc/net/dev`, relays interface statistics
+  - `arp`: reads `/proc/net/arp`, relays ARP cache (Linux format with "IP address" header)
+  - `ss`: reads `/proc/net/tcp`, prints "Netid" header + socket stats
+  - `nc`: TCP client using `tcp_connect/tcp_send/tcp_recv`; listen mode documented as unsupported until bind/listen/accept are functional
+- Updated `smoke-net` harness to verify user-space binary output
+**Remaining**: `/bin/route` (needs `/proc/net/route`); `/bin/ip` user-space binary; `/bin/ping` (needs SOCK_RAW or kernel ping syscall); congestion control; full TIME_WAIT state; traceroute, host, dig utilities.
 
 ---
 

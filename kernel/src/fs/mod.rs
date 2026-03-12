@@ -1658,6 +1658,21 @@ fn builtin_bin_seed_payload(path: &str) -> (&'static [u8], u16) {
         "/bin/ps" if !user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES.is_empty() => {
             (user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES, 0o755)
         }
+        "/bin/netstat" if !user_bin_embed::ARROST_USER_BIN_NETSTAT_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_NETSTAT_ELF_BYTES, 0o755)
+        }
+        "/bin/arp" if !user_bin_embed::ARROST_USER_BIN_ARP_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_ARP_ELF_BYTES, 0o755)
+        }
+        "/bin/ss" if !user_bin_embed::ARROST_USER_BIN_SS_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_SS_ELF_BYTES, 0o755)
+        }
+        "/bin/ifconfig" if !user_bin_embed::ARROST_USER_BIN_IFCONFIG_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_IFCONFIG_ELF_BYTES, 0o755)
+        }
+        "/bin/nc" if !user_bin_embed::ARROST_USER_BIN_NC_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_NC_ELF_BYTES, 0o755)
+        }
         _ => (b"#!/arrost/bin\n", 0o755),
     }
 }

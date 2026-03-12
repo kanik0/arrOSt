@@ -5,6 +5,11 @@ fn main() {
     emit_user_linker_script("ls");
     emit_user_linker_script("cat");
     emit_user_linker_script("ps");
+    emit_user_linker_script("netstat");
+    emit_user_linker_script("arp");
+    emit_user_linker_script("ss");
+    emit_user_linker_script("ifconfig");
+    emit_user_linker_script("nc");
 }
 
 fn emit_user_linker_script(bin_name: &str) {

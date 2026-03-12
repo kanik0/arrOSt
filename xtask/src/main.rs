@@ -50,6 +50,22 @@ const USER_BIN_CAT_ELF_HINT_ENV: &str = "ARROST_USER_BIN_CAT_ELF_HINT";
 const USER_BIN_CAT_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_CAT_ELF_PRESENT";
 const USER_BIN_PS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PS_ELF_HINT";
 const USER_BIN_PS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PS_ELF_PRESENT";
+// M19 network utility user-space binaries
+const USER_BIN_NETSTAT: &str = "netstat";
+const USER_BIN_ARP: &str = "arp";
+const USER_BIN_SS: &str = "ss";
+const USER_BIN_IFCONFIG: &str = "ifconfig";
+const USER_BIN_NC: &str = "nc";
+const USER_BIN_NETSTAT_ELF_HINT_ENV: &str = "ARROST_USER_BIN_NETSTAT_ELF_HINT";
+const USER_BIN_NETSTAT_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_NETSTAT_ELF_PRESENT";
+const USER_BIN_ARP_ELF_HINT_ENV: &str = "ARROST_USER_BIN_ARP_ELF_HINT";
+const USER_BIN_ARP_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_ARP_ELF_PRESENT";
+const USER_BIN_SS_ELF_HINT_ENV: &str = "ARROST_USER_BIN_SS_ELF_HINT";
+const USER_BIN_SS_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_SS_ELF_PRESENT";
+const USER_BIN_IFCONFIG_ELF_HINT_ENV: &str = "ARROST_USER_BIN_IFCONFIG_ELF_HINT";
+const USER_BIN_IFCONFIG_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_IFCONFIG_ELF_PRESENT";
+const USER_BIN_NC_ELF_HINT_ENV: &str = "ARROST_USER_BIN_NC_ELF_HINT";
+const USER_BIN_NC_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_NC_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
 const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]>";
@@ -369,6 +385,47 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
+    // M19 network utility binaries (x86_64)
+    let user_bin_netstat = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_NETSTAT,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_arp = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_ARP,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_ss = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_SS,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_ifconfig = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_IFCONFIG,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_nc = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_NC,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
     let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET)?;
     let doom_generic = build_doom_generic_artifact(KERNEL_TARGET)?;
     println!(
@@ -464,6 +521,67 @@ fn build_impl(
         .env(
             USER_BIN_PS_ELF_PRESENT_ENV,
             if user_bin_ps.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        // M19 network utility env vars
+        .env(
+            USER_BIN_NETSTAT_ELF_HINT_ENV,
+            user_bin_netstat.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_NETSTAT_ELF_PRESENT_ENV,
+            if user_bin_netstat.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_ARP_ELF_HINT_ENV,
+            user_bin_arp.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_ARP_ELF_PRESENT_ENV,
+            if user_bin_arp.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_SS_ELF_HINT_ENV,
+            user_bin_ss.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_SS_ELF_PRESENT_ENV,
+            if user_bin_ss.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_IFCONFIG_ELF_HINT_ENV,
+            user_bin_ifconfig.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_IFCONFIG_ELF_PRESENT_ENV,
+            if user_bin_ifconfig.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_NC_ELF_HINT_ENV,
+            user_bin_nc.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_NC_ELF_PRESENT_ENV,
+            if user_bin_nc.size > 0 {
                 "true"
             } else {
                 "false"
@@ -673,6 +791,47 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
+    // M19 network utility binaries (aarch64)
+    let user_bin_netstat = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_NETSTAT,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_arp = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_ARP,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_ss = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_SS,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_ifconfig = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_IFCONFIG,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_nc = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_NC,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
     let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET_AARCH64)?;
     let doom_generic = build_doom_generic_artifact(KERNEL_TARGET_AARCH64)?;
     println!(
@@ -767,6 +926,67 @@ fn build_secondary_target(
         .env(
             USER_BIN_PS_ELF_PRESENT_ENV,
             if user_bin_ps.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        // M19 network utility env vars
+        .env(
+            USER_BIN_NETSTAT_ELF_HINT_ENV,
+            user_bin_netstat.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_NETSTAT_ELF_PRESENT_ENV,
+            if user_bin_netstat.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_ARP_ELF_HINT_ENV,
+            user_bin_arp.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_ARP_ELF_PRESENT_ENV,
+            if user_bin_arp.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_SS_ELF_HINT_ENV,
+            user_bin_ss.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_SS_ELF_PRESENT_ENV,
+            if user_bin_ss.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_IFCONFIG_ELF_HINT_ENV,
+            user_bin_ifconfig.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_IFCONFIG_ELF_PRESENT_ENV,
+            if user_bin_ifconfig.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_NC_ELF_HINT_ENV,
+            user_bin_nc.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_NC_ELF_PRESENT_ENV,
+            if user_bin_nc.size > 0 {
                 "true"
             } else {
                 "false"
@@ -2478,25 +2698,21 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
         send_serial_command(stdin, "net\n")?;
         wait_for_log(&log, "net: backend=", Duration::from_secs(8), "net info")?;
 
-        // netstat shows connection table header
+        // netstat: user-space /bin/netstat prints "Active Internet connections" header
+        // then relays /proc/net/tcp content.
         send_serial_command(stdin, "netstat\n")?;
         wait_for_log(
             &log,
-            "netstat: Active Internet connections",
-            Duration::from_secs(8),
+            "Active Internet connections",
+            Duration::from_secs(12),
             "netstat header",
         )?;
 
-        // ifconfig shows eth0 line
+        // ifconfig: user-space /bin/ifconfig relays /proc/net/dev which contains "eth0:"
         send_serial_command(stdin, "ifconfig\n")?;
-        wait_for_log(
-            &log,
-            "ifconfig: eth0:",
-            Duration::from_secs(8),
-            "ifconfig eth0 line",
-        )?;
+        wait_for_log(&log, "eth0:", Duration::from_secs(12), "ifconfig eth0 line")?;
 
-        // route shows routing table header
+        // route: no user-space binary yet; kernel handler outputs the routing table
         send_serial_command(stdin, "route\n")?;
         wait_for_log(
             &log,
@@ -2505,39 +2721,29 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
             "route table header",
         )?;
 
-        // arp shows ARP cache header
+        // arp: user-space /bin/arp relays /proc/net/arp (Linux format starting with "IP address")
         send_serial_command(stdin, "arp\n")?;
         wait_for_log(
             &log,
-            "arp: Address",
-            Duration::from_secs(8),
+            "IP address",
+            Duration::from_secs(12),
             "arp cache header",
         )?;
 
-        // ss shows socket summary header
+        // ss: user-space /bin/ss prints "Netid" header then /proc/net/tcp content
         send_serial_command(stdin, "ss\n")?;
-        wait_for_log(
-            &log,
-            "ss: Netid",
-            Duration::from_secs(8),
-            "ss socket header",
-        )?;
+        wait_for_log(&log, "Netid", Duration::from_secs(12), "ss socket header")?;
 
-        // ip addr shows interface info
+        // ip addr: kernel shell handler still dispatches for 'ip'; shows interface info
         send_serial_command(stdin, "ip addr\n")?;
-        wait_for_log(
-            &log,
-            "ifconfig: eth0:",
-            Duration::from_secs(8),
-            "ip addr output (delegates to ifconfig)",
-        )?;
+        wait_for_log(&log, "eth0:", Duration::from_secs(8), "ip addr output")?;
 
-        // Verify /bin/netstat is in ls /bin output
+        // Verify the M19 network utility binaries appear in ls /bin
         send_serial_command(stdin, "ls /bin\n")?;
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(300));
         let ls_snapshot = snapshot_log(&log);
         let ls_lines = lines_after_matching_until_prompt(&ls_snapshot, "ls /bin");
-        for marker in ["netstat", "ifconfig", "ip"] {
+        for marker in ["netstat", "ifconfig", "arp", "ss", "nc", "ip"] {
             if !ls_lines.contains(&marker) {
                 bail!("missing `{marker}` in ls /bin output: {ls_lines:?}");
             }
@@ -2561,7 +2767,7 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
     if let Some(line) = last_matching_line(&log_snapshot, "net: backend=") {
         println!("{smoke_name}: {line}");
     }
-    if let Some(line) = last_matching_line(&log_snapshot, "netstat: Active") {
+    if let Some(line) = last_matching_line(&log_snapshot, "Active Internet connections") {
         println!("{smoke_name}: {line}");
     }
     Ok(())

@@ -841,6 +841,39 @@ pub mod runtime {
             }
         }
     }
+
+    /// Connect a TCP socket to `dst_ip:dst_port` using `src_port` as the local
+    /// port.  On success returns a non-negative file descriptor that refers to
+    /// the established TCP connection.
+    pub fn tcp_connect(req: &crate::syscall::TcpConnectReq) -> isize {
+        syscall2(
+            crate::syscall::SYS_CONNECT,
+            req as *const crate::syscall::TcpConnectReq as u64,
+            core::mem::size_of::<crate::syscall::TcpConnectReq>() as u64,
+        )
+    }
+
+    /// Send `data` on the established TCP connection identified by `fd`.
+    /// Returns bytes accepted or a negative errno.
+    pub fn tcp_send(fd: u32, data: &[u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_SEND,
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    }
+
+    /// Receive up to `buf.len()` bytes from the TCP connection identified by
+    /// `fd`.  Returns bytes read, 0 on EOF, or a negative errno.
+    pub fn tcp_recv(fd: u32, buf: &mut [u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_RECV,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
 }
 
 #[macro_export]

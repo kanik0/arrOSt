@@ -117,7 +117,8 @@ Useful runtime commands:
 - Multi-window GUI terminal sessions with independent state.
 - File manager backed by the current VFS API.
 - Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, minimal TCP state machine with BSD socket syscalls, and `curl` support for UDP and HTTP.
-- Unix network utilities available as `/bin/*` executables and shell commands: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`.
+- Unix network utilities as kernel shell commands and `/bin/*` stubs: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`.
+- User-space ring-3 ELF binaries (M19 Phase 2): `/bin/netstat` (reads `/proc/net/tcp`), `/bin/ifconfig` (reads `/proc/net/dev`), `/bin/arp` (reads `/proc/net/arp`), `/bin/ss` (socket stats from `/proc/net/tcp`), `/bin/nc` (TCP client via `connect`/`send`/`recv` syscalls).
 - DoomGeneric runtime with dedicated window, keyboard capture, configurable viewport filter, and audio status/control commands.
 
 ## Known limitations
