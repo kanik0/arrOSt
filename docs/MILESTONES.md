@@ -12,7 +12,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 |-----------|-------|--------|
 | **M11** | Kernel Page-Table Isolation (KPTI) | **Complete** |
 | **M12** | VFS-Backed ELF Launch + Exec Groundwork | **Complete** |
-| **M13** | fork + Copy-on-Write + Demand Paging | Not started |
+| **M13** | fork + Copy-on-Write + Demand Paging | **Complete** |
 | **M14** | Timer-Driven Hard Preemption | **Complete** |
 | **M15** | Extended Syscall Surface | **Complete** (Phase A) |
 | **M16** | Extended ProcFS | **Complete** |
@@ -152,109 +152,29 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 - TCP retransmission queue with RTO and Karn's algorithm: QEMU's slirp stack provides reliable delivery; retransmission does not affect observable behavior in this environment.
 - User-space ring-3 ELF binaries for each utility: depends on M22 (`execve`); kernel-mediated dispatch remains the active path.
 
+### M13: fork + Copy-on-Write + Demand Paging
+
+**Status**: Complete
+
+**Delivered**:
+- `kernel/src/mem/vma.rs`: `VmaEntry` / `VmaFlags` with `READ`, `WRITE`, `EXEC`, `COW`, `ANON` bits; `MAX_VMAS = 16` per process.
+- `Ring3ProcessContext` extended with `vma_list: [Option<VmaEntry>; MAX_VMAS]`, `vma_count`, `brk_end`; VMA list seeded from ELF segments in `apply_process_image`.
+- **`SYS_FORK = 23`** (`crates/arrostd`): `syscall_fork_ring3()` clones parent address space with CoW; marks all writable VMAs `COW` in both parent and child; child receives return value 0.
+- **`create_fork_child_image()`** (`ring3_groundwork`): creates child page-table root; maps each parent page as read-only; shares `Arc<UserPageHolder>` (ref-count ≥ 2 signals shared frame).
+- **`handle_cow_fault()`** (`ring3_groundwork`): on write fault to a CoW page — if exclusively owned (`Arc::strong_count == 1`) re-enables write permission; if shared allocates a private copy, remaps, clears CoW flag in VMA.
+- **`alloc_and_map_demand_page()`** (`ring3_groundwork`): allocates a zeroed 4 KiB page on first access to an `ANON` VMA; maps with requested permissions.
+- **`on_ring3_page_fault_internal()`** (`proc/mod`): dispatches write-fault to `handle_cow_fault` for CoW VMAs; dispatches to `alloc_and_map_demand_page` for anonymous VMAs; returns `false` (mark faulted) for unmapped addresses.
+- **`SYS_MMAP = 41`** (previously ENOSYS stub): `syscall_mmap_ring3()` allocates anonymous demand-paged VMAs (`MAP_ANONYMOUS`); returns start address; non-anonymous mappings return `ENOSYS`.
+- **`SYS_BRK = 44`** (previously ENOSYS stub): `syscall_brk_ring3()` queries and extends program break; expands heap VMA demand-paged.
+- **`fork()`**, **`mmap_anon()`**, **`brk()`** runtime helpers in `crates/arrostd/src/lib.rs`.
+- `smoke-fork` xtask harness for both `x86_64` and `aarch64`: launches `ring3 run init`, verifies `"fork: parent=X child=Y"` kernel log.
+- Physical frame reference counting implemented via `Arc<UserPageHolder>` (strong count replaces the proposed `BTreeMap<u64, u16>`).
+
+**Not delivered** (tracked in M21): `munmap`, `mprotect`, full VMA shrink, `/proc/<pid>/maps`.
+
 ---
 
 ## Planned milestones
-
-### M13: fork + Copy-on-Write + Demand Paging
-
-**Status**: Not started
-**Goal**: Implement `fork()` with CoW page sharing and demand-paged user mappings.
-
-**Dependencies**: M14 (preemption, done), M11 (KPTI, done).
-
-#### Phase A: VMA tracking + demand paging
-
-##### Step A1: Introduce VMA (Virtual Memory Area) tracking
-**Files to create**: `kernel/src/mem/vma.rs`
-**Files to modify**: `kernel/src/proc/mod.rs`
-
-1. Define:
-   ```rust
-   pub struct Vma {
-       pub start: u64,
-       pub end: u64,
-       pub flags: VmaFlags,
-       pub backing: VmaBacking,
-   }
-
-   bitflags! {
-       pub struct VmaFlags: u8 {
-           const READ  = 0x01;
-           const WRITE = 0x02;
-           const EXEC  = 0x04;
-           const COW   = 0x08;
-       }
-   }
-
-   pub enum VmaBacking {
-       Anonymous,
-       ElfSegment { data_offset: usize, data_len: usize },
-       Cow { original_frame: u64 },
-   }
-   ```
-2. Add `vmas: Vec<Vma>` to `Ring3ProcessContext`.
-3. During ELF loading in `ring3_groundwork.rs`, create VMA entries for each `PT_LOAD` segment and the user stack.
-
-##### Step A2: Extend page-fault handler for demand paging
-**Files to modify**: `kernel/src/arch/x86_64/trampoline.rs`, `kernel/src/arch/aarch64/trampoline.rs`, `kernel/src/proc/mod.rs`
-
-1. In the page-fault handler, before marking a process as `faulted`, call `try_demand_page(pid, fault_addr, is_write)`.
-2. `try_demand_page` looks up the VMA list for the faulting process:
-   - If address is in a valid VMA: allocate a physical frame, zero it (anonymous) or copy ELF data (segment-backed), map it into the process page table, return `Ok(())`.
-   - If no matching VMA: return `Err(())` -> mark `faulted` as before.
-3. On x86_64: detect fault type from error code (bit 1 = write, bit 2 = user, bit 4 = instruction fetch).
-4. On aarch64: detect from ESR_EL1 ISS (data abort class, WnR bit).
-
-##### Step A3: Physical frame reference counting
-**Files to create**: `kernel/src/mem/frame.rs`
-
-1. Global `static FRAME_REFCOUNTS: Mutex<BTreeMap<u64, u16>>` (physical page address -> refcount).
-2. `frame_ref_inc(phys: u64)`, `frame_ref_dec(phys: u64) -> bool` (true if refcount reached 0 -> free frame).
-3. On process exit, walk all user-mapped pages and decrement refcounts; free frames where refcount hits 0.
-4. Default refcount for newly allocated frames: 1.
-
-#### Phase B: fork + Copy-on-Write
-
-##### Step B1: Add `SYS_FORK` syscall
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`
-
-1. Add `pub const SYS_FORK: u64 = 53;` (next available after `SYS_RECV = 52`).
-2. Gate under `CAP_PROC` capability.
-
-##### Step B2: Implement fork
-**Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/proc/ring3_groundwork.rs`
-
-1. `sys_fork(caller_pid) -> i64`:
-   - Allocate new PID and `Ring3ProcessContext`.
-   - Clone parent's VMA list.
-   - Create new page-table root.
-   - For each mapped user page in the parent:
-     - Set parent PTE to read-only.
-     - Copy PTE into child page table (same physical frame, read-only).
-     - Mark VMA as `COW` in both parent and child.
-     - `frame_ref_inc()` on the shared physical frame.
-   - Clone parent fd table (dup all open descriptors).
-   - Copy parent trap frame into child; set child return value = 0.
-   - Set parent return value = child PID.
-   - Enqueue child as `ready`.
-   - Return child PID to parent.
-2. Limit: max 8 concurrent ring-3 processes (to bound memory usage).
-
-##### Step B3: CoW page-fault handling
-**Files to modify**: `kernel/src/proc/mod.rs` (the `try_demand_page` function)
-
-1. On write fault to a read-only page with `COW` flag in VMA:
-   - If frame refcount == 1: just make PTE writable again, clear COW.
-   - If refcount > 1: allocate new frame, copy old frame contents, map new frame as writable, `frame_ref_dec()` on old frame.
-2. Flush TLB entry for the faulting address.
-
-#### Testing
-1. `smoke-fork`: parent forks, child writes to shared page, parent reads old value.
-2. `smoke-fork-cow`: after fork, child and parent write different values; verify independence.
-3. All existing smoke tests must pass unchanged.
-
----
 
 ### M20: Signal Infrastructure
 
@@ -800,29 +720,28 @@ All global mutable state must be protected:
 
 | Priority | Milestone | Rationale |
 |----------|-----------|-----------|
-| 1 | **M13**: fork + CoW + Demand Paging | Foundation for Unix process model |
-| 2 | **M20**: Signal Infrastructure | Required for proper process management |
-| 3 | **M21**: Full mmap / VMA | Needed by many programs |
-| 4 | **M22**: execve Syscall | True Unix exec model |
-| 5 | **M23**: /dev Filesystem | Standard Unix device access |
-| 6 | **M24**: Shell Pipes + Process Groups | Core shell usability |
-| 7 | **M25**: ANSI Terminal | Visual quality of life |
-| 8 | **M26**: Environment Variables | Process configuration |
-| 9 | **M28**: RTC + Wall-Clock Time | Timestamps |
-| 10 | **M29**: Block Cache | Performance improvement |
-| 11 | **M30**: Multi-User + Login | Security model |
-| 12 | **M31**: Doom Enhancements | Fun factor |
-| 13 | **M27**: SMP / Multi-Core | Advanced scheduling |
-| 14 | **M18**: Hardware Abstraction | Platform portability |
+| 1 | **M20**: Signal Infrastructure | Required for proper process management |
+| 2 | **M21**: Full mmap / VMA | Needed by many programs |
+| 3 | **M22**: execve Syscall | True Unix exec model |
+| 4 | **M23**: /dev Filesystem | Standard Unix device access |
+| 5 | **M24**: Shell Pipes + Process Groups | Core shell usability |
+| 6 | **M25**: ANSI Terminal | Visual quality of life |
+| 7 | **M26**: Environment Variables | Process configuration |
+| 8 | **M28**: RTC + Wall-Clock Time | Timestamps |
+| 9 | **M29**: Block Cache | Performance improvement |
+| 10 | **M30**: Multi-User + Login | Security model |
+| 11 | **M31**: Doom Enhancements | Fun factor |
+| 12 | **M27**: SMP / Multi-Core | Advanced scheduling |
+| 13 | **M18**: Hardware Abstraction | Platform portability |
 
 ### Dependency graph
 
 ```
-M14 (done) ─┬─> M13 (fork/CoW) ──┬─> M22 (execve) ──> M24 (pipes+groups)
-             │                     │                ──> M26 (env vars)
-             │                     │                ──> M30 (multi-user)
-             │                     └─> M20 (signals)
-             │                     └─> M21 (mmap/VMA) ─> M22 (execve)
+M14 (done) ─┬─> M13 (done/fork+CoW) ──┬─> M22 (execve) ──> M24 (pipes+groups)
+             │                          │                ──> M26 (env vars)
+             │                          │                ──> M30 (multi-user)
+             │                          └─> M20 (signals)
+             │                          └─> M21 (mmap/VMA) ─> M22 (execve)
 M15 (done) ──┘
 M11 (done) ──┘
 
@@ -833,5 +752,5 @@ M28 (RTC) ── standalone
 M29 (cache) ── standalone
 M18 (HAL) ── standalone
 M31 (Doom) ── partially depends on M18 (audio), M22 (user-mode doom)
-M27 (SMP) ── depends on M13 (per-process page tables)
+M27 (SMP) ── depends on M13 (done, per-process page tables)
 ```
