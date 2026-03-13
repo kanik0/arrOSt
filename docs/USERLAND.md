@@ -55,7 +55,7 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 - Ring-3 shell controls:
   - `ring3 ps`
   - `ring3 wait <pid|any|all>`
-- Ring-3 preemption points are enforced at syscall/trap boundaries (`yield`, `sleep`, `exit`, plus syscall-timeslice return to kernel).
+- Ring-3 preemption is both timer-driven (hard preemption at any instruction boundary, M14) and syscall-driven (`yield`, `sleep`, `exit`, plus syscall-timeslice return to kernel).
 - `x86_64` uses CPL3 `int 0x80`; `aarch64` uses EL0 `SVC`; both route through shared process-layer capability policy and accounting.
 - Ring-3 syscalls copy user buffers through the owning process address space; the kernel never blindly dereferences user virtual pointers.
 - User-mode CPU faults transition the active ring-3 task to `faulted` and return to the kernel runtime.
@@ -68,8 +68,8 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 
 - Ring-3 address-space roots currently clone the active kernel root table and map a fixed trampoline user page as KPTI groundwork; trimming kernel mappings remains deferred until the kernel no longer executes from low virtual addresses during CR3/TTBR switches.
 - There is no `execve` syscall yet; `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` still uses embedded smoke/debug artifacts.
-- Preemption is not yet hard timer-driven at arbitrary instruction boundaries.
-- Syscall surface remains intentionally small.
+- Timer-driven hard preemption is implemented (M14 complete): PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) preempt ring-3 at any instruction boundary. Quantum = 10 ticks.
+- Syscall surface: 52 syscalls at ABI revision 5 (lifecycle, filesystem, directory/path, process identity, pipe IPC, BSD sockets, plus signal/memory stubs).
 
 ## Relevant files
 

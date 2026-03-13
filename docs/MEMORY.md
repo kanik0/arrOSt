@@ -29,7 +29,7 @@ Ring-3 runtime notes:
 - Ring-3 ELF processes now own a dedicated address-space root per process.
 - User ELF segments and stacks are mapped into a dedicated user virtual range (current linker scripts place user code/data near `0x0000_2000_0000_0000`).
 - Kernel/user copies translate user virtual addresses through the owning process page tables and then access the backing memory via kernel-visible physical aliases.
-- Ring-3 page-table creation currently clones the active root table verbatim, then overlays user mappings plus a fixed trampoline page (`mem::TRAMPOLINE_VADDR`); tighter KPTI trimming is deferred until kernel runtime no longer depends on low virtual addresses across CR3/TTBR switches.
+- M11 KPTI transition wiring is complete: ring-3 page tables include a dedicated trampoline page (`mem::TRAMPOLINE_VADDR`), and syscall/fault transitions route through architecture trampoline entry/exit paths with per-CPU KPTI scratch-assisted CR3/TTBR switching. Ring-3 roots currently still clone the active kernel root table as the kernel executes from low virtual addresses during switches.
 
 Heap allocator:
 

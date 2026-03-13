@@ -239,95 +239,40 @@ Three scheduler tables coexist:
 4. Validate with smoke tests or interactive QEMU session
 5. Update relevant docs if externally visible behavior changed
 
-## Current Milestones (from Known Limitations)
+## Milestones
 
-### M11: Kernel Page-Table Isolation (KPTI)
-**Status**: Implemented
-**Summary**: Ring-3 page tables now preserve only upper-half kernel mappings; each process maps a dedicated trampoline page at a fixed user-accessible address. Syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU KPTI scratch root/RSP tracking.
-- `kernel/src/arch/x86_64/trampoline.rs`: CR3 switch on int 0x80 entry/exit; per-CPU KPTI scratch store
-- `kernel/src/arch/aarch64/trampoline.rs`: TTBR0 switch on SVC/fault entry/exit; SP_EL0 scratch save/restore
-- `proc/mod.rs`: `KPTI_KERNEL_ROOT_TABLE`, `KPTI_USER_ROOT_TABLE`, `KPTI_USER_RSP_SCRATCH`, `KPTI_KERNEL_RSP_SCRATCH` atomics; `kpti_set_*` helpers
-- `ring3_groundwork.rs`: trampoline page allocated and mapped into each ring-3 address space
-- `cargo xtask smoke-kpti-m11` harness verifies the trampoline roundtrip
-**Remaining**: full separation of kernel mappings beyond upper-half (deeper KPTI); per-CPU GS-based scratch on x86_64 (currently uses shared atomics).
+### Completed
+| # | Milestone | Summary |
+|---|-----------|---------|
+| M11 | KPTI | Trampoline infrastructure, per-CPU scratch, CR3/TTBR0 switching on entry/exit |
+| M12 | VFS-backed ELF launch | `/bin/*` auto-dispatch, kernel-mediated spawn-from-path, 18 seeded binaries |
+| M14 | Timer-driven preemption | PIT IRQ0 / GIC IRQ27, 10-tick quantum, full GPR save/restore |
+| M15 | Extended syscalls | 52 syscalls total, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
+| M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
+| M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
 
-### M12: Filesystem-backed execve [WORK IN PROGRESS]
-**Status**: In Progress
-**Limitation**: "There is no filesystem-backed execve path yet; ring-3 apps are still embedded artifacts (ring3_init, ring3_doom)."
-**Goal**: Implement `execve` syscall that loads ELF binaries from the VFS (e.g., `/bin/init`, `/bin/doom`) into a fresh ring-3 process with new address space.
+### In progress
+| # | Milestone | Remaining |
+|---|-----------|-----------|
+| M19 | TCP/IP + utilities | Passive TCP, congestion control, retransmission, `traceroute`/`host`/`dig` |
 
-### M13: fork + Copy-on-Write + Demand Paging
-**Status**: Implemented
-**Summary**: `SYS_FORK` (23) clones the active ring-3 process with CoW-shared address space. Key components:
-- `kernel/src/mem/vma.rs`: `VmaEntry` / `VmaFlags` with READ/WRITE/EXEC/COW/ANON bits; `contains()`, `with_cow()`, `without_cow()` helpers
-- `ring3_groundwork.rs`: `UserPageHolder` (Arc-wrapped page + phys/vaddr/writable/executable), `create_fork_child_image`, `handle_cow_fault`, `alloc_and_map_demand_page`
-- `proc/mod.rs`: `syscall_fork_ring3` (CoW marking, child task allocation), `syscall_mmap_ring3` (ANON VMAs), `syscall_brk_ring3` (program break), `on_ring3_page_fault_internal` (CoW + demand-page dispatch)
-- Arch wiring: x86_64 page-fault handler tries CoW/demand before marking process faulted; aarch64 EL0 data/instruction abort handler added; 4th syscall arg (r10 / x3) wired through both arches
-- `cargo xtask smoke-fork` harness verifies the "fork: parent=X child=Y" kernel log marker
-**Remaining**: swap backend to virtio-blk; `SYS_FORK` return value in child (currently hardcoded 0 in trap frame); `/proc/<pid>/maps`.
-
-### M14: Timer-Driven Hard Preemption
-**Status**: Implemented
-**Summary**: PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) now preempt ring-3 processes at any instruction boundary. Naked ISR (x86_64) / full-save EL0 IRQ vector (aarch64) capture all GPRs; saved to static frame; restored on rescheduling. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`).
-
-### M15: Extended Syscall Surface
-**Status**: Implemented
-**Summary**: Added 22 new syscalls (numbers 25–46) across four phases:
-- Phase A1 (directory ops): `mkdir` `rmdir` `unlink` `rename` `link` `symlink` `readlink` `getcwd` `chdir` `getdents`
-- Phase A2 (process identity): `getppid` `getuid` `getgid` `kill`
-- Phase A3 (memory, stubs): `mmap` `munmap` `mprotect` `brk` → return `ENOSYS`
-- Phase A4 (signal stubs): `sigaction` `sigreturn` → return `ENOSYS`
-- Phase A4 (pipe IPC): `pipe` `pipe2` with 8-slot global table, 4 KiB circular buffers, fd integration
-- Shell prompt upgraded from `arrost> ` to `user@arrost /path> ` (serial + GUI terminal)
-**Remaining**: Phase B signal infrastructure (delivery, frames, masking); full mmap/VMA layer.
-
-### M16: Extended ProcFS
-**Status**: Implemented
-**Summary**: Expanded `/proc` from 5 fixed entries to a full tree:
-- Global: `version`, `cpuinfo`, `meminfo` (+ existing `mounts`, `uptime`, `ps`)
-- Network subsystem: `/proc/net/` directory with `dev`, `arp`, `tcp`
-- Per-process directories: `/proc/<pid>/` dynamically enumerated for all live PIDs, each with `status`, `cmdline`, `stat`
-- Added `mem::heap_size_bytes()`, `net::arp_snapshot()`, `net::ArpEntryInfo`
-**Remaining**: `/proc/<pid>/maps` (needs M13), `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`, `/proc/net/route`
-
-### M17: Full-Data Journaling for diskfs-v2
-**Status**: Implemented
-**Summary**: `diskfs-v2` now supports three journal modes selectable at runtime:
-- `MetadataOnly`: original behavior — only inode/directory metadata journaled
-- `Ordered` (default): data written before metadata commit for crash-safe ordering
-- `Full`: both data blocks and metadata blocks staged in journal before final placement
-- Shell commands: `journal` (show current mode + stats), `journal mode <metadata|ordered|full>` (switch mode)
-- `kernel/src/fs/journal.rs`: `JournalMode` enum, full-data record type, mode-aware commit and replay
-**Remaining**: journal capacity expansion (currently capped at 63 staged sectors per transaction); checkpoint mechanism for reclaiming journal space.
-
-### M18: Hardware Diversification Beyond QEMU/Virtio
-**Status**: Planned
-**Limitation**: "Storage, graphics, and device support remain QEMU/virtio-first."
-**Goal**: Add a device abstraction layer and at least one non-virtio backend per class (storage, net, graphics).
-
-### M19: Production TCP/IP Stack + Unix Network Utilities
-**Status**: In Progress
-**Limitation**: "Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack."
-**Delivered**:
-- TCP state machine: SYN_SENT → ESTABLISHED → FIN_WAIT_1 → **FIN_WAIT_2** → **TIME_WAIT** (2*MSL timer, ~4 s) → CLOSED; CLOSE_WAIT → LAST_ACK; simultaneous-close path via CLOSING → TIME_WAIT
-- **TCP congestion control**: slow-start (`cwnd < ssthresh` → `cwnd += MSS`/ACK) + congestion-avoidance (`cwnd += MSS²/cwnd`/ACK); `sent_una` tracks unacknowledged data; `tcp_send_data` gated by cwnd
-- BSD socket syscalls: socket/connect/send/recv (TCP), sendto/recvfrom (UDP); **bind/listen/accept fully implemented** (kernel + ring-3 dispatch); `FdTarget::TcpUnbound` → `TcpListener` → `TcpSocket` fd lifecycle
-- ABI revision 5 with `TcpConnectReq` / `TcpSendReq` / `TcpRecvReq` kernel structures
-- `arrostd::runtime` shims: `tcp_connect()`, `tcp_send()`, `tcp_recv()`, `ping()`, **`socket()`, `bind_tcp()`, `listen()`, `accept()`**
-- **SYS_PING (53)**: kernel ICMP echo syscall; `arrostd::runtime::ping(ip)` ring-3 shim
-- **`/proc/net/route`**: synthetic Linux-format routing table (gateway + connected route + loopback)
-- Kernel-side shell commands and `/bin/*` stubs: netstat, ifconfig, route, arp, ss, nc, ip, ping
-- **User-space ring-3 ELF binaries** (M19 Phase 2): `/bin/netstat`, `/bin/ifconfig`, `/bin/arp`, `/bin/ss`, `/bin/nc`, **`/bin/route`**, **`/bin/ip`**, **`/bin/ping`**
-  - `netstat`: reads `/proc/net/tcp`, prints "Active Internet connections" header + table
-  - `ifconfig`: reads `/proc/net/dev`, relays interface statistics
-  - `arp`: reads `/proc/net/arp`, relays ARP cache (Linux format with "IP address" header)
-  - `ss`: reads `/proc/net/tcp`, prints "Netid" header + socket stats
-  - `nc`: TCP client + **TCP server** (`nc -l <port>` uses socket/bind/listen/accept, relays traffic)
-  - `route`: reads `/proc/net/route`, relays routing table
-  - `ip`: multi-subcommand (`addr`/`link` → `/proc/net/dev`; `route` → `/proc/net/route`; `neigh` → `/proc/net/arp`)
-  - `ping`: sends ICMP echo via SYS_PING, prints per-reply RTT in Linux ping format
-- Updated `smoke-net` harness to verify user-space binary output
-**Remaining**: `/bin/route` needs `/proc/net/route` live gateway data; `/bin/ip` full subcommand surface; `/bin/ping` flood/count modes; congestion control retransmit timer; traceroute, host, dig (not planned).
+### Planned
+| # | Milestone | Goal |
+|---|-----------|------|
+| M13 | fork + CoW + demand paging | `fork()` with CoW pages, VMA tracking, demand-paged mappings |
+| M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
+| M21 | Full mmap / VMA | Replace mmap/munmap/mprotect/brk stubs with real VMA manager |
+| M22 | execve syscall | True `execve` exposing VFS ELF loading to user-space |
+| M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
+| M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
+| M25 | ANSI terminal | VT100 escape sequences, 16-color palette, cursor control |
+| M26 | Environment variables | Per-process env, `export`, `$VAR` expansion, inheritance |
+| M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
+| M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
+| M29 | Block cache | LRU sector cache, write-back, cache stats |
+| M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
+| M31 | Doom enhancements | Audio mixing, savegames, fullscreen, network multiplayer groundwork |
+| M18 | Hardware abstraction | Device traits, ramdisk, loopback, device registry |
 
 ---
 
