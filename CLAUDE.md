@@ -250,11 +250,10 @@ Three scheduler tables coexist:
 | M15 | Extended syscalls | 52 syscalls total, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
 | M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
 | M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
+| M19 | TCP/IP + utilities | Ethernet/ARP/IPv4/ICMP/UDP/TCP stack; `ping` (-c, RTT, hostname), `traceroute`, `host`, `dig`, `curl`; Ctrl+C; high-res RDTSC/CNTVCT RTT |
 
 ### In progress
-| # | Milestone | Remaining |
-|---|-----------|-----------|
-| M19 | TCP/IP + utilities | Passive TCP, congestion control, retransmission, `traceroute`/`host`/`dig` |
+*(none)*
 
 ### Planned
 | # | Milestone | Goal |
