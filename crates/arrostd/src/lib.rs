@@ -37,6 +37,7 @@ pub mod syscall {
     pub const SYS_FSTAT: u64 = 20;
     pub const SYS_DUP: u64 = 21;
     pub const SYS_DUP2: u64 = 22;
+    pub const SYS_FORK: u64 = 23;
     pub const SYS_MKDIR: u64 = 25;
     pub const SYS_RMDIR: u64 = 26;
     pub const SYS_UNLINK: u64 = 27;
@@ -57,6 +58,15 @@ pub mod syscall {
     pub const SYS_MUNMAP: u64 = 42;
     pub const SYS_MPROTECT: u64 = 43;
     pub const SYS_BRK: u64 = 44;
+
+    pub const MAP_SHARED: u32 = 0x01;
+    pub const MAP_PRIVATE: u32 = 0x02;
+    pub const MAP_ANONYMOUS: u32 = 0x20;
+    pub const MAP_FIXED: u32 = 0x10;
+    pub const PROT_NONE: u32 = 0x00;
+    pub const PROT_READ: u32 = 0x01;
+    pub const PROT_WRITE: u32 = 0x02;
+    pub const PROT_EXEC: u32 = 0x04;
     pub const SYS_PIPE: u64 = 45;
     pub const SYS_PIPE2: u64 = 46;
     pub const SYS_BIND: u64 = 47;
@@ -65,6 +75,7 @@ pub mod syscall {
     pub const SYS_CONNECT: u64 = 50;
     pub const SYS_SEND: u64 = 51;
     pub const SYS_RECV: u64 = 52;
+    pub const SYS_PING: u64 = 53;
 
     pub mod app {
         pub const INIT: u64 = 1;
@@ -265,12 +276,14 @@ pub mod syscall {
             SYS_FSTAT => "fstat",
             SYS_DUP => "dup",
             SYS_DUP2 => "dup2",
+            SYS_FORK => "fork",
             SYS_BIND => "bind",
             SYS_LISTEN => "listen",
             SYS_ACCEPT => "accept",
             SYS_CONNECT => "connect",
             SYS_SEND => "send",
             SYS_RECV => "recv",
+            SYS_PING => "ping",
             SYS_MKDIR => "mkdir",
             SYS_RMDIR => "rmdir",
             SYS_UNLINK => "unlink",
@@ -325,6 +338,8 @@ pub mod syscall {
         pub const EPIPE: isize = -32;
         pub const ESRCH: isize = -3;
         pub const EEXIST: isize = -17;
+        pub const ECHILD: isize = -10;
+        pub const ENOMEM: isize = -12;
 
         pub const fn name(code: isize) -> &'static str {
             match code {
@@ -355,6 +370,8 @@ pub mod syscall {
                 EPIPE => "EPIPE",
                 ESRCH => "ESRCH",
                 EEXIST => "EEXIST",
+                ECHILD => "ECHILD",
+                ENOMEM => "ENOMEM",
                 _ => "UNKNOWN",
             }
         }
@@ -438,10 +455,10 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_CHDIR, SYS_CLOSE, SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE,
-        SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK,
-        SYS_MKDIR, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
-        SYS_SYMLINK, SYS_UNLINK, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXIT, SYS_FORK, SYS_FREAD,
+        SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPPID, SYS_GETUID,
+        SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK,
+        SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK, SYS_UNLINK, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -624,6 +641,44 @@ pub mod runtime {
                 inlateout("x0") arg0 => result,
                 in("x1") arg1,
                 in("x2") arg2,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> isize {
+        let mut result = number;
+        // SAFETY: follows the ArrOSt `int 0x80` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inlateout("rax") result,
+                in("rdi") arg0,
+                in("rsi") arg1,
+                in("rdx") arg2,
+                in("r10") arg3,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        result as isize
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> isize {
+        let mut result: u64;
+        // SAFETY: follows the ArrOSt EL0 `svc` register ABI.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") number,
+                inlateout("x0") arg0 => result,
+                in("x1") arg1,
+                in("x2") arg2,
+                in("x3") arg3,
                 options(nostack)
             );
         }
@@ -825,6 +880,23 @@ pub mod runtime {
         syscall2(SYS_PIPE2, pipefd.as_mut_ptr() as u64, flags as u64)
     }
 
+    /// Fork the current process. Returns child PID to parent, 0 to child, or negative errno.
+    pub fn fork() -> isize {
+        syscall0(SYS_FORK)
+    }
+
+    /// Map anonymous memory. Only MAP_ANONYMOUS|MAP_PRIVATE is supported.
+    /// Returns the mapped address (as isize) or negative errno.
+    pub fn mmap_anon(addr: u64, len: u64, prot: u32, flags: u32) -> isize {
+        syscall4(SYS_MMAP, addr, len, prot as u64, flags as u64)
+    }
+
+    /// `brk(addr)` — returns new program break or negative errno.
+    /// Pass 0 to query current break.
+    pub fn brk(addr: u64) -> isize {
+        syscall1(SYS_BRK, addr)
+    }
+
     pub fn copy_fd_to_stdout(fd: u32, buffer: &mut [u8]) -> isize {
         loop {
             let read = fread(fd, buffer);
@@ -840,6 +912,69 @@ pub mod runtime {
                 return 0;
             }
         }
+    }
+
+    /// Connect a TCP socket to `dst_ip:dst_port` using `src_port` as the local
+    /// port.  On success returns a non-negative file descriptor that refers to
+    /// the established TCP connection.
+    pub fn tcp_connect(req: &crate::syscall::TcpConnectReq) -> isize {
+        syscall2(
+            crate::syscall::SYS_CONNECT,
+            req as *const crate::syscall::TcpConnectReq as u64,
+            core::mem::size_of::<crate::syscall::TcpConnectReq>() as u64,
+        )
+    }
+
+    /// Send `data` on the established TCP connection identified by `fd`.
+    /// Returns bytes accepted or a negative errno.
+    pub fn tcp_send(fd: u32, data: &[u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_SEND,
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    }
+
+    /// Receive up to `buf.len()` bytes from the TCP connection identified by
+    /// `fd`.  Returns bytes read, 0 on EOF, or a negative errno.
+    pub fn tcp_recv(fd: u32, buf: &mut [u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_RECV,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+
+    /// Send one ICMP echo request to `ip` (4-byte array) and wait for reply.
+    /// Returns round-trip time in milliseconds (>=0) or negative errno on failure.
+    pub fn ping(ip: [u8; 4]) -> isize {
+        syscall2(crate::syscall::SYS_PING, ip.as_ptr() as u64, 4u64)
+    }
+
+    /// Create a socket.  `domain` = `AF_INET` (2), `sock_type` = `SOCK_STREAM` (1)
+    /// or `SOCK_DGRAM` (2).  Returns a non-negative fd or negative errno.
+    pub fn socket(domain: u64, sock_type: u64, protocol: u64) -> isize {
+        syscall3(crate::syscall::SYS_SOCKET, domain, sock_type, protocol)
+    }
+
+    /// Bind a SOCK_STREAM socket fd to a local port.  `port` is passed as
+    /// the second argument (the address structure argument is unused here).
+    /// Returns 0 on success or negative errno.
+    pub fn bind_tcp(fd: u32, port: u16) -> isize {
+        syscall3(crate::syscall::SYS_BIND, fd as u64, port as u64, 0u64)
+    }
+
+    /// Mark a bound socket as passive (server mode).  Returns 0 or negative errno.
+    pub fn listen(fd: u32, backlog: i32) -> isize {
+        syscall2(crate::syscall::SYS_LISTEN, fd as u64, backlog as u64)
+    }
+
+    /// Block until a new connection arrives on `fd`.  Returns a new connected fd
+    /// (non-negative) or negative errno (`EAGAIN` = no connection within timeout).
+    pub fn accept(fd: u32) -> isize {
+        syscall3(crate::syscall::SYS_ACCEPT, fd as u64, 0u64, 0u64)
     }
 }
 

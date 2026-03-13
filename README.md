@@ -94,15 +94,16 @@ Representative commands:
 - Ring-3 scheduling is round-robin with timer-driven hard preemption (10-tick quantum via PIT IRQ0 on x86_64 / GIC virtual timer IRQ27 on aarch64) and syscall-timeslice preemption.
 - Ring-3 ELF segments and stacks are mapped into dedicated per-arch user virtual ranges owned by each process (`0x0000_2000_...` on `x86_64`, `0x0000_0004_...` on `aarch64`).
 - Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
-- `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`.
-- `aarch64` ring-3 entry uses EL0 `SVC` groundwork routed into the same process-layer syscall dispatch.
-- User-mode CPU faults now transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
+- `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`; aarch64 uses EL0 `SVC`.
+- KPTI (M11): ring-3 page tables preserve only upper-half kernel mappings; each process maps a dedicated trampoline page; syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU scratch root/RSP tracking.
+- `fork` (M13): `SYS_FORK` clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
+- User-mode CPU faults transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
 - ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
 
 Current syscall surface (52 syscalls):
 
-- lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`
+- lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`, `fork`
 - capabilities: `cap_get`, `cap_drop`
 - networking: `socket`, `sendto`, `recvfrom`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`
 - filesystem: `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, `dup2`
@@ -137,7 +138,7 @@ Useful runtime commands:
 ## Known limitations
 
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
-- No `fork`, copy-on-write, demand paging, or swap.
+- `fork` (M13) is implemented with CoW page sharing and demand-paged anonymous VMAs; swap to virtio-blk and `/proc/<pid>/maps` are remaining follow-ups.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - No `/dev` filesystem or device nodes.
 - No ANSI/VT100 terminal escape sequence support.
@@ -317,6 +318,9 @@ Representative smoke commands:
 - `cargo xtask smoke-proc-spawn --arch aarch64`
 - `cargo xtask smoke-bin-exec --arch x86_64`
 - `cargo xtask smoke-bin-exec --arch aarch64`
+- `cargo xtask smoke-fork --arch x86_64`
+- `cargo xtask smoke-fork --arch aarch64`
+- `cargo xtask smoke-kpti-m11`
 - `cargo xtask smoke-fs --arch x86_64`
 - `cargo xtask smoke-fs --arch aarch64`
 - `cargo xtask smoke-ring3 --arch x86_64`

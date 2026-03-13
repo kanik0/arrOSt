@@ -15,6 +15,7 @@ const PROC_NET_DIR_INO: InodeNum = 11;
 const PROC_NET_DEV_INO: InodeNum = 12;
 const PROC_NET_ARP_INO: InodeNum = 13;
 const PROC_NET_TCP_INO: InodeNum = 14;
+const PROC_NET_ROUTE_INO: InodeNum = 15;
 
 // Per-PID inode ranges (pid fits in low bits, range tag in upper bits).
 fn pid_dir_ino(pid: u32) -> InodeNum {
@@ -60,6 +61,7 @@ pub enum ProcOpenFile {
     NetDev,
     NetArp,
     NetTcp,
+    NetRoute,
     PidStatus {
         pid: u32,
     },
@@ -93,6 +95,7 @@ impl ProcFs {
             "net/dev" => Ok(Self::file_stat(PROC_NET_DEV_INO)),
             "net/arp" => Ok(Self::file_stat(PROC_NET_ARP_INO)),
             "net/tcp" => Ok(Self::file_stat(PROC_NET_TCP_INO)),
+            "net/route" => Ok(Self::file_stat(PROC_NET_ROUTE_INO)),
             "fslist" => Ok(Self::file_stat(PROC_FSLIST_INO)),
             _ if local_path.starts_with("fslist/") => Ok(Self::file_stat(PROC_FSLIST_INO)),
             _ => {
@@ -133,10 +136,13 @@ impl ProcFs {
                     (PROC_NET_DEV_INO, FileType::Regular, "dev"),
                     (PROC_NET_ARP_INO, FileType::Regular, "arp"),
                     (PROC_NET_TCP_INO, FileType::Regular, "tcp"),
+                    (PROC_NET_ROUTE_INO, FileType::Regular, "route"),
                 ],
             ),
             "mounts" | "uptime" | "ps" | "fslist" | "self/pid" | "version" | "cpuinfo"
-            | "meminfo" | "net/dev" | "net/arp" | "net/tcp" => Err(FsError::NotADirectory),
+            | "meminfo" | "net/dev" | "net/arp" | "net/tcp" | "net/route" => {
+                Err(FsError::NotADirectory)
+            }
             _ if local_path.starts_with("fslist/") => Err(FsError::NotADirectory),
             _ => {
                 if let Some((pid, sub)) = parse_pid_path(local_path)
@@ -241,6 +247,7 @@ impl ProcFs {
             "net/dev" => Ok(ProcOpenFile::NetDev),
             "net/arp" => Ok(ProcOpenFile::NetArp),
             "net/tcp" => Ok(ProcOpenFile::NetTcp),
+            "net/route" => Ok(ProcOpenFile::NetRoute),
             "fslist" => Ok(ProcOpenFile::FsList {
                 path: {
                     let mut path = [0u8; super::MAX_OPEN_PATH_BYTES];
@@ -301,6 +308,7 @@ impl ProcFs {
             ProcOpenFile::NetDev => (PROC_NET_DEV_INO, 0),
             ProcOpenFile::NetArp => (PROC_NET_ARP_INO, 0),
             ProcOpenFile::NetTcp => (PROC_NET_TCP_INO, 0),
+            ProcOpenFile::NetRoute => (PROC_NET_ROUTE_INO, 0),
             ProcOpenFile::PidStatus { pid } => (pid_status_ino(pid), 0),
             ProcOpenFile::PidCmdline { pid } => (pid_cmdline_ino(pid), 0),
             ProcOpenFile::PidStat { pid } => (pid_stat_ino(pid), 0),

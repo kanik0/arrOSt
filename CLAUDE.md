@@ -40,6 +40,8 @@ cargo xtask smoke-bin-exec --arch x86_64 # /bin exec smoke
 cargo xtask smoke-bin-exec --arch aarch64
 cargo xtask smoke-proc-caps --arch x86_64
 cargo xtask smoke-proc-spawn --arch x86_64
+cargo xtask smoke-fork --arch x86_64      # Fork/CoW smoke
+cargo xtask smoke-fork --arch aarch64
 ```
 
 ### Environment Variables
@@ -66,6 +68,7 @@ kernel/                     Rust no_std kernel crate
         interrupts.rs       GDT/IDT/PIC/PIT + int 0x80 gate
         gdt.rs              GDT/TSS setup
         ring3.rs            CPL3 user-mode transition
+        trampoline.rs       KPTI CR3 switch entry/exit stubs (M11)
         syscall.rs          x86_64 syscall entry
         pic.rs              PIC controller
         pit.rs              PIT timer
@@ -76,6 +79,7 @@ kernel/                     Rust no_std kernel crate
         syscall.rs          aarch64 SVC syscall dispatch
         port.rs             virtio-mmio I/O port shim (25K)
         framebuffer.rs      GOP framebuffer for aarch64
+        trampoline.rs       KPTI TTBR0 switch entry/exit stubs (M11)
         mod.rs              aarch64 module
     fs/
       mod.rs                VFS facade + mount-aware path resolution
@@ -95,6 +99,7 @@ kernel/                     Rust no_std kernel crate
       mod.rs                Memory subsystem + heap allocator
       x86_64.rs             x86_64 memory (bootloader memory map)
       aarch64.rs            aarch64 memory (UEFI map handoff)
+      vma.rs                VmaEntry / VmaFlags per-process VMA tracker (M13)
     proc/
       mod.rs                Process model + scheduler (150K)
       ring3_groundwork.rs   Ring-3 ELF loader + page-table setup
@@ -168,7 +173,7 @@ Three scheduler tables coexist:
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
 - Numbers:
-  - core: write(1) read(2) exit(3) yield(4) sleep(5) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14)
+  - core: write(1) read(2) exit(3) yield(4) sleep(5) getpid(9) time_ms(10) cap_get(11) cap_drop(12) spawn(13) waitpid(14) fork(23)
   - filesystem: open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22)
   - directory/path: mkdir(25) rmdir(26) unlink(27) rename(28) link(29) symlink(30) readlink(31) getcwd(32) chdir(33) getdents(34)
   - process identity: getppid(35) getuid(36) getgid(37) kill(38)

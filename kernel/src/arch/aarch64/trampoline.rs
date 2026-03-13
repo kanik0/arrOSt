@@ -42,6 +42,16 @@ pub fn sync_dispatch_transition(frame_ptr: *mut syscall::SyncFrame) -> u64 {
         return result;
     }
 
+    // Data/instruction abort from EL0: attempt CoW copy or demand-page allocation first (M13).
+    if from_el0 {
+        let ec = syscall::exception_class(esr);
+        if (ec == 0x24 || ec == 0x20) && syscall::handle_lower_el0_page_fault(esr, elr, sp_el0) {
+            // Fault handled: eret will re-execute the faulting instruction.
+            trampoline_sync_exit();
+            return 0;
+        }
+    }
+
     if from_el0 && syscall::handle_lower_sync_fault_if_smoke(esr, elr, spsr, sp_el0) {
         trampoline_sync_exit();
         // Unreachable in current smoke path (resume to kernel), but keep explicit result.

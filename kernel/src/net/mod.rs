@@ -54,6 +54,8 @@ const UDP_MAILBOX_CAP: usize = 512;
 const CURL_HTTP_BUF: usize = 2048;
 const CURL_WAIT_TICKS: u64 = 300;
 const MAX_TCP_CONNS: usize = 4;
+const MAX_TCP_LISTENERS: usize = 4;
+const LISTEN_QUEUE_SIZE: usize = 4;
 const TCP_RX_BUF: usize = 2048;
 const TCP_CONNECT_TICKS: u64 = 400;
 const DHCP_WAIT_TICKS: u64 = 400;
@@ -427,11 +429,14 @@ impl PendingHttpCurl {
 enum TcpState {
     Closed,
     SynSent,
+    SynReceived,
     Established,
     FinWait1,
+    FinWait2,
     CloseWait,
     Closing,
     LastAck,
+    TimeWait,
     Reset,
 }
 
@@ -441,15 +446,27 @@ impl TcpState {
         match self {
             Self::Closed => "CLOSED",
             Self::SynSent => "SYN_SENT",
+            Self::SynReceived => "SYN_RECEIVED",
             Self::Established => "ESTABLISHED",
             Self::FinWait1 => "FIN_WAIT_1",
+            Self::FinWait2 => "FIN_WAIT_2",
             Self::CloseWait => "CLOSE_WAIT",
             Self::Closing => "CLOSING",
             Self::LastAck => "LAST_ACK",
+            Self::TimeWait => "TIME_WAIT",
             Self::Reset => "RESET",
         }
     }
 }
+
+/// 2*MSL timeout in ticks for TIME_WAIT state (≈4 s at 100 Hz).
+const TIME_WAIT_TICKS: u64 = 400;
+/// Initial congestion window (bytes).
+const TCP_INIT_CWND: u32 = 1460;
+/// Initial slow-start threshold (bytes).
+const TCP_INIT_SSTHRESH: u32 = 65535;
+/// Maximum segment size used by congestion control.
+const TCP_MSS: u32 = 1460;
 
 #[derive(Clone, Copy)]
 struct TcpConn {
@@ -463,6 +480,14 @@ struct TcpConn {
     rx_buf: [u8; TCP_RX_BUF],
     rx_len: usize,
     fin_received: bool,
+    /// Tick at which TIME_WAIT / FinWait2 expires (0 = not set).
+    close_deadline: u64,
+    /// Congestion window (bytes in flight allowed).
+    cwnd: u32,
+    /// Slow-start threshold.
+    ssthresh: u32,
+    /// Oldest unacknowledged sequence number.
+    sent_una: u32,
 }
 
 impl TcpConn {
@@ -478,6 +503,10 @@ impl TcpConn {
             rx_buf: [0; TCP_RX_BUF],
             rx_len: 0,
             fin_received: false,
+            close_deadline: 0,
+            cwnd: TCP_INIT_CWND,
+            ssthresh: TCP_INIT_SSTHRESH,
+            sent_una: 0,
         }
     }
 
@@ -487,6 +516,53 @@ impl TcpConn {
 
     fn is_active(&self) -> bool {
         !matches!(self.state, TcpState::Closed | TcpState::Reset)
+    }
+}
+
+/// A passive-listen socket waiting for incoming connections.
+#[derive(Clone, Copy)]
+struct TcpListener {
+    /// True when this slot has been allocated via `tcp_bind`.
+    active: bool,
+    /// Local port we're listening on.
+    local_port: u16,
+    /// True once `tcp_listen` has been called (SYS_LISTEN).
+    listening: bool,
+    /// Indices into `tcp_conns` of accepted-but-not-yet-taken connections.
+    accept_queue: [u8; LISTEN_QUEUE_SIZE],
+    /// Number of entries in `accept_queue`.
+    accept_len: usize,
+}
+
+impl TcpListener {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            local_port: 0,
+            listening: false,
+            accept_queue: [0; LISTEN_QUEUE_SIZE],
+            accept_len: 0,
+        }
+    }
+
+    fn push_conn(&mut self, conn_idx: u8) -> bool {
+        if self.accept_len >= LISTEN_QUEUE_SIZE {
+            return false;
+        }
+        self.accept_queue[self.accept_len] = conn_idx;
+        self.accept_len += 1;
+        true
+    }
+
+    #[allow(dead_code)]
+    fn pop_conn(&mut self) -> Option<u8> {
+        if self.accept_len == 0 {
+            return None;
+        }
+        let idx = self.accept_queue[0];
+        self.accept_queue.copy_within(1..self.accept_len, 0);
+        self.accept_len -= 1;
+        Some(idx)
     }
 }
 
@@ -649,6 +725,7 @@ struct NetState {
     last_udp: LastUdp,
     udp_mailbox: UdpMailbox,
     tcp_conns: [TcpConn; MAX_TCP_CONNS],
+    tcp_listeners: [TcpListener; MAX_TCP_LISTENERS],
     pending_http: PendingHttpCurl,
     dhcp_xid: u32,
     dhcp_offer: DhcpOffer,
@@ -689,6 +766,7 @@ impl NetState {
             last_udp: LastUdp::empty(),
             udp_mailbox: UdpMailbox::empty(),
             tcp_conns: [TcpConn::empty(); MAX_TCP_CONNS],
+            tcp_listeners: [TcpListener::empty(); MAX_TCP_LISTENERS],
             pending_http: PendingHttpCurl::empty(),
             dhcp_xid: 0,
             dhcp_offer: DhcpOffer::empty(),
@@ -957,6 +1035,16 @@ impl NetState {
             return;
         }
         while self.poll_rx_once().unwrap_or(false) {}
+        // Expire TIME_WAIT connections whose 2*MSL timer has elapsed.
+        let now = time::ticks();
+        for conn in &mut self.tcp_conns {
+            if conn.state == TcpState::TimeWait
+                && conn.close_deadline != 0
+                && now >= conn.close_deadline
+            {
+                conn.clear();
+            }
+        }
     }
 
     fn poll_rx_once(&mut self) -> Result<bool, NetError> {
@@ -1224,6 +1312,45 @@ impl NetState {
             return Ok(());
         }
 
+        // Check if a passive listener is waiting on this dst_port for a SYN.
+        if (flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) == 0 {
+            for li in 0..MAX_TCP_LISTENERS {
+                if !self.tcp_listeners[li].active || !self.tcp_listeners[li].listening {
+                    continue;
+                }
+                if self.tcp_listeners[li].local_port != dst_port {
+                    continue;
+                }
+                // Allocate a connection slot for the incoming SYN.
+                if let Some(ci) = self.alloc_tcp_conn() {
+                    let initial_seq = self.make_dhcp_xid().wrapping_add(0x9abc_0000);
+                    // Resolve the peer MAC via ARP best-effort; if unknown use broadcast.
+                    let dst_mac = self.resolve_arp_cached(src_ip).unwrap_or(MAC_BROADCAST);
+                    self.tcp_conns[ci].clear();
+                    self.tcp_conns[ci].state = TcpState::SynReceived;
+                    self.tcp_conns[ci].dst_mac = dst_mac;
+                    self.tcp_conns[ci].remote_ip = src_ip;
+                    self.tcp_conns[ci].remote_port = src_port;
+                    self.tcp_conns[ci].local_port = dst_port;
+                    self.tcp_conns[ci].seq_next = initial_seq.wrapping_add(1);
+                    self.tcp_conns[ci].ack_next = seq.wrapping_add(1);
+                    // Send SYN-ACK.
+                    let sn = initial_seq;
+                    let an = self.tcp_conns[ci].ack_next;
+                    let _ = self.send_tcp_segment_for_conn(
+                        ci,
+                        sn,
+                        an,
+                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                        &[],
+                    );
+                    // Enqueue in accept queue.
+                    self.tcp_listeners[li].push_conn(ci as u8);
+                }
+                return Ok(());
+            }
+        }
+
         // Fall back to the legacy pending_http path.
         if !self.pending_http.active
             || self.pending_http.remote_ip != src_ip
@@ -1308,6 +1435,18 @@ impl NetState {
     fn handle_tcp_conn(&mut self, idx: usize, seq: u32, ack: u32, flags: u16, data: &[u8]) {
         let conn = &self.tcp_conns[idx];
         match conn.state {
+            TcpState::SynReceived => {
+                if (flags & TCP_FLAG_RST) != 0 {
+                    self.tcp_conns[idx].state = TcpState::Closed;
+                    return;
+                }
+                // Received the final ACK of the three-way handshake.
+                if (flags & TCP_FLAG_ACK) != 0 && ack == self.tcp_conns[idx].seq_next {
+                    self.tcp_conns[idx].state = TcpState::Established;
+                    self.tcp_conns[idx].ack_next = seq;
+                    self.tcp_conns[idx].sent_una = self.tcp_conns[idx].seq_next;
+                }
+            }
             TcpState::SynSent => {
                 if (flags & TCP_FLAG_RST) != 0 {
                     self.tcp_conns[idx].state = TcpState::Reset;
@@ -1321,6 +1460,7 @@ impl NetState {
                     let seq_n = self.tcp_conns[idx].seq_next;
                     let ack_n = self.tcp_conns[idx].ack_next;
                     let _ = self.send_tcp_segment_for_conn(idx, seq_n, ack_n, TCP_FLAG_ACK, &[]);
+                    self.tcp_conns[idx].sent_una = seq_n;
                     self.tcp_conns[idx].state = TcpState::Established;
                 }
             }
@@ -1328,6 +1468,24 @@ impl NetState {
                 if (flags & TCP_FLAG_RST) != 0 {
                     self.tcp_conns[idx].state = TcpState::Reset;
                     return;
+                }
+                // Congestion control: advance sent_una and grow cwnd on new ACKs.
+                if (flags & TCP_FLAG_ACK) != 0 {
+                    let una = self.tcp_conns[idx].sent_una;
+                    let new_ack = ack;
+                    // Only advance if ack is strictly newer (wrapping comparison).
+                    if new_ack.wrapping_sub(una) > 0 && new_ack.wrapping_sub(una) < 0x8000_0000 {
+                        self.tcp_conns[idx].sent_una = new_ack;
+                        let conn = &mut self.tcp_conns[idx];
+                        if conn.cwnd < conn.ssthresh {
+                            // Slow start: grow by one MSS per ACK.
+                            conn.cwnd = conn.cwnd.saturating_add(TCP_MSS);
+                        } else {
+                            // Congestion avoidance: grow by MSS²/cwnd per ACK.
+                            let inc = TCP_MSS.saturating_mul(TCP_MSS) / conn.cwnd;
+                            conn.cwnd = conn.cwnd.saturating_add(inc.max(1));
+                        }
+                    }
                 }
                 // Receive in-order data.
                 if !data.is_empty() && seq == self.tcp_conns[idx].ack_next {
@@ -1360,31 +1518,53 @@ impl NetState {
             TcpState::FinWait1 => {
                 if (flags & TCP_FLAG_ACK) != 0 && ack == self.tcp_conns[idx].seq_next {
                     if (flags & TCP_FLAG_FIN) != 0 {
-                        // Simultaneous close.
-                        let conn = &mut self.tcp_conns[idx];
-                        conn.ack_next = seq.wrapping_add(1);
-                        let sn = conn.seq_next;
-                        let an = conn.ack_next;
+                        // Simultaneous close → TimeWait.
+                        self.tcp_conns[idx].ack_next = seq.wrapping_add(1);
+                        let sn = self.tcp_conns[idx].seq_next;
+                        let an = self.tcp_conns[idx].ack_next;
                         let _ = self.send_tcp_segment_for_conn(idx, sn, an, TCP_FLAG_ACK, &[]);
-                        self.tcp_conns[idx].state = TcpState::Closed;
+                        self.tcp_conns[idx].close_deadline =
+                            time::ticks().wrapping_add(TIME_WAIT_TICKS);
+                        self.tcp_conns[idx].state = TcpState::TimeWait;
                     } else {
-                        // FIN ACKed - transition to time_wait (treat as closed).
-                        self.tcp_conns[idx].state = TcpState::Closed;
+                        // FIN ACKed without peer FIN yet → FinWait2.
+                        self.tcp_conns[idx].state = TcpState::FinWait2;
                     }
                 } else if (flags & TCP_FLAG_FIN) != 0 {
-                    // Peer closed first.
-                    let conn = &mut self.tcp_conns[idx];
-                    conn.ack_next = seq.wrapping_add(1);
-                    let sn = conn.seq_next;
-                    let an = conn.ack_next;
+                    // Peer FIN before our FIN is ACKed → Closing.
+                    self.tcp_conns[idx].ack_next = seq.wrapping_add(1);
+                    let sn = self.tcp_conns[idx].seq_next;
+                    let an = self.tcp_conns[idx].ack_next;
                     let _ = self.send_tcp_segment_for_conn(idx, sn, an, TCP_FLAG_ACK, &[]);
                     self.tcp_conns[idx].state = TcpState::Closing;
                 }
             }
-            TcpState::Closing | TcpState::LastAck => {
+            TcpState::FinWait2 => {
+                if (flags & TCP_FLAG_FIN) != 0 {
+                    // Peer FIN received → acknowledge and enter TimeWait.
+                    self.tcp_conns[idx].ack_next = seq.wrapping_add(1);
+                    let sn = self.tcp_conns[idx].seq_next;
+                    let an = self.tcp_conns[idx].ack_next;
+                    let _ = self.send_tcp_segment_for_conn(idx, sn, an, TCP_FLAG_ACK, &[]);
+                    self.tcp_conns[idx].close_deadline =
+                        time::ticks().wrapping_add(TIME_WAIT_TICKS);
+                    self.tcp_conns[idx].state = TcpState::TimeWait;
+                }
+            }
+            TcpState::Closing => {
+                if (flags & TCP_FLAG_ACK) != 0 {
+                    self.tcp_conns[idx].close_deadline =
+                        time::ticks().wrapping_add(TIME_WAIT_TICKS);
+                    self.tcp_conns[idx].state = TcpState::TimeWait;
+                }
+            }
+            TcpState::LastAck => {
                 if (flags & TCP_FLAG_ACK) != 0 {
                     self.tcp_conns[idx].state = TcpState::Closed;
                 }
+            }
+            TcpState::TimeWait => {
+                // Silently drop segments; expiry handled in poll().
             }
             _ => {}
         }
@@ -1392,6 +1572,15 @@ impl NetState {
 
     fn alloc_tcp_conn(&mut self) -> Option<usize> {
         (0..MAX_TCP_CONNS).find(|&i| !self.tcp_conns[i].is_active())
+    }
+
+    /// Look up an ARP cache entry without sending a request.  Returns `None`
+    /// when the entry is not present.
+    fn resolve_arp_cached(&self, ip: [u8; 4]) -> Option<[u8; 6]> {
+        self.arp
+            .iter()
+            .find(|e| e.valid && e.ip == ip)
+            .map(|e| e.mac)
     }
 
     /// Send a TCP segment for connection `idx`.
@@ -1484,8 +1673,21 @@ impl NetState {
         if i >= MAX_TCP_CONNS || self.tcp_conns[i].state != TcpState::Established {
             return Err(NetError::NotReady);
         }
+        // Respect congestion window: bytes in flight = seq_next - sent_una.
+        let in_flight = self.tcp_conns[i]
+            .seq_next
+            .wrapping_sub(self.tcp_conns[i].sent_una);
+        let cwnd = self.tcp_conns[i].cwnd;
+        if in_flight >= cwnd {
+            // Window full; caller should poll and retry.
+            return Ok(0);
+        }
+        let window_remaining = (cwnd - in_flight) as usize;
         let max_payload = MAX_TX_FRAME.saturating_sub(40);
-        let send_len = data.len().min(max_payload);
+        let send_len = data.len().min(max_payload).min(window_remaining);
+        if send_len == 0 {
+            return Ok(0);
+        }
         let seq = self.tcp_conns[i].seq_next;
         let ack = self.tcp_conns[i].ack_next;
         self.send_tcp_segment_for_conn(
@@ -2914,6 +3116,85 @@ pub fn tcp_close(conn_idx: u8) {
 #[allow(dead_code)]
 pub fn tcp_conns_snapshot() -> ([TcpConnInfo; MAX_TCP_CONNS], usize) {
     with_net(|state| state.tcp_conn_info_snapshot())
+}
+
+// ── Public TCP Listener API ───────────────────────────────────────────────────
+
+/// Allocate a passive-listen socket bound to `port`.  Returns a listener index
+/// (0..MAX_TCP_LISTENERS) or an error if no slot is available or the port is
+/// already in use.
+pub fn tcp_bind(port: u16) -> Result<u8, NetError> {
+    with_net_mut(|state| {
+        // Reject if any active listener already owns this port.
+        for li in 0..MAX_TCP_LISTENERS {
+            if state.tcp_listeners[li].active && state.tcp_listeners[li].local_port == port {
+                return Err(NetError::QueueUnavailable);
+            }
+        }
+        // Find a free slot.
+        let slot = (0..MAX_TCP_LISTENERS)
+            .find(|&i| !state.tcp_listeners[i].active)
+            .ok_or(NetError::QueueUnavailable)?;
+        state.tcp_listeners[slot] = TcpListener::empty();
+        state.tcp_listeners[slot].active = true;
+        state.tcp_listeners[slot].local_port = port;
+        Ok(slot as u8)
+    })
+}
+
+/// Mark a previously bound listener as ready to receive incoming SYNs.
+pub fn tcp_listen(listener_idx: u8) -> Result<(), NetError> {
+    with_net_mut(|state| {
+        let li = listener_idx as usize;
+        if li >= MAX_TCP_LISTENERS || !state.tcp_listeners[li].active {
+            return Err(NetError::NotFound);
+        }
+        state.tcp_listeners[li].listening = true;
+        Ok(())
+    })
+}
+
+/// Non-blocking dequeue of the next fully-established connection from the
+/// accept queue.  Returns the connection index or `None` if the queue is empty.
+pub fn tcp_accept(listener_idx: u8) -> Option<u8> {
+    with_net_mut(|state| {
+        let li = listener_idx as usize;
+        if li >= MAX_TCP_LISTENERS || !state.tcp_listeners[li].active {
+            return None;
+        }
+        // Scan the queue and only return a connection that has reached ESTABLISHED.
+        for qi in 0..state.tcp_listeners[li].accept_len {
+            let ci = state.tcp_listeners[li].accept_queue[qi] as usize;
+            if state.tcp_conns[ci].state == TcpState::Established {
+                // Remove from queue.
+                state.tcp_listeners[li]
+                    .accept_queue
+                    .copy_within(qi + 1..state.tcp_listeners[li].accept_len, qi);
+                state.tcp_listeners[li].accept_len -= 1;
+                return Some(ci as u8);
+            }
+        }
+        None
+    })
+}
+
+/// Release a passive-listen socket, closing any pending connections in the
+/// accept queue.
+pub fn tcp_listener_close(listener_idx: u8) {
+    with_net_mut(|state| {
+        let li = listener_idx as usize;
+        if li >= MAX_TCP_LISTENERS {
+            return;
+        }
+        // Close any connections still waiting in the accept queue.
+        for qi in 0..state.tcp_listeners[li].accept_len {
+            let ci = state.tcp_listeners[li].accept_queue[qi] as usize;
+            if ci < MAX_TCP_CONNS {
+                state.tcp_conns[ci].clear();
+            }
+        }
+        state.tcp_listeners[li] = TcpListener::empty();
+    });
 }
 
 /// Public snapshot of one ARP cache entry for /proc/net/arp.
