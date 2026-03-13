@@ -60,3 +60,33 @@ pub fn poll_timer_ticks() -> u64 {
 pub fn poll_timer_ticks() -> u64 {
     aarch64::poll_timer_ticks()
 }
+
+#[cfg(target_arch = "x86_64")]
+pub fn read_hires_counter() -> u64 {
+    x86_64::read_hires_counter()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn read_hires_counter() -> u64 {
+    aarch64::read_hires_counter()
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn hires_counter_to_us(cycles: u64) -> u64 {
+    x86_64::hires_counter_to_us(cycles)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn hires_counter_to_us(cycles: u64) -> u64 {
+    aarch64::hires_counter_to_us(cycles)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn calibrate_hires_counter() {
+    x86_64::calibrate_hires_counter()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn calibrate_hires_counter() {
+    aarch64::calibrate_hires_counter()
+}

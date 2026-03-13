@@ -161,3 +161,21 @@ fn read_counter_freq() -> u64 {
     }
     counter_freq
 }
+
+/// Read the ARM generic timer counter (CNTPCT_EL0).
+#[inline]
+pub fn read_hires_counter() -> u64 {
+    read_counter()
+}
+
+/// Convert an ARM generic timer cycle delta to microseconds using CNTFRQ_EL0.
+#[inline]
+pub fn hires_counter_to_us(cycles: u64) -> u64 {
+    let freq = read_counter_freq().max(1);
+    // cycles * 1_000_000 / freq, avoiding overflow for reasonable cycle counts.
+    cycles / (freq / 1_000_000).max(1)
+}
+
+/// No calibration needed on aarch64: CNTFRQ_EL0 gives the exact frequency.
+#[inline]
+pub fn calibrate_hires_counter() {}

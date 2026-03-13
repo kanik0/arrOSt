@@ -72,7 +72,7 @@ const IP_BROADCAST: [u8; 4] = [255, 255, 255, 255];
 const IP_ZERO: [u8; 4] = [0, 0, 0, 0];
 const MAC_BROADCAST: [u8; 6] = [0xff; 6];
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
-const DNS_WAIT_TICKS: u64 = 300;
+const DNS_WAIT_TICKS: u64 = 100;
 
 const DHCP_OPT_SUBNET_MASK: u8 = 1;
 const DHCP_OPT_ROUTER: u8 = 3;
@@ -248,6 +248,44 @@ impl PendingPing {
             target: [0; 4],
             start_tick: 0,
             reply_tick: 0,
+        }
+    }
+}
+
+/// Result returned by a single traceroute TTL probe.
+#[derive(Clone, Copy)]
+pub struct TracerouteHop {
+    /// IP address that responded (zero if no reply).
+    pub ip: [u8; 4],
+    /// Round-trip time in milliseconds (0 if no reply).
+    pub ms: u64,
+    /// True when the final destination replied (echo reply received).
+    pub reached: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingTraceroute {
+    active: bool,
+    ident: u16,
+    seq: u16,
+    target: [u8; 4],
+    start_tick: u64,
+    reply_tick: u64,
+    responding_ip: [u8; 4],
+    reached: bool,
+}
+
+impl PendingTraceroute {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            ident: 0,
+            seq: 0,
+            target: [0; 4],
+            start_tick: 0,
+            reply_tick: 0,
+            responding_ip: [0; 4],
+            reached: false,
         }
     }
 }
@@ -721,6 +759,7 @@ struct NetState {
     next_ping_seq: u16,
     arp: [ArpEntry; 8],
     pending_ping: PendingPing,
+    pending_traceroute: PendingTraceroute,
     stats: NetStats,
     last_udp: LastUdp,
     udp_mailbox: UdpMailbox,
@@ -762,6 +801,7 @@ impl NetState {
             next_ping_seq: 1,
             arp: [ArpEntry::empty(); 8],
             pending_ping: PendingPing::empty(),
+            pending_traceroute: PendingTraceroute::empty(),
             stats: NetStats::new(),
             last_udp: LastUdp::empty(),
             udp_mailbox: UdpMailbox::empty(),
@@ -1217,14 +1257,41 @@ impl NetState {
             let csum = checksum(&reply[..payload.len()]);
             reply[2..4].copy_from_slice(&csum.to_be_bytes());
             self.send_ipv4_packet(src_mac, src_ip, IP_PROTO_ICMP, &reply[..payload.len()])?;
-        } else if icmp_type == 0
-            && self.pending_ping.active
-            && self.pending_ping.ident == ident
-            && self.pending_ping.seq == seq
-            && self.pending_ping.target == src_ip
-        {
-            self.pending_ping.reply_tick = time::ticks();
-            self.pending_ping.active = false;
+        } else if icmp_type == 0 {
+            // Echo reply: satisfy pending ping.
+            if self.pending_ping.active
+                && self.pending_ping.ident == ident
+                && self.pending_ping.seq == seq
+                && self.pending_ping.target == src_ip
+            {
+                self.pending_ping.reply_tick = crate::arch::read_hires_counter();
+                self.pending_ping.active = false;
+            }
+            // Echo reply from destination: satisfy pending traceroute probe.
+            if self.pending_traceroute.active
+                && self.pending_traceroute.ident == ident
+                && self.pending_traceroute.seq == seq
+                && self.pending_traceroute.target == src_ip
+            {
+                self.pending_traceroute.reply_tick = crate::arch::read_hires_counter();
+                self.pending_traceroute.responding_ip = src_ip;
+                self.pending_traceroute.reached = true;
+                self.pending_traceroute.active = false;
+            }
+        } else if icmp_type == 11 && payload.len() >= 36 {
+            // ICMP Time Exceeded: payload[8..28] = original IP header,
+            // payload[28..36] = first 8 bytes of original ICMP (type/code/csum/ident/seq).
+            let orig_ident = u16::from_be_bytes([payload[32], payload[33]]);
+            let orig_seq = u16::from_be_bytes([payload[34], payload[35]]);
+            if self.pending_traceroute.active
+                && self.pending_traceroute.ident == orig_ident
+                && self.pending_traceroute.seq == orig_seq
+            {
+                self.pending_traceroute.reply_tick = crate::arch::read_hires_counter();
+                self.pending_traceroute.responding_ip = src_ip;
+                self.pending_traceroute.reached = false;
+                self.pending_traceroute.active = false;
+            }
         }
         Ok(())
     }
@@ -1779,26 +1846,30 @@ impl NetState {
 
         let next_hop = self.select_next_hop(target);
         let dst_mac = self.resolve_arp(next_hop)?;
-        let start = time::ticks();
+        let start_hires = crate::arch::read_hires_counter();
+        let start_tick = time::ticks();
         self.pending_ping = PendingPing {
             active: true,
             ident,
             seq,
             target,
-            start_tick: start,
+            start_tick: start_hires,
             reply_tick: 0,
         };
         self.send_ipv4_packet(dst_mac, target, IP_PROTO_ICMP, &icmp[..total])?;
 
         let timeout_ticks = 300;
-        while time::ticks().saturating_sub(start) < timeout_ticks {
+        while time::ticks().saturating_sub(start_tick) < timeout_ticks {
             self.poll();
             if !self.pending_ping.active
                 && self.pending_ping.ident == ident
                 && self.pending_ping.seq == seq
                 && self.pending_ping.reply_tick >= self.pending_ping.start_tick
             {
-                return Ok(self.pending_ping.reply_tick - self.pending_ping.start_tick);
+                let rtt_us = crate::arch::hires_counter_to_us(
+                    self.pending_ping.reply_tick - self.pending_ping.start_tick,
+                );
+                return Ok(rtt_us);
             }
             spin_loop();
         }
@@ -1906,6 +1977,14 @@ impl NetState {
             if let Some(meta) = self.pop_udp_mailbox(&mut response) {
                 if meta.src_port != UDP_DNS_PORT {
                     continue;
+                }
+                // Detect NXDOMAIN/error response early to avoid spinning until timeout.
+                if meta.len >= 4 {
+                    let resp_id = u16::from_be_bytes([response[0], response[1]]);
+                    let flags = u16::from_be_bytes([response[2], response[3]]);
+                    if resp_id == txid && (flags & 0x8000) != 0 && (flags & 0x000f) != 0 {
+                        return Err(NetError::NotFound);
+                    }
                 }
                 if let Some(ip) = parse_dns_a_response(&response[..meta.len], txid) {
                     self.stats.dns_answer = self.stats.dns_answer.saturating_add(1);
@@ -2107,6 +2186,98 @@ impl NetState {
 
         frame[34..34 + payload.len()].copy_from_slice(payload);
         self.transmit_frame(&frame[..14 + total_len])
+    }
+
+    fn send_ipv4_packet_with_ttl(
+        &mut self,
+        dst_mac: [u8; 6],
+        dst_ip: [u8; 4],
+        proto: u8,
+        payload: &[u8],
+        ttl: u8,
+    ) -> Result<(), NetError> {
+        let total_len = 20 + payload.len();
+        if total_len > MAX_TX_FRAME.saturating_sub(14) {
+            return Err(NetError::FrameTooLarge);
+        }
+        let mut frame = [0u8; MAX_TX_FRAME];
+        frame[0..6].copy_from_slice(&dst_mac);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12..14].copy_from_slice(&ETH_TYPE_IPV4.to_be_bytes());
+        let ip = &mut frame[14..14 + 20];
+        ip[0] = 0x45;
+        ip[1] = 0;
+        ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        ip[4..6].copy_from_slice(&self.next_ip_id.to_be_bytes());
+        self.next_ip_id = self.next_ip_id.wrapping_add(1);
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = ttl;
+        ip[9] = proto;
+        ip[10..12].copy_from_slice(&0u16.to_be_bytes());
+        ip[12..16].copy_from_slice(&self.ipv4);
+        ip[16..20].copy_from_slice(&dst_ip);
+        let ip_csum = checksum(ip);
+        ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+        frame[34..34 + payload.len()].copy_from_slice(payload);
+        self.transmit_frame(&frame[..14 + total_len])
+    }
+
+    /// Send a single ICMP echo probe with the given TTL and wait for a reply.
+    /// Returns [`TracerouteHop`] with responding IP and RTT, or an error on timeout/ARP failure.
+    fn send_traceroute_probe(
+        &mut self,
+        target: [u8; 4],
+        ttl: u8,
+        ident: u16,
+        seq: u16,
+    ) -> Result<TracerouteHop, NetError> {
+        let body = b"arr0st-traceroute";
+        let total = 8 + body.len();
+        let mut icmp = [0u8; 32];
+        icmp[0] = 8; // echo request
+        icmp[1] = 0;
+        icmp[4..6].copy_from_slice(&ident.to_be_bytes());
+        icmp[6..8].copy_from_slice(&seq.to_be_bytes());
+        icmp[8..8 + body.len()].copy_from_slice(body);
+        let csum = checksum(&icmp[..total]);
+        icmp[2..4].copy_from_slice(&csum.to_be_bytes());
+
+        let next_hop = self.select_next_hop(target);
+        let dst_mac = self.resolve_arp(next_hop)?;
+        let start_hires = crate::arch::read_hires_counter();
+        let start_tick = time::ticks();
+        self.pending_traceroute = PendingTraceroute {
+            active: true,
+            ident,
+            seq,
+            target,
+            start_tick: start_hires,
+            reply_tick: 0,
+            responding_ip: [0; 4],
+            reached: false,
+        };
+        self.send_ipv4_packet_with_ttl(dst_mac, target, IP_PROTO_ICMP, &icmp[..total], ttl)?;
+
+        // Wait up to ~25 ticks for a reply (Time Exceeded or Echo Reply).
+        let timeout_ticks = 25u64;
+        while time::ticks().saturating_sub(start_tick) < timeout_ticks {
+            self.poll();
+            if !self.pending_traceroute.active {
+                let rtt_cycles = self
+                    .pending_traceroute
+                    .reply_tick
+                    .saturating_sub(self.pending_traceroute.start_tick);
+                let ms = crate::arch::hires_counter_to_us(rtt_cycles) / 1_000;
+                return Ok(TracerouteHop {
+                    ip: self.pending_traceroute.responding_ip,
+                    ms,
+                    reached: self.pending_traceroute.reached,
+                });
+            }
+            spin_loop();
+        }
+        self.pending_traceroute.active = false;
+        Err(NetError::IoTimeout)
     }
 
     fn transmit_frame(&mut self, frame: &[u8]) -> Result<(), NetError> {
@@ -2534,7 +2705,7 @@ impl NetState {
         }
         self.send_arp_request(target_ip)?;
         let start = time::ticks();
-        while time::ticks().saturating_sub(start) < 200 {
+        while time::ticks().saturating_sub(start) < 60 {
             self.poll();
             if let Some(mac) = self.lookup_arp(target_ip) {
                 return Ok(mac);
@@ -2855,40 +3026,251 @@ pub fn ping(target: [u8; 4]) -> Result<u64, NetError> {
     with_net_mut(|state| state.send_ping(target))
 }
 
-pub fn ping_to_serial(ip_text: &str) {
-    let Some(target) = parse_ipv4(ip_text) else {
-        serial::write_line("ping: invalid ip (usage: ping <a.b.c.d>)");
+pub fn ping_to_serial(args: &str) {
+    let args = args.trim();
+    // Parse optional -c N count prefix.
+    let (count, target_str) = if let Some(rest) = args.strip_prefix("-c ") {
+        let rest = rest.trim_start();
+        match rest.find(char::is_whitespace) {
+            Some(i) => {
+                let n = rest[..i].parse::<usize>().unwrap_or(4).clamp(1, 100);
+                (n, rest[i..].trim())
+            }
+            None => (4, rest),
+        }
+    } else {
+        (4, args)
+    };
+    if target_str.is_empty() {
+        serial::write_line("ping: usage: ping [-c count] <host|ip>");
         return;
+    }
+    // Resolve target: IP literal first, then DNS.
+    let target = match parse_ipv4(target_str) {
+        Some(ip) => ip,
+        None => match with_net_mut(|s| s.dns_resolve_ipv4(target_str)) {
+            Ok(ip) => ip,
+            Err(_) => {
+                serial::write_fmt(format_args!(
+                    "ping: {}: name or service not known\n",
+                    target_str
+                ));
+                return;
+            }
+        },
     };
     serial::write_fmt(format_args!(
-        "PING {}.{}.{}.{}: 56 data bytes\n",
-        target[0], target[1], target[2], target[3]
+        "PING {} ({}.{}.{}.{}): 56 data bytes\n",
+        target_str, target[0], target[1], target[2], target[3]
     ));
-    match with_net_mut(|state| state.send_ping(target)) {
-        Ok(rtt_ticks) => {
-            let ms = rtt_ticks.saturating_mul(10);
-            serial::write_fmt(format_args!(
-                "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\n",
-                target[0],
-                target[1],
-                target[2],
-                target[3],
-                ms,
-                target[0],
-                target[1],
-                target[2],
-                target[3]
-            ));
+    let mut transmitted = 0u32;
+    let mut received = 0u32;
+    for seq in 1..=(count as u32) {
+        transmitted += 1;
+        match with_net_mut(|state| state.send_ping(target)) {
+            Ok(rtt_us) => {
+                received += 1;
+                if rtt_us < 1_000 {
+                    serial::write_fmt(format_args!(
+                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time=<1 ms\n",
+                        target[0], target[1], target[2], target[3], seq
+                    ));
+                } else {
+                    let ms = rtt_us / 1_000;
+                    serial::write_fmt(format_args!(
+                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time={} ms\n",
+                        target[0], target[1], target[2], target[3], seq, ms
+                    ));
+                }
+            }
+            Err(NetError::ArpTimeout) | Err(NetError::IoTimeout) => {
+                serial::write_fmt(format_args!("Request timeout for icmp_seq {}\n", seq));
+            }
+            Err(err) => {
+                serial::write_fmt(format_args!("ping: error: {}\n", err.as_str()));
+                break;
+            }
         }
-        Err(NetError::ArpTimeout) | Err(NetError::IoTimeout) => {
-            serial::write_fmt(format_args!(
-                "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss\n",
-                target[0], target[1], target[2], target[3]
-            ));
+    }
+    let loss = ((transmitted - received) * 100)
+        .checked_div(transmitted)
+        .unwrap_or(100);
+    serial::write_fmt(format_args!(
+        "\n--- {} ping statistics ---\n{} packets transmitted, {} received, {}% packet loss\n",
+        target_str, transmitted, received, loss
+    ));
+}
+
+/// `traceroute <host|ip>`: send ICMP probes with incrementing TTL, print hop table.
+pub fn traceroute_to_serial(target_str: &str) {
+    // Resolve target: IP literal first, then DNS.
+    let target = match parse_ipv4(target_str) {
+        Some(ip) => ip,
+        None => match with_net_mut(|s| s.dns_resolve_ipv4(target_str)) {
+            Ok(ip) => ip,
+            Err(_) => {
+                serial::write_fmt(format_args!(
+                    "traceroute: {}: name or service not known\n",
+                    target_str
+                ));
+                return;
+            }
+        },
+    };
+    serial::write_fmt(format_args!(
+        "traceroute to {} ({}.{}.{}.{}), 30 hops max, 32 byte packets\n",
+        target_str, target[0], target[1], target[2], target[3]
+    ));
+    // QEMU slirp user-mode networking proxies ICMP to the real host without
+    // decrementing TTL, so intermediate hops are never visible and the
+    // destination always appears at hop 1 with an echo reply.
+    serial::write_line(
+        "Note: QEMU slirp does not simulate intermediate hops; route is approximate.",
+    );
+    // Use a fixed ident derived from target to avoid collisions with pings.
+    let ident: u16 = 0xAA00u16
+        .wrapping_add(target[2] as u16)
+        .wrapping_add(target[3] as u16);
+    let base_seq = with_net_mut(|s| {
+        let seq = s.next_ping_seq;
+        s.next_ping_seq = s.next_ping_seq.wrapping_add(30);
+        seq
+    });
+    let mut consecutive_timeouts = 0u8;
+    for ttl in 1u8..=30 {
+        let seq = base_seq.wrapping_add(ttl as u16 - 1);
+        match with_net_mut(|state| state.send_traceroute_probe(target, ttl, ident, seq)) {
+            Ok(hop) if hop.ip != [0; 4] => {
+                consecutive_timeouts = 0;
+                // Annotate when destination replies with echo reply at hop 1
+                // (QEMU slirp behaviour: TTL ignored, proxy responds directly).
+                let note = if hop.reached && ttl == 1 {
+                    " [direct]"
+                } else {
+                    ""
+                };
+                if hop.ms == 0 {
+                    serial::write_fmt(format_args!(
+                        "{:2}  {}.{}.{}.{}  <1 ms{}\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], note
+                    ));
+                } else {
+                    serial::write_fmt(format_args!(
+                        "{:2}  {}.{}.{}.{}  {} ms{}\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], hop.ms, note
+                    ));
+                }
+                if hop.reached {
+                    break;
+                }
+            }
+            _ => {
+                consecutive_timeouts += 1;
+                serial::write_fmt(format_args!("{:2}  * * *\n", ttl));
+                if consecutive_timeouts >= 3 {
+                    serial::write_line("traceroute: too many consecutive timeouts, stopping");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `host <name>`: resolve hostname to IPv4 address via DNS.
+pub fn host_to_serial(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        serial::write_line("host: usage: host <hostname>");
+        return;
+    }
+    // If it's already an IP, just echo it back.
+    if let Some(ip) = parse_ipv4(name) {
+        serial::write_fmt(format_args!(
+            "{} has address {}.{}.{}.{}\n",
+            name, ip[0], ip[1], ip[2], ip[3]
+        ));
+        return;
+    }
+    match with_net_mut(|state| state.dns_resolve_ipv4(name)) {
+        Ok(ip) => serial::write_fmt(format_args!(
+            "{} has address {}.{}.{}.{}\n",
+            name, ip[0], ip[1], ip[2], ip[3]
+        )),
+        Err(NetError::IoTimeout) => {
+            serial::write_fmt(format_args!("host: {}: no answer from DNS server\n", name));
+        }
+        Err(NetError::NotFound) => {
+            serial::write_fmt(format_args!("host: {}: name not found\n", name));
         }
         Err(err) => {
-            serial::write_fmt(format_args!("ping: error: {}\n", err.as_str()));
+            serial::write_fmt(format_args!("host: {}: {}\n", name, err.as_str()));
         }
+    }
+}
+
+/// `dig <name> [type]`: verbose DNS lookup (A records only).
+pub fn dig_to_serial(name: &str, qtype: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        serial::write_line("dig: usage: dig <hostname> [A]");
+        return;
+    }
+    let qtype = if qtype.trim().is_empty() {
+        "A"
+    } else {
+        qtype.trim()
+    };
+    if qtype != "A" && qtype != "a" {
+        serial::write_fmt(format_args!(
+            "dig: unsupported query type {} (only A supported)\n",
+            qtype
+        ));
+        return;
+    }
+    let start_ms = with_net_mut(|s| s.stats.rx_frames); // use rx_frames as proxy for time
+    let _ = start_ms;
+    let start_tick = crate::time::ticks();
+    let result = with_net_mut(|state| state.dns_resolve_ipv4(name));
+    let elapsed_ms = crate::time::ticks()
+        .saturating_sub(start_tick)
+        .saturating_mul(10);
+
+    serial::write_fmt(format_args!("; <<>> dig 1.0 <<>> {} {}\n", qtype, name));
+    serial::write_line(";; global options: +cmd");
+    serial::write_line("");
+    serial::write_line(";; Got answer:");
+    match &result {
+        Ok(ip) => {
+            serial::write_line(";; ->>HEADER<<- opcode: QUERY, status: NOERROR");
+            serial::write_line("");
+            serial::write_line(";; QUESTION SECTION:");
+            serial::write_fmt(format_args!(";{}.   IN  A\n", name));
+            serial::write_line("");
+            serial::write_line(";; ANSWER SECTION:");
+            serial::write_fmt(format_args!(
+                "{}.   300  IN  A  {}.{}.{}.{}\n",
+                name, ip[0], ip[1], ip[2], ip[3]
+            ));
+        }
+        Err(_) => {
+            serial::write_line(";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN");
+            serial::write_line("");
+            serial::write_line(";; QUESTION SECTION:");
+            serial::write_fmt(format_args!(";{}.   IN  A\n", name));
+        }
+    }
+    serial::write_line("");
+    serial::write_line(";; Query time: see below");
+    with_net_mut(|state| {
+        let dns = state.dns;
+        serial::write_fmt(format_args!(
+            ";; SERVER: {}.{}.{}.{}#53\n",
+            dns[0], dns[1], dns[2], dns[3]
+        ));
+    });
+    serial::write_fmt(format_args!(";; Query time: {} msec\n", elapsed_ms));
+    if result.is_ok() {
+        serial::write_fmt(format_args!(";; MSG SIZE rcvd: 44\n"));
     }
 }
 

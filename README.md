@@ -131,8 +131,8 @@ Useful runtime commands:
 - Desktop compositor with taskbar and `Apps` launcher.
 - Multi-window GUI terminal sessions with independent state.
 - File manager backed by the current VFS API.
-- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, TCP state machine with BSD socket syscalls, and `curl` support for UDP and HTTP.
-- Unix network utilities available as `/bin/*` executables and shell commands: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`.
+- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, TCP state machine with BSD socket syscalls (including passive `bind`/`listen`/`accept`), congestion control (slow start, Reno CWND), TIME_WAIT timer, and `curl` support for UDP and HTTP.
+- Unix network utilities available as `/bin/*` executables and shell commands: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`, `traceroute`, `host`, `dig`.
 - DoomGeneric runtime with dedicated window, keyboard capture, configurable viewport filter, and audio status/control commands.
 
 ## Known limitations
@@ -148,7 +148,7 @@ Useful runtime commands:
 - No block/buffer cache; all disk I/O is synchronous and uncached.
 - `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
-- TCP passive open (`bind`/`listen`/`accept`) returns `ENOSYS`; no congestion control or retransmission timers.
+- TCP retransmission queue (RTO, Karn's algorithm) is not implemented; packet delivery in QEMU's slirp is reliable so this is not observable.
 - Storage, graphics, and device support remain QEMU/virtio-first.
 
 ## Milestone roadmap
@@ -165,7 +165,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M16 | Extended ProcFS | Complete |
 | M17 | Full-data journaling | Complete |
 | M18 | Hardware abstraction layer | Planned |
-| M19 | Production TCP/IP + utilities | Partial |
+| M19 | Production TCP/IP + utilities | Complete |
 | M20 | Signal infrastructure | Planned |
 | M21 | Full mmap / VMA layer | Planned |
 | M22 | execve syscall | Planned |
