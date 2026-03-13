@@ -3,6 +3,7 @@ use crate::audio;
 use crate::doom;
 use crate::fs;
 use crate::gfx;
+use crate::hal;
 use crate::keyboard;
 use crate::mouse;
 use crate::net;
@@ -1589,6 +1590,26 @@ fn run_command(shell: &mut ShellState) {
         }
         "net" => {
             net::log_info();
+        }
+        "hal" | "hal list" => {
+            hal::log_info();
+            hal::log_device_list();
+        }
+        "hal test block" => {
+            // Test block device at index 1 (ramdisk — non-destructive).
+            if hal::test_block(1) {
+                serial::write_line("hal: block[1] ramdisk test ok");
+            } else {
+                serial::write_line("hal: block[1] ramdisk test FAILED");
+            }
+        }
+        "hal test net" => {
+            // Test net device at index 1 (loopback).
+            if hal::test_net_loopback(1) {
+                serial::write_line("hal: net[1] loopback test ok");
+            } else {
+                serial::write_line("hal: net[1] loopback test FAILED");
+            }
         }
         "journal" => {
             fs::journal_status_to_serial();

@@ -13,6 +13,7 @@ mod doom;
 mod doom_bridge;
 mod fs;
 mod gfx;
+mod hal;
 mod input;
 mod keyboard;
 mod mem;
@@ -392,6 +393,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         fs_report.max_files,
         fs_report.max_file_bytes
     ));
+
+    let hal_report = hal::init(&gfx_report);
+    serial::write_fmt(format_args!(
+        "HAL: block={} net={} display={} audio={} input={}\n",
+        hal_report.block_devices,
+        hal_report.net_devices,
+        hal_report.display_devices,
+        hal_report.audio_devices,
+        hal_report.input_devices,
+    ));
+
     serial::write_fmt(format_args!(
         "Doom: app={} rust_artifact={} rust_artifact_size={} c_backend_size={} c_backend_ready={} c_backend_object={}\n",
         DOOM_APP,
@@ -713,6 +725,17 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         fs_report.max_files,
         fs_report.max_file_bytes
     ));
+
+    let hal_report = hal::init(&gfx_report);
+    serial::write_fmt(format_args!(
+        "HAL: block={} net={} display={} audio={} input={}\n",
+        hal_report.block_devices,
+        hal_report.net_devices,
+        hal_report.display_devices,
+        hal_report.audio_devices,
+        hal_report.input_devices,
+    ));
+
     serial::write_fmt(format_args!(
         "Doom: app={} rust_artifact={} rust_artifact_size={} c_backend_size={} c_backend_ready={} c_backend_object={}\n",
         DOOM_APP,
