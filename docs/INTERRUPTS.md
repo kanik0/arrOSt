@@ -80,6 +80,15 @@ Kernel time uses an IRQ-preferred hybrid model: runtime IRQs are enabled after b
 - `x86_64`: IRQ-first (`timer_interrupt_handler`) with PIT polling fallback only when IRQs are disabled.
 - `aarch64`: IRQ-preferred ticks (`gic-timer`) with counter-polling fallback if unhandled IRQs are observed; `wfi` idle is used only after live IRQ ticks are observed.
 
+## Timer-driven hard preemption (M14 - Complete)
+
+- Ring-3 processes are preempted at any instruction boundary via hardware timer interrupts.
+- **x86_64**: PIT IRQ0 fires during user-mode execution (RFLAGS.IF=1 in iretq frame). The timer interrupt handler checks if a ring-3 process is active, decrements `remaining_ticks`, and on quantum expiry saves the full user GPR state from the interrupt frame, marks the process `ready`, and returns into the kernel scheduler.
+- **aarch64**: GIC virtual timer IRQ27 fires during EL0 execution (DAIF.I=0 in SPSR_EL1). The full-save EL0 IRQ vector captures x0-x30, SP_EL0, ELR_EL1, and SPSR_EL1 into the process trap frame, marks the process `ready`, and returns to the kernel scheduler.
+- Quantum: `RING3_PREEMPT_QUANTUM = 10` timer ticks (~10 ms at 1000 Hz).
+- Preempted processes are re-enqueued as `ready` and their full register state is restored on next schedule.
+- Syscall-timeslice preemption also remains active as a belt-and-suspenders mechanism.
+
 ## KPTI status note (M11)
 
 - M11 KPTI transition wiring is complete for the current runtime model.

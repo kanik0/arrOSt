@@ -17,8 +17,14 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - QEMU/virtio-first device stack for block, net, input, and audio.
 - Hybrid process model: cooperative kernel tasks, ring-3 ELF processes, and scheduler-visible external runtime helpers.
 - Ring-3 ELF isolation with per-process page-table ownership, dedicated user virtual mappings, and kernel-resume fault containment.
+- KPTI trampoline infrastructure with per-CPU scratch state and architecture-specific CR3/TTBR0 switching on syscall/fault entry/exit paths.
+- Timer-driven hard preemption via PIT IRQ0 (x86_64) / GIC virtual timer IRQ27 (aarch64) with 10-tick quantum.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
-- Syscall ABI revision `5`, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, and memory/signal stubs.
+- Full-data journaling: `MetadataOnly`, `Ordered` (default), and `Full` modes with on-disk persistence and runtime shell control.
+- Syscall ABI revision `5` with 52 syscalls, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, and memory/signal stubs.
+- VFS-backed `/bin/*` command dispatch: shell and GUI terminal auto-execute ring-3 ELF binaries from the mounted filesystem.
+- Extended `/proc` with global system files, per-PID directories, and `/proc/net/` subsystem.
+- TCP/IP networking with state machine (SYN_SENT through LAST_ACK), BSD socket syscalls, and kernel-side Unix network utilities.
 - Cross-target build orchestration and smoke automation through `cargo xtask`.
 - DoomGeneric integration with runtime controls, viewport rendering, and virtio-audio preference when available.
 
@@ -41,6 +47,13 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - `aarch64` runtime uses virtio-mmio discovery, while shared drivers keep a legacy-style register model where needed.
 - Serial diagnostics remain the baseline debugging path even when framebuffer UI is active.
 
+### Memory and isolation
+
+- KPTI trampoline infrastructure: ring-3 transitions route through architecture trampoline entry/exit paths with per-CPU KPTI scratch (kernel/user root tables, kernel/user RSP).
+- x86_64: provisional CR3 switches in `trampoline_syscall_entry` / `trampoline_page_fault_entry`.
+- aarch64: TTBR0 switch+barrier sequencing in sync trampoline dispatch, with `SP_EL0` / kernel SP capture/restore.
+- Timer-driven hard preemption: PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) preempt ring-3 at any instruction boundary. Quantum = 10 ticks (`RING3_PREEMPT_QUANTUM`).
+
 ### Filesystem
 
 - Root filesystem mounts `diskfs-v2` when persistent storage is ready, otherwise falls back to `ramfs`.
@@ -57,8 +70,9 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - File metadata tracks `uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, and `ctime`.
 - Permission enforcement is active in the VFS.
 - Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
+- Pipe IPC: 8-slot global table, 4 KiB circular buffers, ref-counted read/write ends.
 - Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
-- Bare shell and GUI terminal commands such as `ls`, `cat`, `ps`, `link`, `symlink`, and `fm` auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
+- Shell and GUI terminal commands auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
 - Default user home is `/home/user`, and shell history persists in `/home/user/.history`.
 - `Tab` completion works for `/bin` commands and for relative/absolute file paths in the current working directory.
 
@@ -86,7 +100,7 @@ Representative commands:
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
 - ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
 
-Current syscall surface includes:
+Current syscall surface (52 syscalls):
 
 - lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`
 - capabilities: `cap_get`, `cap_drop`
@@ -116,20 +130,53 @@ Useful runtime commands:
 - Desktop compositor with taskbar and `Apps` launcher.
 - Multi-window GUI terminal sessions with independent state.
 - File manager backed by the current VFS API.
-- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, minimal TCP state machine with BSD socket syscalls, and `curl` support for UDP and HTTP.
+- Virtio network path with ARP, IPv4, ICMP ping, UDP send/receive, TCP state machine with BSD socket syscalls, and `curl` support for UDP and HTTP.
 - Unix network utilities available as `/bin/*` executables and shell commands: `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`.
 - DoomGeneric runtime with dedicated window, keyboard capture, configurable viewport filter, and audio status/control commands.
 
 ## Known limitations
 
-- KPTI milestone M11 is complete: ring-3 roots preserve only upper-half kernel mappings, each process maps a dedicated trampoline page, and syscall/fault/sync transition flow is routed through architecture trampoline entry/exit paths with per-CPU KPTI scratch root/RSP tracking.
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - No `fork`, copy-on-write, demand paging, or swap.
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
+- No `/dev` filesystem or device nodes.
+- No ANSI/VT100 terminal escape sequence support.
+- No environment variables or process inheritance beyond fd tables.
+- Single-core only; no SMP support.
+- No real-time clock or wall-clock timestamps.
+- No block/buffer cache; all disk I/O is synchronous and uncached.
 - `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
+- TCP passive open (`bind`/`listen`/`accept`) returns `ENOSYS`; no congestion control or retransmission timers.
 - Storage, graphics, and device support remain QEMU/virtio-first.
-- Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack.
+
+## Milestone roadmap
+
+See `docs/MILESTONES.md` for detailed implementation plans. Summary:
+
+| # | Milestone | Status |
+|---|-----------|--------|
+| M11 | KPTI | Complete |
+| M12 | VFS-backed ELF launch | Complete |
+| M13 | fork + CoW + demand paging | Planned |
+| M14 | Timer-driven hard preemption | Complete |
+| M15 | Extended syscall surface | Complete |
+| M16 | Extended ProcFS | Complete |
+| M17 | Full-data journaling | Complete |
+| M18 | Hardware abstraction layer | Planned |
+| M19 | Production TCP/IP + utilities | Partial |
+| M20 | Signal infrastructure | Planned |
+| M21 | Full mmap / VMA layer | Planned |
+| M22 | execve syscall | Planned |
+| M23 | /dev filesystem | Planned |
+| M24 | Shell pipes + process groups | Planned |
+| M25 | ANSI terminal emulation | Planned |
+| M26 | Environment variables | Planned |
+| M27 | SMP / multi-core | Planned |
+| M28 | RTC + wall-clock time | Planned |
+| M29 | Block cache | Planned |
+| M30 | Multi-user + login | Planned |
+| M31 | Doom enhancements | Planned |
 
 ## Build
 
@@ -279,6 +326,8 @@ Representative smoke commands:
 - `cargo xtask smoke-ring3-fault --arch aarch64`
 - `cargo xtask smoke-net --arch x86_64`
 - `cargo xtask smoke-net --arch aarch64`
+- `cargo xtask smoke-kpti-m11 --arch x86_64`
+- `cargo xtask smoke-kpti-m11 --arch aarch64`
 
 ## Documentation index
 
@@ -293,6 +342,7 @@ Representative smoke commands:
 - `docs/GFX.md`
 - `docs/USERLAND.md`
 - `docs/DOOM.md`
+- `docs/MILESTONES.md`
 
 ## License
 

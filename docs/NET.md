@@ -78,11 +78,18 @@ The `smoke-net` harness boots QEMU, waits for the shell, then verifies:
 - `ip addr` delegates to ifconfig
 - `ls /bin` includes `/bin/netstat`, `/bin/ifconfig`, `/bin/ip`
 
+## M19 status
+
+Network utilities (`netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip`, `ping`) are currently kernel-side shell commands dispatched as `/bin/*` entries through the kernel-mediated spawn path. They are not yet user-space ring-3 ELF binaries with independent syscall-based implementations.
+
 ## Limits
 
 - Passive TCP (`bind`/`listen`/`accept`) not yet implemented (returns `ENOSYS`).
+- No TCP congestion control (slow start, CWND) or retransmission timers.
+- No `TIME_WAIT`/`FIN_WAIT_2` timeout enforcement (2*MSL).
 - Maximum 4 concurrent TCP connections.
 - `nc` interactive mode not supported; use `curl` for HTTP.
+- `traceroute`, `host`, `dig` utilities not yet implemented.
 - Not a full production TCP/IP stack; focused on deterministic behavior inside QEMU.
 
 ## Relevant files

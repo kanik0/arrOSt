@@ -234,62 +234,40 @@ Three scheduler tables coexist:
 4. Validate with smoke tests or interactive QEMU session
 5. Update relevant docs if externally visible behavior changed
 
-## Current Milestones (from Known Limitations)
+## Milestones
 
-### M11: Kernel Page-Table Isolation (KPTI)
-**Status**: Planned
-**Limitation**: "Kernel mappings are still shared into each ring-3 page table, but remain supervisor-only."
-**Goal**: Remove kernel mappings from ring-3 page tables entirely; map only a minimal trampoline page for user/kernel transitions.
+### Completed
+| # | Milestone | Summary |
+|---|-----------|---------|
+| M11 | KPTI | Trampoline infrastructure, per-CPU scratch, CR3/TTBR0 switching on entry/exit |
+| M12 | VFS-backed ELF launch | `/bin/*` auto-dispatch, kernel-mediated spawn-from-path, 18 seeded binaries |
+| M14 | Timer-driven preemption | PIT IRQ0 / GIC IRQ27, 10-tick quantum, full GPR save/restore |
+| M15 | Extended syscalls | 52 syscalls total, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
+| M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
+| M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
 
-### M12: Filesystem-backed execve [WORK IN PROGRESS]
-**Status**: In Progress
-**Limitation**: "There is no filesystem-backed execve path yet; ring-3 apps are still embedded artifacts (ring3_init, ring3_doom)."
-**Goal**: Implement `execve` syscall that loads ELF binaries from the VFS (e.g., `/bin/init`, `/bin/doom`) into a fresh ring-3 process with new address space.
+### In progress
+| # | Milestone | Remaining |
+|---|-----------|-----------|
+| M19 | TCP/IP + utilities | Passive TCP, congestion control, retransmission, `traceroute`/`host`/`dig` |
 
-### M13: fork + Copy-on-Write + Demand Paging + Swap
-**Status**: Planned
-**Limitation**: "No fork, copy-on-write, demand paging, or swap."
-**Goal**: Implement `fork()` with CoW page sharing, demand-paged user mappings, and optionally a basic swap backend to virtio-blk.
-
-### M14: Timer-Driven Hard Preemption
-**Status**: Implemented
-**Summary**: PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) now preempt ring-3 processes at any instruction boundary. Naked ISR (x86_64) / full-save EL0 IRQ vector (aarch64) capture all GPRs; saved to static frame; restored on rescheduling. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`).
-
-### M15: Extended Syscall Surface
-**Status**: Implemented
-**Summary**: Added 22 new syscalls (numbers 25–46) across four phases:
-- Phase A1 (directory ops): `mkdir` `rmdir` `unlink` `rename` `link` `symlink` `readlink` `getcwd` `chdir` `getdents`
-- Phase A2 (process identity): `getppid` `getuid` `getgid` `kill`
-- Phase A3 (memory, stubs): `mmap` `munmap` `mprotect` `brk` → return `ENOSYS`
-- Phase A4 (signal stubs): `sigaction` `sigreturn` → return `ENOSYS`
-- Phase A4 (pipe IPC): `pipe` `pipe2` with 8-slot global table, 4 KiB circular buffers, fd integration
-- Shell prompt upgraded from `arrost> ` to `user@arrost /path> ` (serial + GUI terminal)
-**Remaining**: Phase B signal infrastructure (delivery, frames, masking); full mmap/VMA layer.
-
-### M16: Extended ProcFS
-**Status**: Implemented
-**Summary**: Expanded `/proc` from 5 fixed entries to a full tree:
-- Global: `version`, `cpuinfo`, `meminfo` (+ existing `mounts`, `uptime`, `ps`)
-- Network subsystem: `/proc/net/` directory with `dev`, `arp`, `tcp`
-- Per-process directories: `/proc/<pid>/` dynamically enumerated for all live PIDs, each with `status`, `cmdline`, `stat`
-- Added `mem::heap_size_bytes()`, `net::arp_snapshot()`, `net::ArpEntryInfo`
-**Remaining**: `/proc/<pid>/maps` (needs M13), `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`, `/proc/net/route`
-
-### M17: Full-Data Journaling for diskfs-v2
-**Status**: Planned
-**Limitation**: "diskfs-v2 journals metadata only; file data is not journaled."
-**Goal**: Add data journaling mode (ordered or full journal) for crash-consistent file data writes.
-
-### M18: Hardware Diversification Beyond QEMU/Virtio
-**Status**: Planned
-**Limitation**: "Storage, graphics, and device support remain QEMU/virtio-first."
-**Goal**: Add a device abstraction layer and at least one non-virtio backend per class (storage, net, graphics).
-
-### M19: Production TCP/IP Stack + Unix Network Utilities
-**Status**: In Progress
-**Limitation**: "Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack."
-**Delivered**: TCP state machine (SYN_SENT → ESTABLISHED → FIN_WAIT_1/CLOSE_WAIT), BSD socket syscalls (socket/bind/listen/accept/connect/send/recv), ABI revision 5, kernel-side Unix network utilities as shell commands and `/bin/*` entries (netstat, ifconfig, route, arp, ss, nc, ip, ping).
-**Remaining**: User-space ring-3 ELF binaries for each utility; congestion control; full TIME_WAIT/CLOSING states; traceroute, host, dig utilities.
+### Planned
+| # | Milestone | Goal |
+|---|-----------|------|
+| M13 | fork + CoW + demand paging | `fork()` with CoW pages, VMA tracking, demand-paged mappings |
+| M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
+| M21 | Full mmap / VMA | Replace mmap/munmap/mprotect/brk stubs with real VMA manager |
+| M22 | execve syscall | True `execve` exposing VFS ELF loading to user-space |
+| M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
+| M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
+| M25 | ANSI terminal | VT100 escape sequences, 16-color palette, cursor control |
+| M26 | Environment variables | Per-process env, `export`, `$VAR` expansion, inheritance |
+| M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
+| M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
+| M29 | Block cache | LRU sector cache, write-back, cache stats |
+| M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
+| M31 | Doom enhancements | Audio mixing, savegames, fullscreen, network multiplayer groundwork |
+| M18 | Hardware abstraction | Device traits, ramdisk, loopback, device registry |
 
 ---
 
