@@ -1264,7 +1264,7 @@ impl NetState {
                 && self.pending_ping.seq == seq
                 && self.pending_ping.target == src_ip
             {
-                self.pending_ping.reply_tick = time::ticks();
+                self.pending_ping.reply_tick = crate::arch::read_hires_counter();
                 self.pending_ping.active = false;
             }
             // Echo reply from destination: satisfy pending traceroute probe.
@@ -1273,7 +1273,7 @@ impl NetState {
                 && self.pending_traceroute.seq == seq
                 && self.pending_traceroute.target == src_ip
             {
-                self.pending_traceroute.reply_tick = time::ticks();
+                self.pending_traceroute.reply_tick = crate::arch::read_hires_counter();
                 self.pending_traceroute.responding_ip = src_ip;
                 self.pending_traceroute.reached = true;
                 self.pending_traceroute.active = false;
@@ -1287,7 +1287,7 @@ impl NetState {
                 && self.pending_traceroute.ident == orig_ident
                 && self.pending_traceroute.seq == orig_seq
             {
-                self.pending_traceroute.reply_tick = time::ticks();
+                self.pending_traceroute.reply_tick = crate::arch::read_hires_counter();
                 self.pending_traceroute.responding_ip = src_ip;
                 self.pending_traceroute.reached = false;
                 self.pending_traceroute.active = false;
@@ -1846,26 +1846,30 @@ impl NetState {
 
         let next_hop = self.select_next_hop(target);
         let dst_mac = self.resolve_arp(next_hop)?;
-        let start = time::ticks();
+        let start_hires = crate::arch::read_hires_counter();
+        let start_tick = time::ticks();
         self.pending_ping = PendingPing {
             active: true,
             ident,
             seq,
             target,
-            start_tick: start,
+            start_tick: start_hires,
             reply_tick: 0,
         };
         self.send_ipv4_packet(dst_mac, target, IP_PROTO_ICMP, &icmp[..total])?;
 
         let timeout_ticks = 300;
-        while time::ticks().saturating_sub(start) < timeout_ticks {
+        while time::ticks().saturating_sub(start_tick) < timeout_ticks {
             self.poll();
             if !self.pending_ping.active
                 && self.pending_ping.ident == ident
                 && self.pending_ping.seq == seq
                 && self.pending_ping.reply_tick >= self.pending_ping.start_tick
             {
-                return Ok(self.pending_ping.reply_tick - self.pending_ping.start_tick);
+                let rtt_us = crate::arch::hires_counter_to_us(
+                    self.pending_ping.reply_tick - self.pending_ping.start_tick,
+                );
+                return Ok(rtt_us);
             }
             spin_loop();
         }
@@ -2240,13 +2244,14 @@ impl NetState {
 
         let next_hop = self.select_next_hop(target);
         let dst_mac = self.resolve_arp(next_hop)?;
-        let start = time::ticks();
+        let start_hires = crate::arch::read_hires_counter();
+        let start_tick = time::ticks();
         self.pending_traceroute = PendingTraceroute {
             active: true,
             ident,
             seq,
             target,
-            start_tick: start,
+            start_tick: start_hires,
             reply_tick: 0,
             responding_ip: [0; 4],
             reached: false,
@@ -2255,14 +2260,14 @@ impl NetState {
 
         // Wait up to ~25 ticks for a reply (Time Exceeded or Echo Reply).
         let timeout_ticks = 25u64;
-        while time::ticks().saturating_sub(start) < timeout_ticks {
+        while time::ticks().saturating_sub(start_tick) < timeout_ticks {
             self.poll();
             if !self.pending_traceroute.active {
-                let rtt_ticks = self
+                let rtt_cycles = self
                     .pending_traceroute
                     .reply_tick
                     .saturating_sub(self.pending_traceroute.start_tick);
-                let ms = rtt_ticks.saturating_mul(10);
+                let ms = crate::arch::hires_counter_to_us(rtt_cycles) / 1_000;
                 return Ok(TracerouteHop {
                     ip: self.pending_traceroute.responding_ip,
                     ms,
@@ -3028,7 +3033,7 @@ pub fn ping_to_serial(args: &str) {
         let rest = rest.trim_start();
         match rest.find(char::is_whitespace) {
             Some(i) => {
-                let n = rest[..i].parse::<usize>().unwrap_or(4).max(1).min(100);
+                let n = rest[..i].parse::<usize>().unwrap_or(4).clamp(1, 100);
                 (n, rest[i..].trim())
             }
             None => (4, rest),
@@ -3063,15 +3068,15 @@ pub fn ping_to_serial(args: &str) {
     for seq in 1..=(count as u32) {
         transmitted += 1;
         match with_net_mut(|state| state.send_ping(target)) {
-            Ok(rtt_ticks) => {
+            Ok(rtt_us) => {
                 received += 1;
-                let ms = rtt_ticks.saturating_mul(10);
-                if ms == 0 {
+                if rtt_us < 1_000 {
                     serial::write_fmt(format_args!(
-                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time=<10 ms\n",
+                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time=<1 ms\n",
                         target[0], target[1], target[2], target[3], seq
                     ));
                 } else {
+                    let ms = rtt_us / 1_000;
                     serial::write_fmt(format_args!(
                         "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time={} ms\n",
                         target[0], target[1], target[2], target[3], seq, ms
@@ -3087,11 +3092,9 @@ pub fn ping_to_serial(args: &str) {
             }
         }
     }
-    let loss = if transmitted > 0 {
-        (transmitted - received) * 100 / transmitted
-    } else {
-        100
-    };
+    let loss = ((transmitted - received) * 100)
+        .checked_div(transmitted)
+        .unwrap_or(100);
     serial::write_fmt(format_args!(
         "\n--- {} ping statistics ---\n{} packets transmitted, {} received, {}% packet loss\n",
         target_str, transmitted, received, loss
@@ -3118,6 +3121,12 @@ pub fn traceroute_to_serial(target_str: &str) {
         "traceroute to {} ({}.{}.{}.{}), 30 hops max, 32 byte packets\n",
         target_str, target[0], target[1], target[2], target[3]
     ));
+    // QEMU slirp user-mode networking proxies ICMP to the real host without
+    // decrementing TTL, so intermediate hops are never visible and the
+    // destination always appears at hop 1 with an echo reply.
+    serial::write_line(
+        "Note: QEMU slirp does not simulate intermediate hops; route is approximate.",
+    );
     // Use a fixed ident derived from target to avoid collisions with pings.
     let ident: u16 = 0xAA00u16
         .wrapping_add(target[2] as u16)
@@ -3133,15 +3142,22 @@ pub fn traceroute_to_serial(target_str: &str) {
         match with_net_mut(|state| state.send_traceroute_probe(target, ttl, ident, seq)) {
             Ok(hop) if hop.ip != [0; 4] => {
                 consecutive_timeouts = 0;
+                // Annotate when destination replies with echo reply at hop 1
+                // (QEMU slirp behaviour: TTL ignored, proxy responds directly).
+                let note = if hop.reached && ttl == 1 {
+                    " [direct]"
+                } else {
+                    ""
+                };
                 if hop.ms == 0 {
                     serial::write_fmt(format_args!(
-                        "{:2}  {}.{}.{}.{}  <10 ms\n",
-                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3]
+                        "{:2}  {}.{}.{}.{}  <1 ms{}\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], note
                     ));
                 } else {
                     serial::write_fmt(format_args!(
-                        "{:2}  {}.{}.{}.{}  {} ms\n",
-                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], hop.ms
+                        "{:2}  {}.{}.{}.{}  {} ms{}\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], hop.ms, note
                     ));
                 }
                 if hop.reached {

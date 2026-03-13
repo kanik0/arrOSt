@@ -332,6 +332,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         irq.syscall_gate_dpl
     ));
     time::set_heartbeat(false);
+    // Calibrate the high-resolution timer now that PIT/GIC ticks are running.
+    arch::calibrate_hires_counter();
     let audio_report = audio::init();
     serial::write_fmt(format_args!(
         "Audio: backend={} ready={} detail={}\n",
