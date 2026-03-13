@@ -736,17 +736,27 @@ pub trait AudioDevice {
 
 ### Delivered scope
 
-- TCP connection table with state machine: CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 / CLOSE_WAIT.
+- TCP connection table with state machine: CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 / CLOSE_WAIT → CLOSING / LAST_ACK.
 - BSD socket syscalls (ABI revision 5): `socket(6)`, `connect(50)`, `send(51)`, `recv(52)`, plus stubs `bind(47)`, `listen(48)`, `accept(49)` returning `ENOSYS`.
 - `FdTarget::TcpSocket(u8)` in the per-process fd table; `close` triggers FIN.
 - Kernel-side helpers for `netstat`, `ifconfig`, `route`, `arp`, `ss`, `nc`, `ip` dispatched from both serial shell and GUI terminal.
 - `/bin/netstat`, `/bin/ifconfig`, `/bin/route`, `/bin/arp`, `/bin/ss`, `/bin/nc`, `/bin/ip`, `/bin/ping` in `BIN_EXEC_PATHS`.
 - `smoke-net` QEMU harness verifying all utility commands produce expected output.
-- Unix-standard `ping` output: `PING <ip>: 56 data bytes` / `64 bytes from <ip>: icmp_seq=1 ttl=64 time=N ms` / statistics summary.
+- `arrostd::runtime` TCP shims: `tcp_connect()`, `tcp_send()`, `tcp_recv()` for ring-3 binaries.
+- **Phase 2 — User-space ring-3 ELF binaries** (M19 Phase 2, 2026-03-12):
+  - `/bin/netstat` — reads `/proc/net/tcp`, prints "Active Internet connections" header + raw table.
+  - `/bin/ifconfig` — reads `/proc/net/dev`, relays per-interface counters (Linux net/dev format).
+  - `/bin/arp` — reads `/proc/net/arp`, relays ARP cache ("IP address … HWaddress … Device").
+  - `/bin/ss` — reads `/proc/net/tcp`, prints "Netid … Local Address:Port … Peer Address:Port" header.
+  - `/bin/nc` — TCP client (`tcp_connect` + `tcp_send`/`tcp_recv` relay loop); listen mode documented as unsupported until `SYS_BIND`/`SYS_LISTEN`/`SYS_ACCEPT` are functional.
+  - Build system: `user/init/build.rs`, `xtask/src/main.rs` (both architectures), `kernel/build.rs`, `kernel/src/fs/mod.rs` wired for all 5 binaries.
+  - `smoke-net` updated to verify user-space binary output strings.
 
 ### Remaining follow-up
 
-- User-space ring-3 ELF binaries for each utility (depends on M15 extended syscall surface).
+- `/bin/route` user-space binary (needs `/proc/net/route` procfs entry).
+- `/bin/ip` user-space binary (multi-subcommand, needs `/proc/net/dev` + `/proc/net/arp` parsing).
+- `/bin/ping` user-space binary (needs `SOCK_RAW` or dedicated kernel ping syscall).
 - Congestion control (slow start / Reno-style CWND).
 - Full TIME_WAIT / CLOSING / LAST_ACK states and 2*MSL timer.
 - Passive TCP (`bind`/`listen`/`accept`) implementation.

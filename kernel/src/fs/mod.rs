@@ -510,6 +510,7 @@ impl FsState {
             ProcOpenFile::NetDev => Ok(self.render_proc_net_dev_text()),
             ProcOpenFile::NetArp => Ok(self.render_proc_net_arp_text()),
             ProcOpenFile::NetTcp => Ok(self.render_proc_net_tcp_text()),
+            ProcOpenFile::NetRoute => Ok(self.render_proc_net_route_text()),
             ProcOpenFile::PidStatus { pid } => self.render_proc_pid_status_text(pid),
             ProcOpenFile::PidCmdline { pid } => self.render_proc_pid_cmdline_text(pid),
             ProcOpenFile::PidStat { pid } => self.render_proc_pid_stat_text(pid),
@@ -528,6 +529,7 @@ impl FsState {
                 | ProcOpenFile::NetDev
                 | ProcOpenFile::NetArp
                 | ProcOpenFile::NetTcp
+                | ProcOpenFile::NetRoute
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -560,6 +562,7 @@ impl FsState {
                 | ProcOpenFile::NetDev
                 | ProcOpenFile::NetArp
                 | ProcOpenFile::NetTcp
+                | ProcOpenFile::NetRoute
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -776,6 +779,34 @@ impl FsState {
                 conn.state,
             );
         }
+        text
+    }
+
+    fn render_proc_net_route_text(&self) -> String {
+        let status = net::status();
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
+        );
+        if status.ready {
+            let gw_le = u32::from_le_bytes(status.gateway);
+            let _ = writeln!(
+                text,
+                "eth0\t00000000\t{gw_le:08X}\t0003\t0\t0\t100\t00000000\t0\t0\t0"
+            );
+            let net_addr = [status.ipv4[0], status.ipv4[1], status.ipv4[2], 0];
+            let net_le = u32::from_le_bytes(net_addr);
+            let mask_le = u32::from_le_bytes(status.netmask);
+            let _ = writeln!(
+                text,
+                "eth0\t{net_le:08X}\t00000000\t0001\t0\t0\t0\t{mask_le:08X}\t0\t0\t0"
+            );
+        }
+        let _ = writeln!(
+            text,
+            "lo\t7F000000\t00000000\t0001\t0\t0\t0\tFF000000\t0\t0\t0"
+        );
         text
     }
 
@@ -1658,8 +1689,38 @@ fn builtin_bin_seed_payload(path: &str) -> (&'static [u8], u16) {
         "/bin/ps" if !user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES.is_empty() => {
             (user_bin_embed::ARROST_USER_BIN_PS_ELF_BYTES, 0o755)
         }
+        "/bin/netstat" if !user_bin_embed::ARROST_USER_BIN_NETSTAT_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_NETSTAT_ELF_BYTES, 0o755)
+        }
+        "/bin/arp" if !user_bin_embed::ARROST_USER_BIN_ARP_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_ARP_ELF_BYTES, 0o755)
+        }
+        "/bin/ss" if !user_bin_embed::ARROST_USER_BIN_SS_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_SS_ELF_BYTES, 0o755)
+        }
+        "/bin/ifconfig" if !user_bin_embed::ARROST_USER_BIN_IFCONFIG_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_IFCONFIG_ELF_BYTES, 0o755)
+        }
+        "/bin/nc" if !user_bin_embed::ARROST_USER_BIN_NC_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_NC_ELF_BYTES, 0o755)
+        }
+        "/bin/route" if !user_bin_embed::ARROST_USER_BIN_ROUTE_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_ROUTE_ELF_BYTES, 0o755)
+        }
+        "/bin/ip" if !user_bin_embed::ARROST_USER_BIN_IP_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_IP_ELF_BYTES, 0o755)
+        }
+        "/bin/ping" if !user_bin_embed::ARROST_USER_BIN_PING_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_PING_ELF_BYTES, 0o755)
+        }
         _ => (b"#!/arrost/bin\n", 0o755),
     }
+}
+
+/// Called by `fd::FdTable::release_description` when the last reference to a
+/// `FdTarget::TcpListener` is dropped.
+pub(crate) fn net_tcp_listener_close(idx: u8) {
+    net::tcp_listener_close(idx);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

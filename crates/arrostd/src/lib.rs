@@ -75,6 +75,7 @@ pub mod syscall {
     pub const SYS_CONNECT: u64 = 50;
     pub const SYS_SEND: u64 = 51;
     pub const SYS_RECV: u64 = 52;
+    pub const SYS_PING: u64 = 53;
 
     pub mod app {
         pub const INIT: u64 = 1;
@@ -282,6 +283,7 @@ pub mod syscall {
             SYS_CONNECT => "connect",
             SYS_SEND => "send",
             SYS_RECV => "recv",
+            SYS_PING => "ping",
             SYS_MKDIR => "mkdir",
             SYS_RMDIR => "rmdir",
             SYS_UNLINK => "unlink",
@@ -910,6 +912,69 @@ pub mod runtime {
                 return 0;
             }
         }
+    }
+
+    /// Connect a TCP socket to `dst_ip:dst_port` using `src_port` as the local
+    /// port.  On success returns a non-negative file descriptor that refers to
+    /// the established TCP connection.
+    pub fn tcp_connect(req: &crate::syscall::TcpConnectReq) -> isize {
+        syscall2(
+            crate::syscall::SYS_CONNECT,
+            req as *const crate::syscall::TcpConnectReq as u64,
+            core::mem::size_of::<crate::syscall::TcpConnectReq>() as u64,
+        )
+    }
+
+    /// Send `data` on the established TCP connection identified by `fd`.
+    /// Returns bytes accepted or a negative errno.
+    pub fn tcp_send(fd: u32, data: &[u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_SEND,
+            fd as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
+    }
+
+    /// Receive up to `buf.len()` bytes from the TCP connection identified by
+    /// `fd`.  Returns bytes read, 0 on EOF, or a negative errno.
+    pub fn tcp_recv(fd: u32, buf: &mut [u8]) -> isize {
+        syscall3(
+            crate::syscall::SYS_RECV,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+
+    /// Send one ICMP echo request to `ip` (4-byte array) and wait for reply.
+    /// Returns round-trip time in milliseconds (>=0) or negative errno on failure.
+    pub fn ping(ip: [u8; 4]) -> isize {
+        syscall2(crate::syscall::SYS_PING, ip.as_ptr() as u64, 4u64)
+    }
+
+    /// Create a socket.  `domain` = `AF_INET` (2), `sock_type` = `SOCK_STREAM` (1)
+    /// or `SOCK_DGRAM` (2).  Returns a non-negative fd or negative errno.
+    pub fn socket(domain: u64, sock_type: u64, protocol: u64) -> isize {
+        syscall3(crate::syscall::SYS_SOCKET, domain, sock_type, protocol)
+    }
+
+    /// Bind a SOCK_STREAM socket fd to a local port.  `port` is passed as
+    /// the second argument (the address structure argument is unused here).
+    /// Returns 0 on success or negative errno.
+    pub fn bind_tcp(fd: u32, port: u16) -> isize {
+        syscall3(crate::syscall::SYS_BIND, fd as u64, port as u64, 0u64)
+    }
+
+    /// Mark a bound socket as passive (server mode).  Returns 0 or negative errno.
+    pub fn listen(fd: u32, backlog: i32) -> isize {
+        syscall2(crate::syscall::SYS_LISTEN, fd as u64, backlog as u64)
+    }
+
+    /// Block until a new connection arrives on `fd`.  Returns a new connected fd
+    /// (non-negative) or negative errno (`EAGAIN` = no connection within timeout).
+    pub fn accept(fd: u32) -> isize {
+        syscall3(crate::syscall::SYS_ACCEPT, fd as u64, 0u64, 0u64)
     }
 }
 
