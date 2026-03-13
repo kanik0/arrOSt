@@ -484,11 +484,13 @@ fn arm_and_enter(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_int80(
     number: u64,
     arg0: u64,
-    _arg1: u64,
-    _arg2: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
     user_rip: u64,
     user_rsp: u64,
     from_ring3: bool,
@@ -501,7 +503,7 @@ pub fn dispatch_int80(
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
 
-    let dispatch = proc::dispatch_ring3_syscall_with_action(number, arg0, _arg1, _arg2);
+    let dispatch = proc::dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2, arg3);
     let result = dispatch.result;
     let return_to_kernel = dispatch.action == proc::Ring3SyscallAction::ReturnKernel;
     if return_to_kernel {
@@ -569,16 +571,26 @@ pub fn handle_page_fault(
     error_code: u64,
     from_ring3: bool,
 ) -> bool {
-    if RING3_SMOKE_STATE.load(Ordering::Acquire) != STATE_ARMED || !from_ring3 {
+    if !from_ring3 || RING3_SMOKE_STATE.load(Ordering::Acquire) != STATE_ARMED {
         return false;
     }
 
+    // Bit 1 of the error code: 1 = write fault, 0 = read/exec fault.
+    let write_fault = (error_code & 0x2) != 0;
+
+    // Attempt CoW copy or demand-page allocation.  If handled, return true so the
+    // caller issues iretq and the faulting instruction is transparently retried.
+    if proc::on_ring3_page_fault(fault_addr, write_fault) {
+        return true;
+    }
+
+    // Unrecoverable: log, mark the process faulted, and resume the kernel scheduler.
     serial::write_fmt(format_args!(
         "ring3 run: page fault addr={:#018x} rip={:#018x} rsp={:#018x} err={:#x} -> kernel resume\n",
         fault_addr, user_rip, user_rsp, error_code
     ));
+    proc::mark_active_ring3_fault_with_info(user_rip, user_rsp);
     RING3_SMOKE_STATE.store(STATE_FAILED, Ordering::Release);
-    proc::mark_active_ring3_fault();
     RING3_SMOKE_TRAP_RIP.store(user_rip, Ordering::Release);
     RING3_SMOKE_TRAP_RSP.store(user_rsp, Ordering::Release);
     RING3_SMOKE_TRAP_RET.store(errno::EFAULT as u64, Ordering::Release);

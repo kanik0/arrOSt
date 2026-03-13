@@ -6114,10 +6114,10 @@ impl LsOptions {
 fn parse_ls_command(input: &str) -> Option<Result<(LsOptions, Option<&str>), &'static str>> {
     let rest = if input == "ls" || input == TERMINAL_BIN_LS {
         ""
+    } else if let Some(rest) = input.strip_prefix("ls ") {
+        rest
     } else {
-        input
-            .strip_prefix("ls ")
-            .or_else(|| input.strip_prefix("/bin/ls "))?
+        input.strip_prefix("/bin/ls ")?
     };
 
     let mut options = LsOptions::empty();

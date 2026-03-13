@@ -5,6 +5,7 @@ mod user_elf_embed {
 }
 
 use crate::fs::{self, FdTable, FdTarget, MAX_FDS, MAX_OPEN_PATH_BYTES};
+use crate::mem::vma::{MAX_VMAS, VmaEntry, VmaFlags};
 use crate::{gfx, net, serial, time};
 use alloc::{boxed::Box, vec::Vec};
 use arrost_user_doom as user_doom;
@@ -12,16 +13,16 @@ use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
     AF_INET, DIRENT_HEADER_SIZE, Dirent, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR,
-    FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR,
-    O_TRUNC, SEEK_CUR, SEEK_END, SEEK_SET, SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND,
-    SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2,
-    SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
-    SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
-    SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV,
-    SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION,
-    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK,
-    SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app,
-    caps, errno,
+    FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, O_ACCMODE, O_CREAT,
+    O_RDONLY, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SEEK_CUR, SEEK_END, SEEK_SET,
+    SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET,
+    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT,
+    SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID, SYS_GETPPID, SYS_GETUID,
+    SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN,
+    SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM, SYS_RENAME,
+    SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
+    SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
+    TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -337,6 +338,11 @@ pub struct Ring3ProcessContext {
     pub user_ranges: [Option<UserMemoryRange>; MAX_USER_RANGES],
     pub user_range_count: usize,
     pub mapped_pages: usize,
+    /// Virtual memory area list (M13: CoW, demand paging, mmap, brk).
+    pub vma_list: [Option<VmaEntry>; MAX_VMAS],
+    pub vma_count: usize,
+    /// Current program break (end of the heap arena).
+    pub brk_end: u64,
     /// Current working directory (UTF-8, no trailing slash except for root).
     pub cwd: [u8; MAX_CWD_LEN],
     pub cwd_len: usize,
@@ -355,6 +361,9 @@ const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
         user_ranges: ring3_groundwork::empty_user_ranges(),
         user_range_count: 0,
         mapped_pages: 0,
+        vma_list: [None; MAX_VMAS],
+        vma_count: 0,
+        brk_end: 0,
         cwd: [0u8; MAX_CWD_LEN],
         cwd_len: 1,
     };
@@ -448,6 +457,23 @@ impl Ring3ProcessContext {
         self.user_ranges = image.user_ranges;
         self.user_range_count = image.user_range_count;
         self.mapped_pages = image.mapped_pages;
+        self.brk_end = image.initial_brk_end;
+        // Seed VMA list from user_ranges (READ|WRITE for writable, READ|EXEC for code, stack READ|WRITE).
+        self.vma_list = [None; MAX_VMAS];
+        self.vma_count = 0;
+        for range in image
+            .user_ranges
+            .iter()
+            .take(image.user_range_count)
+            .flatten()
+        {
+            if self.vma_count >= MAX_VMAS {
+                break;
+            }
+            let flags = VmaFlags(VmaFlags::READ | if range.writable { VmaFlags::WRITE } else { 0 });
+            self.vma_list[self.vma_count] = Some(VmaEntry::new(range.start, range.len, flags));
+            self.vma_count += 1;
+        }
     }
 
     pub fn launch_context(self) -> Ring3LaunchContext {
@@ -1561,7 +1587,7 @@ impl Scheduler {
     }
 
     fn dispatch_ring3_syscall(&mut self, number: u64, arg0: u64, arg1: u64, arg2: u64) -> isize {
-        self.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2)
+        self.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2, 0)
             .result
     }
 
@@ -1571,6 +1597,7 @@ impl Scheduler {
         arg0: u64,
         arg1: u64,
         arg2: u64,
+        arg3: u64,
     ) -> Ring3SyscallDispatch {
         if !self.ring3_context.active {
             self.stats.errors = self.stats.errors.saturating_add(1);
@@ -1793,8 +1820,18 @@ impl Scheduler {
                 }
             }
             SYS_SIGACTION | SYS_SIGRETURN => errno::ENOSYS,
-            // M15 Phase A3: memory ops — stubs
-            SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => errno::ENOSYS,
+            // M13: real mmap / brk; munmap / mprotect remain ENOSYS
+            SYS_MMAP => {
+                // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
+                self.syscall_mmap_ring3(arg1, arg2, arg3)
+            }
+            SYS_MUNMAP | SYS_MPROTECT => errno::ENOSYS,
+            SYS_BRK => {
+                // arg0 = new brk address (0 = query)
+                self.syscall_brk_ring3(arg0)
+            }
+            // M13: fork
+            SYS_FORK => self.syscall_fork_ring3(),
             // M15 Phase A4: pipe IPC
             SYS_PIPE => {
                 self.stats.pipe = self.stats.pipe.saturating_add(1);
@@ -1826,6 +1863,227 @@ impl Scheduler {
         }
 
         Ring3SyscallDispatch { result, action }
+    }
+
+    // ── M13: mmap / brk / fork / page-fault ──────────────────────────────
+
+    /// SYS_MMAP: anonymous demand-paged mapping (MAP_ANONYMOUS only).
+    fn syscall_mmap_ring3(&mut self, len: u64, prot: u64, flags: u64) -> isize {
+        if flags & u64::from(MAP_ANONYMOUS) == 0 {
+            return errno::ENOSYS; // file-backed mmap not implemented
+        }
+        if len == 0 {
+            return errno::EINVAL;
+        }
+        let aligned_len = (len.saturating_add(0xFFF)) & !0xFFF_u64;
+        let ctx_ref = &mut self.ring3_context.process;
+        if ctx_ref.vma_count >= MAX_VMAS {
+            return errno::ENOMEM;
+        }
+        // Find first free virtual address >= 2 MiB above the highest VMA end.
+        let mut start: u64 = ctx_ref.brk_end.saturating_add(0x20_0000);
+        start = (start.saturating_add(0x1F_FFFF)) & !0x1F_FFFF_u64; // 2 MiB align
+        for i in 0..ctx_ref.vma_count {
+            if let Some(vma) = ctx_ref.vma_list[i] {
+                let end = vma.start.saturating_add(vma.len);
+                let end_aligned = (end.saturating_add(0x1F_FFFF)) & !0x1F_FFFF_u64;
+                if end_aligned > start {
+                    start = end_aligned;
+                }
+            }
+        }
+        let r = if prot & u64::from(PROT_READ) != 0 {
+            VmaFlags::READ
+        } else {
+            0
+        };
+        let w = if prot & u64::from(PROT_WRITE) != 0 {
+            VmaFlags::WRITE
+        } else {
+            0
+        };
+        let x = if prot & u64::from(PROT_EXEC) != 0 {
+            VmaFlags::EXEC
+        } else {
+            0
+        };
+        let vma_flags = VmaFlags(VmaFlags::ANON | r | w | x);
+        ctx_ref.vma_list[ctx_ref.vma_count] = Some(VmaEntry::new(start, aligned_len, vma_flags));
+        ctx_ref.vma_count += 1;
+        start as isize
+    }
+
+    /// SYS_BRK: query or extend the program break.
+    fn syscall_brk_ring3(&mut self, addr: u64) -> isize {
+        let ctx_ref = &mut self.ring3_context.process;
+        if addr == 0 {
+            return ctx_ref.brk_end as isize;
+        }
+        let new_brk = (addr.saturating_add(0xFFF)) & !0xFFF_u64;
+        let old_brk = ctx_ref.brk_end;
+        if new_brk <= old_brk {
+            return old_brk as isize; // shrink not implemented for M13
+        }
+        let additional_len = new_brk.saturating_sub(old_brk);
+        if ctx_ref.vma_count < MAX_VMAS {
+            let vma_flags = VmaFlags(VmaFlags::ANON | VmaFlags::READ | VmaFlags::WRITE);
+            ctx_ref.vma_list[ctx_ref.vma_count] =
+                Some(VmaEntry::new(old_brk, additional_len, vma_flags));
+            ctx_ref.vma_count += 1;
+        }
+        ctx_ref.brk_end = new_brk;
+        new_brk as isize
+    }
+
+    /// SYS_FORK: create a child process with CoW-shared address space.
+    ///
+    /// Returns the child PID to the parent; the child receives 0 via its trap frame.
+    fn syscall_fork_ring3(&mut self) -> isize {
+        let Some(slot) = self.ring3_active_slot else {
+            return errno::EPERM;
+        };
+        let parent_img_ptr = match self.ring3_tasks[slot].as_ref() {
+            Some(task) if !task.image_ptr.is_null() => task.image_ptr,
+            _ => return errno::ENODEV,
+        };
+        // SAFETY: parent_img_ptr is valid while the parent task is in ring3_tasks and the
+        // scheduler lock is held; nothing else mutates the image concurrently.
+        let parent_image = unsafe { &mut *parent_img_ptr };
+
+        let child_image = match ring3_groundwork::create_fork_child_image(
+            parent_image,
+            self.ring3_context.process.trap_frame,
+        ) {
+            Ok(img) => img,
+            Err(e) => {
+                serial::write_fmt(format_args!("fork: child image failed: {e}\n"));
+                return errno::ENOMEM;
+            }
+        };
+
+        let Some(child_pid) = self.take_next_pid() else {
+            return errno::ENOMEM;
+        };
+        let child_img_ptr = Box::into_raw(Box::new(child_image));
+        let Some(child_slot) = self.alloc_ring3_task_slot() else {
+            // SAFETY: freshly allocated, never shared.
+            unsafe { drop(Box::from_raw(child_img_ptr)) };
+            return errno::ENOMEM;
+        };
+
+        let mut child_task = EMPTY_RING3_TASK;
+        child_task.pid = child_pid;
+        child_task.parent_pid = self.ring3_context.process.pid;
+        child_task.name = self.ring3_context.process.name;
+        child_task.syscall_caps = self.ring3_context.process.syscall_caps;
+        child_task.state = Ring3TaskState::Ready;
+        child_task.image_ptr = child_img_ptr;
+        // SAFETY: child_img_ptr is valid and exclusively owned.
+        let child_img_ref = unsafe { &*child_img_ptr };
+        child_task.process = self.ring3_context.process;
+        child_task.process.pid = child_pid;
+        child_task.process.apply_process_image(child_img_ref);
+        // Restore fd table and cwd (apply_process_image resets them to defaults).
+        child_task.process.fd_table = self.ring3_context.process.fd_table;
+        child_task.process.cwd = self.ring3_context.process.cwd;
+        child_task.process.cwd_len = self.ring3_context.process.cwd_len;
+        child_task.process.brk_end = self.ring3_context.process.brk_end;
+        // Copy parent VMA list; mark writable VMAs as CoW in child.
+        child_task.process.vma_list = self.ring3_context.process.vma_list;
+        child_task.process.vma_count = self.ring3_context.process.vma_count;
+        for v in child_task.process.vma_list[..child_task.process.vma_count]
+            .iter_mut()
+            .flatten()
+        {
+            if v.flags.is_write() {
+                *v = VmaEntry::new(v.start, v.len, v.flags.with_cow());
+            }
+        }
+        // Mark parent's writable VMAs as CoW too (PTEs are now read-only after fork).
+        let parent_vma_count = self.ring3_context.process.vma_count;
+        for v in self.ring3_context.process.vma_list[..parent_vma_count]
+            .iter_mut()
+            .flatten()
+        {
+            if v.flags.is_write() {
+                *v = VmaEntry::new(v.start, v.len, v.flags.with_cow());
+            }
+        }
+        // Flush updated parent context back to its task record.
+        if let Some(ref mut parent_task) = self.ring3_tasks[slot] {
+            parent_task.process = self.ring3_context.process;
+        }
+        self.ring3_tasks[child_slot] = Some(child_task);
+        serial::write_fmt(format_args!(
+            "fork: parent={} child={}\n",
+            self.ring3_context.process.pid, child_pid
+        ));
+        child_pid as isize
+    }
+
+    /// Called by the arch page-fault handler for ring-3 CoW and demand-page faults.
+    ///
+    /// Returns `true` if the fault was handled (the faulting instruction should be retried).
+    fn on_ring3_page_fault_internal(&mut self, fault_addr: u64, write_fault: bool) -> bool {
+        let Some(slot) = self.ring3_active_slot else {
+            return false;
+        };
+        let img_ptr = match self.ring3_tasks[slot].as_ref() {
+            Some(task) if !task.image_ptr.is_null() => task.image_ptr,
+            _ => return false,
+        };
+        let page_addr = fault_addr & !0xFFF_u64;
+
+        // Find the VMA covering the faulting address.
+        let mut found: Option<(usize, VmaEntry)> = None;
+        {
+            let ctx = &self.ring3_context.process;
+            for i in 0..ctx.vma_count {
+                if let Some(e) = ctx.vma_list[i] {
+                    if !e.contains(fault_addr) {
+                        continue;
+                    }
+                    found = Some((i, e));
+                    break;
+                }
+            }
+        }
+        let (vma_idx, vma) = match found {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // SAFETY: img_ptr is valid while this task is in ring3_tasks and the scheduler lock
+        // is held.
+        let image = unsafe { &mut *img_ptr };
+        let token = self.ring3_context.process.address_space;
+
+        if write_fault && vma.flags.is_cow() {
+            match ring3_groundwork::handle_cow_fault(image, token, page_addr) {
+                Ok(()) => {
+                    // Clear CoW flag: page is now exclusively writable in this process.
+                    if let Some(ref mut v) = self.ring3_context.process.vma_list[vma_idx] {
+                        *v = VmaEntry::new(v.start, v.len, v.flags.without_cow());
+                    }
+                    return true;
+                }
+                Err(_) => {
+                    // Page not yet mapped (ANON VMA never demand-paged); fall through.
+                    if !vma.flags.is_anon() {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if vma.flags.is_anon() {
+            let w = vma.flags.is_write() && !vma.flags.is_cow();
+            let x = vma.flags.is_exec();
+            if ring3_groundwork::alloc_and_map_demand_page(image, page_addr, w, x).is_ok() {
+                return true;
+            }
+        }
+        false
     }
 
     fn run_ring3_groundwork_smoke(&mut self) -> Result<Ring3GroundworkSmokeReport, isize> {
@@ -5982,9 +6240,10 @@ pub fn dispatch_ring3_syscall_with_action(
     arg0: u64,
     arg1: u64,
     arg2: u64,
+    arg3: u64,
 ) -> Ring3SyscallDispatch {
     with_scheduler(|scheduler| {
-        scheduler.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2)
+        scheduler.dispatch_ring3_syscall_with_action(number, arg0, arg1, arg2, arg3)
     })
 }
 
@@ -6071,6 +6330,24 @@ pub fn ring3_active_pid() -> u32 {
 
 pub fn mark_active_ring3_fault() {
     with_scheduler(|scheduler| scheduler.mark_active_ring3_fault());
+}
+
+/// Called by the arch page-fault handler for ring-3 faults.
+/// Returns `true` if the fault was handled (CoW copy or demand page); the faulting instruction
+/// will be retried on iret/eret.  Returns `false` for unrecoverable faults.
+pub fn on_ring3_page_fault(fault_addr: u64, write_fault: bool) -> bool {
+    with_scheduler(|scheduler| scheduler.on_ring3_page_fault_internal(fault_addr, write_fault))
+}
+
+/// Marks the active ring-3 process as Faulted and records the faulting RIP/RSP so that
+/// the post-mortem scheduler can display them.
+pub fn mark_active_ring3_fault_with_info(rip: u64, rsp: u64) {
+    with_scheduler(|scheduler| {
+        if scheduler.ring3_context.active {
+            scheduler.ring3_context.process.state = Ring3ProcessState::Faulted;
+            scheduler.ring3_context.process.trap_frame = Ring3TrapFrame::new(rip, rsp);
+        }
+    });
 }
 
 pub fn ring3_elf_groundwork_enabled() -> bool {
