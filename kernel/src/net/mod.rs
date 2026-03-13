@@ -72,7 +72,7 @@ const IP_BROADCAST: [u8; 4] = [255, 255, 255, 255];
 const IP_ZERO: [u8; 4] = [0, 0, 0, 0];
 const MAC_BROADCAST: [u8; 6] = [0xff; 6];
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
-const DNS_WAIT_TICKS: u64 = 300;
+const DNS_WAIT_TICKS: u64 = 100;
 
 const DHCP_OPT_SUBNET_MASK: u8 = 1;
 const DHCP_OPT_ROUTER: u8 = 3;
@@ -1974,6 +1974,14 @@ impl NetState {
                 if meta.src_port != UDP_DNS_PORT {
                     continue;
                 }
+                // Detect NXDOMAIN/error response early to avoid spinning until timeout.
+                if meta.len >= 4 {
+                    let resp_id = u16::from_be_bytes([response[0], response[1]]);
+                    let flags = u16::from_be_bytes([response[2], response[3]]);
+                    if resp_id == txid && (flags & 0x8000) != 0 && (flags & 0x000f) != 0 {
+                        return Err(NetError::NotFound);
+                    }
+                }
                 if let Some(ip) = parse_dns_a_response(&response[..meta.len], txid) {
                     self.stats.dns_answer = self.stats.dns_answer.saturating_add(1);
                     return Ok(ip);
@@ -2245,8 +2253,8 @@ impl NetState {
         };
         self.send_ipv4_packet_with_ttl(dst_mac, target, IP_PROTO_ICMP, &icmp[..total], ttl)?;
 
-        // Wait up to ~200 ticks for a reply (Time Exceeded or Echo Reply).
-        let timeout_ticks = 200u64;
+        // Wait up to ~25 ticks for a reply (Time Exceeded or Echo Reply).
+        let timeout_ticks = 25u64;
         while time::ticks().saturating_sub(start) < timeout_ticks {
             self.poll();
             if !self.pending_traceroute.active {
@@ -2692,7 +2700,7 @@ impl NetState {
         }
         self.send_arp_request(target_ip)?;
         let start = time::ticks();
-        while time::ticks().saturating_sub(start) < 200 {
+        while time::ticks().saturating_sub(start) < 60 {
             self.poll();
             if let Some(mac) = self.lookup_arp(target_ip) {
                 return Ok(mac);
@@ -3013,52 +3021,102 @@ pub fn ping(target: [u8; 4]) -> Result<u64, NetError> {
     with_net_mut(|state| state.send_ping(target))
 }
 
-pub fn ping_to_serial(ip_text: &str) {
-    let Some(target) = parse_ipv4(ip_text) else {
-        serial::write_line("ping: invalid ip (usage: ping <a.b.c.d>)");
+pub fn ping_to_serial(args: &str) {
+    let args = args.trim();
+    // Parse optional -c N count prefix.
+    let (count, target_str) = if let Some(rest) = args.strip_prefix("-c ") {
+        let rest = rest.trim_start();
+        match rest.find(char::is_whitespace) {
+            Some(i) => {
+                let n = rest[..i].parse::<usize>().unwrap_or(4).max(1).min(100);
+                (n, rest[i..].trim())
+            }
+            None => (4, rest),
+        }
+    } else {
+        (4, args)
+    };
+    if target_str.is_empty() {
+        serial::write_line("ping: usage: ping [-c count] <host|ip>");
         return;
+    }
+    // Resolve target: IP literal first, then DNS.
+    let target = match parse_ipv4(target_str) {
+        Some(ip) => ip,
+        None => match with_net_mut(|s| s.dns_resolve_ipv4(target_str)) {
+            Ok(ip) => ip,
+            Err(_) => {
+                serial::write_fmt(format_args!(
+                    "ping: {}: name or service not known\n",
+                    target_str
+                ));
+                return;
+            }
+        },
     };
     serial::write_fmt(format_args!(
-        "PING {}.{}.{}.{}: 56 data bytes\n",
-        target[0], target[1], target[2], target[3]
+        "PING {} ({}.{}.{}.{}): 56 data bytes\n",
+        target_str, target[0], target[1], target[2], target[3]
     ));
-    match with_net_mut(|state| state.send_ping(target)) {
-        Ok(rtt_ticks) => {
-            let ms = rtt_ticks.saturating_mul(10);
-            serial::write_fmt(format_args!(
-                "64 bytes from {}.{}.{}.{}: icmp_seq=1 ttl=64 time={} ms\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\n",
-                target[0],
-                target[1],
-                target[2],
-                target[3],
-                ms,
-                target[0],
-                target[1],
-                target[2],
-                target[3]
-            ));
-        }
-        Err(NetError::ArpTimeout) | Err(NetError::IoTimeout) => {
-            serial::write_fmt(format_args!(
-                "Request timeout for icmp_seq 1\n\n--- {}.{}.{}.{} ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss\n",
-                target[0], target[1], target[2], target[3]
-            ));
-        }
-        Err(err) => {
-            serial::write_fmt(format_args!("ping: error: {}\n", err.as_str()));
+    let mut transmitted = 0u32;
+    let mut received = 0u32;
+    for seq in 1..=(count as u32) {
+        transmitted += 1;
+        match with_net_mut(|state| state.send_ping(target)) {
+            Ok(rtt_ticks) => {
+                received += 1;
+                let ms = rtt_ticks.saturating_mul(10);
+                if ms == 0 {
+                    serial::write_fmt(format_args!(
+                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time=<10 ms\n",
+                        target[0], target[1], target[2], target[3], seq
+                    ));
+                } else {
+                    serial::write_fmt(format_args!(
+                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time={} ms\n",
+                        target[0], target[1], target[2], target[3], seq, ms
+                    ));
+                }
+            }
+            Err(NetError::ArpTimeout) | Err(NetError::IoTimeout) => {
+                serial::write_fmt(format_args!("Request timeout for icmp_seq {}\n", seq));
+            }
+            Err(err) => {
+                serial::write_fmt(format_args!("ping: error: {}\n", err.as_str()));
+                break;
+            }
         }
     }
-}
-
-/// `traceroute <ip>`: send ICMP probes with incrementing TTL, print hop table.
-pub fn traceroute_to_serial(ip_text: &str) {
-    let Some(target) = parse_ipv4(ip_text) else {
-        serial::write_line("traceroute: invalid ip (usage: traceroute <a.b.c.d>)");
-        return;
+    let loss = if transmitted > 0 {
+        (transmitted - received) * 100 / transmitted
+    } else {
+        100
     };
     serial::write_fmt(format_args!(
-        "traceroute to {}.{}.{}.{}, 30 hops max, 32 byte packets\n",
-        target[0], target[1], target[2], target[3]
+        "\n--- {} ping statistics ---\n{} packets transmitted, {} received, {}% packet loss\n",
+        target_str, transmitted, received, loss
+    ));
+}
+
+/// `traceroute <host|ip>`: send ICMP probes with incrementing TTL, print hop table.
+pub fn traceroute_to_serial(target_str: &str) {
+    // Resolve target: IP literal first, then DNS.
+    let target = match parse_ipv4(target_str) {
+        Some(ip) => ip,
+        None => match with_net_mut(|s| s.dns_resolve_ipv4(target_str)) {
+            Ok(ip) => ip,
+            Err(_) => {
+                serial::write_fmt(format_args!(
+                    "traceroute: {}: name or service not known\n",
+                    target_str
+                ));
+                return;
+            }
+        },
+    };
+    serial::write_fmt(format_args!(
+        "traceroute to {} ({}.{}.{}.{}), 30 hops max, 32 byte packets\n",
+        target_str, target[0], target[1], target[2], target[3]
     ));
     // Use a fixed ident derived from target to avoid collisions with pings.
     let ident: u16 = 0xAA00u16
@@ -3069,20 +3127,34 @@ pub fn traceroute_to_serial(ip_text: &str) {
         s.next_ping_seq = s.next_ping_seq.wrapping_add(30);
         seq
     });
+    let mut consecutive_timeouts = 0u8;
     for ttl in 1u8..=30 {
         let seq = base_seq.wrapping_add(ttl as u16 - 1);
         match with_net_mut(|state| state.send_traceroute_probe(target, ttl, ident, seq)) {
             Ok(hop) if hop.ip != [0; 4] => {
-                serial::write_fmt(format_args!(
-                    "{:2}  {}.{}.{}.{}  {} ms\n",
-                    ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], hop.ms
-                ));
+                consecutive_timeouts = 0;
+                if hop.ms == 0 {
+                    serial::write_fmt(format_args!(
+                        "{:2}  {}.{}.{}.{}  <10 ms\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3]
+                    ));
+                } else {
+                    serial::write_fmt(format_args!(
+                        "{:2}  {}.{}.{}.{}  {} ms\n",
+                        ttl, hop.ip[0], hop.ip[1], hop.ip[2], hop.ip[3], hop.ms
+                    ));
+                }
                 if hop.reached {
                     break;
                 }
             }
             _ => {
+                consecutive_timeouts += 1;
                 serial::write_fmt(format_args!("{:2}  * * *\n", ttl));
+                if consecutive_timeouts >= 3 {
+                    serial::write_line("traceroute: too many consecutive timeouts, stopping");
+                    break;
+                }
             }
         }
     }

@@ -49,6 +49,7 @@ static EVENT_QUEUE_TAIL: AtomicUsize = AtomicUsize::new(0);
 static EVENT_QUEUE_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
 static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
@@ -61,6 +62,7 @@ pub fn init() {
     EVENT_QUEUE_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
 
     SHIFT_PRESSED.store(false, Ordering::Relaxed);
+    CTRL_PRESSED.store(false, Ordering::Relaxed);
     EXTENDED_PREFIX.store(false, Ordering::Relaxed);
 }
 
@@ -79,6 +81,11 @@ pub fn handle_scancode(scancode: u8) {
             SHIFT_PRESSED.store(pressed, Ordering::Relaxed);
             return;
         }
+        // Left Ctrl (0x1D); Right Ctrl is extended 0x1D — both handled here.
+        0x1D => {
+            CTRL_PRESSED.store(pressed, Ordering::Relaxed);
+            return;
+        }
         _ => {}
     }
 
@@ -94,8 +101,14 @@ pub fn handle_scancode(scancode: u8) {
     }
 
     let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
+    let ctrl = CTRL_PRESSED.load(Ordering::Relaxed);
     if let Some(ascii) = map_set1_scancode(code, shift) {
-        push_byte(ascii);
+        if ctrl && ascii.is_ascii_alphabetic() {
+            // Generate control character: Ctrl+A=0x01, Ctrl+C=0x03, etc.
+            push_byte(ascii.to_ascii_uppercase() & 0x1f);
+        } else {
+            push_byte(ascii);
+        }
     }
 }
 

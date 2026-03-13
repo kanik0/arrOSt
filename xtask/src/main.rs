@@ -4178,15 +4178,9 @@ fn smoke_doom_impl(
             .context("failed to capture qemu stdin")?;
 
         let ready = snapshot_log(&log).contains("DoomGeneric: ready=true");
-        if force_fallback && ready {
-            bail!("expected DoomGeneric ready=false for fallback smoke");
-        }
-        if !force_fallback && !ready {
-            bail!(
-                "doomgeneric ready=false in smoke-doom; run `cargo xtask build` (or wait for fallback restore) and retry"
-            );
-        }
 
+        // aarch64 smoke-doom only validates boot/input/audio readiness (no doom play).
+        // DoomGeneric sources may not be vendored on aarch64 builds; skip ready check.
         if arch == RuntimeArch::Aarch64 {
             wait_for_log(
                 &log,
@@ -4203,6 +4197,15 @@ fn smoke_doom_impl(
             }
             println!("smoke-doom: aarch64 headless boot readiness validated");
             return Ok(());
+        }
+
+        if force_fallback && ready {
+            bail!("expected DoomGeneric ready=false for fallback smoke");
+        }
+        if !force_fallback && !ready {
+            bail!(
+                "doomgeneric ready=false in smoke-doom; run `cargo xtask build` (or wait for fallback restore) and retry"
+            );
         }
 
         send_serial_command(stdin, "doom play\n")?;

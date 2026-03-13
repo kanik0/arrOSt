@@ -565,6 +565,20 @@ fn process_byte(byte: u8) {
                 }
             }
         }
+        0x03 => {
+            // Ctrl+C: kill the foreground vfs child if one is running.
+            if let Some(pid) = shell.waiting_vfs_pid {
+                proc::kill_process(pid);
+                shell.waiting_vfs_pid = None;
+                serial::write_str("\n^C\n");
+                print_prompt();
+            } else if shell.len > 0 {
+                // Cancel the current input line.
+                shell.len = 0;
+                serial::write_str("\n^C\n");
+                print_prompt();
+            }
+        }
         0x20..=0x7e => {
             if shell.len < MAX_LINE_LEN.saturating_sub(1) {
                 history_cancel(&mut shell.history_nav);
@@ -938,19 +952,14 @@ fn run_command(shell: &mut ShellState) {
     }
 
     if input == "ping" || input == SERIAL_BIN_PING {
-        serial::write_line("usage: ping <a.b.c.d>");
+        serial::write_line("usage: ping [-c count] <host|ip>");
         return;
     }
-    if let Some(ip) = input
+    if let Some(args) = input
         .strip_prefix("ping ")
         .or_else(|| input.strip_prefix("/bin/ping "))
     {
-        let ip = ip.trim();
-        if ip.is_empty() {
-            serial::write_line("usage: ping <a.b.c.d>");
-            return;
-        }
-        net::ping_to_serial(ip);
+        net::ping_to_serial(args);
         return;
     }
 
