@@ -103,6 +103,8 @@ Pipe implementation: 8-slot global table, 4 KiB circular buffers, ref-counted en
 | 50 | `connect` | `(fd, addr, addrlen) -> 0 or -errno` | Connect to remote host (blocking) |
 | 51 | `send` | `(fd, buf, len, flags) -> bytes or -errno` | Send on connected socket |
 | 52 | `recv` | `(fd, buf, len, flags) -> bytes or -errno` | Receive from connected socket |
+| 53 | `ping` | `(ip_ptr, ip_len) -> rtt_ms or -errno` | ICMP echo request/reply |
+| 54 | `execve` | `(path_ptr, path_len) -> ! or -errno` | Replace process image with ELF at VFS path |
 
 ## File descriptor model
 
@@ -202,7 +204,7 @@ On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DP
 `x86_64` also traps CPL3 page faults back into the kernel runtime, marks the active ring-3 task faulted, and resumes scheduling instead of halting the kernel.
 On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to process-layer ring-3 syscall dispatch.
 On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, arguments in `x0..x5`, return value in `x0`.
-Filesystem-backed `/bin/*` launch does not change the ABI revision: it currently uses a kernel-mediated spawn-from-path flow over the existing ABI, with no new `exec`/`execve` syscall yet.
+`execve` (M22, SYS_EXECVE=54) is now implemented: user-space processes can replace their image via VFS path. Kernel-mediated spawn-from-path remains the active shell dispatch path.
 `fork` (M13), anonymous `mmap`, and `brk` are fully implemented: they are no longer stubs. `munmap`, `mprotect`, and file-backed `mmap` remain `ENOSYS` (tracked in M21).
 
 ## Userland shim

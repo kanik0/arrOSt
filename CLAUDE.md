@@ -42,6 +42,8 @@ cargo xtask smoke-proc-caps --arch x86_64
 cargo xtask smoke-proc-spawn --arch x86_64
 cargo xtask smoke-fork --arch x86_64      # Fork/CoW smoke
 cargo xtask smoke-fork --arch aarch64
+cargo xtask smoke-execve --arch x86_64    # execve smoke
+cargo xtask smoke-execve --arch aarch64
 ```
 
 ### Environment Variables
@@ -180,7 +182,8 @@ Three scheduler tables coexist:
   - signal stubs (ENOSYS): sigaction(39) sigreturn(40)
   - memory stubs (ENOSYS): mmap(41) munmap(42) mprotect(43) brk(44)
   - ipc: pipe(45) pipe2(46)
-  - networking: socket(6) sendto(7) recvfrom(8) bind(47) listen(48) accept(49) connect(50) send(51) recv(52)
+  - networking: socket(6) sendto(7) recvfrom(8) bind(47) listen(48) accept(49) connect(50) send(51) recv(52) ping(53)
+  - process image: execve(54)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -252,6 +255,7 @@ Three scheduler tables coexist:
 | M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
 | M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
 | M19 | TCP/IP + utilities | Ethernet/ARP/IPv4/ICMP/UDP/TCP stack; `ping` (-c, RTT, hostname), `traceroute`, `host`, `dig`, `curl`; Ctrl+C; high-res RDTSC/CNTVCT RTT |
+| M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path; `smoke-execve` harness |
 
 ### In progress
 *(none)*
@@ -261,7 +265,6 @@ Three scheduler tables coexist:
 |---|-----------|------|
 | M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
 | M21 | Full mmap / VMA | Add `munmap`/`mprotect`, file-backed mappings, VMA shrink, `/proc/<pid>/maps` |
-| M22 | execve syscall | True `execve` exposing VFS ELF loading to user-space |
 | M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
 | M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
 | M25 | ANSI terminal | VT100 escape sequences, 16-color palette, cursor control |

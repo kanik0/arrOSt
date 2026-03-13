@@ -76,6 +76,7 @@ pub mod syscall {
     pub const SYS_SEND: u64 = 51;
     pub const SYS_RECV: u64 = 52;
     pub const SYS_PING: u64 = 53;
+    pub const SYS_EXECVE: u64 = 54;
 
     pub mod app {
         pub const INIT: u64 = 1;
@@ -284,6 +285,7 @@ pub mod syscall {
             SYS_SEND => "send",
             SYS_RECV => "recv",
             SYS_PING => "ping",
+            SYS_EXECVE => "execve",
             SYS_MKDIR => "mkdir",
             SYS_RMDIR => "rmdir",
             SYS_UNLINK => "unlink",
@@ -455,10 +457,10 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXIT, SYS_FORK, SYS_FREAD,
-        SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPPID, SYS_GETUID,
-        SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK,
-        SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK, SYS_UNLINK, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_FORK,
+        SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPPID,
+        SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2,
+        SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK, SYS_UNLINK, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -883,6 +885,13 @@ pub mod runtime {
     /// Fork the current process. Returns child PID to parent, 0 to child, or negative errno.
     pub fn fork() -> isize {
         syscall0(SYS_FORK)
+    }
+
+    /// Replace the current process image with the executable at `path`.
+    /// On success this call does not return; the process restarts from the new ELF entry point.
+    /// Returns a negative errno on failure.
+    pub fn execve(path: &str) -> isize {
+        syscall2(SYS_EXECVE, path.as_ptr() as u64, path.len() as u64)
     }
 
     /// Map anonymous memory. Only MAP_ANONYMOUS|MAP_PRIVATE is supported.

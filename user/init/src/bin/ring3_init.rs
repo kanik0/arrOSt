@@ -2,7 +2,9 @@
 #![no_main]
 
 #[cfg(target_arch = "x86_64")]
-use arrostd::syscall::{SYS_EXIT, SYS_FORK, SYS_GETPID, SYS_SLEEP, SYS_TIME_MS, SYS_YIELD};
+use arrostd::syscall::{
+    SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_GETPID, SYS_SLEEP, SYS_TIME_MS, SYS_YIELD,
+};
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
@@ -28,11 +30,19 @@ _start:
     svc #0
     mov x8, #23       // SYS_FORK — smoke fork test; kernel logs "fork: parent=X child=Y"
     svc #0
+    // Smoke test for M22 execve: replace process image with /bin/ls.
+    // Kernel logs "execve: pid=X path=/bin/ls" on success.
+    adr x0, .Lexecve_path  // path pointer
+    mov x1, #7             // path length: len("/bin/ls") = 7
+    mov x8, #54            // SYS_EXECVE
+    svc #0
     mov x8, #3        // SYS_EXIT
     mov x0, #7
     svc #0
-1:
-    b 1b
+.Lspin:
+    b .Lspin
+.Lexecve_path:
+    .ascii "/bin/ls"
 "#
 );
 
@@ -45,6 +55,14 @@ pub extern "C" fn _start() -> ! {
     let _ = syscall1(SYS_SLEEP, 1);
     // Smoke test for M13 fork: kernel logs "fork: parent=X child=Y" on success.
     let _ = syscall0(SYS_FORK);
+    // Smoke test for M22 execve: replace process image with /bin/ls.
+    // Kernel logs "execve: pid=X path=/bin/ls" on success.
+    const EXECVE_PATH: &str = "/bin/ls";
+    let _ = syscall2(
+        SYS_EXECVE,
+        EXECVE_PATH.as_ptr() as u64,
+        EXECVE_PATH.len() as u64,
+    );
     let _ = syscall1(SYS_EXIT, 7);
     loop {
         core::hint::spin_loop();
@@ -76,6 +94,24 @@ fn syscall1(number: u64, arg0: u64) -> isize {
             "int 0x80",
             inlateout("rax") result,
             in("rdi") arg0,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    result as isize
+}
+
+#[cfg(target_arch = "x86_64")]
+fn syscall2(number: u64, arg0: u64, arg1: u64) -> isize {
+    let mut result = number;
+    // SAFETY: runs in ring-3 test binary and follows kernel int80 ABI (a0:rdi, a1:rsi, rc:rax).
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") arg0,
+            in("rsi") arg1,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack)
