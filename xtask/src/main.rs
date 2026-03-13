@@ -4427,7 +4427,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom mouse y on",
+            "doom: mouse y mapping enabled",
             Duration::from_secs(4),
             "doom mouse y on prompt",
         )?;
@@ -4441,7 +4441,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom mouse turn 5",
+            "doom: mouse turn threshold set to 5",
             Duration::from_secs(4),
             "doom mouse turn prompt",
         )?;
@@ -4455,7 +4455,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom mouse move 7",
+            "doom: mouse move threshold set to 7",
             Duration::from_secs(4),
             "doom mouse move prompt",
         )?;
@@ -4490,7 +4490,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom key left",
+            "doom: injected key 0x61",
             Duration::from_secs(4),
             "doom key prompt",
         )?;
@@ -4504,7 +4504,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom keyup left",
+            "doom: injected keyup 0x61",
             Duration::from_secs(4),
             "doom keyup prompt",
         )?;
@@ -4518,7 +4518,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom key fire",
+            "doom: injected key 0x20",
             Duration::from_secs(4),
             "doom fire prompt",
         )?;
@@ -4533,7 +4533,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom keyup fire",
+            "doom: injected keyup 0x20",
             Duration::from_secs(4),
             "doom fire keyup prompt",
         )?;
@@ -4547,7 +4547,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom key enter",
+            "doom: injected key 0x0a",
             Duration::from_secs(4),
             "doom enter prompt",
         )?;
@@ -4561,7 +4561,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom keyup enter",
+            "doom: injected keyup 0x0a",
             Duration::from_secs(4),
             "doom enter keyup prompt",
         )?;
@@ -4680,7 +4680,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom key right",
+            "doom: injected key 0x64",
             Duration::from_secs(4),
             "doom right prompt",
         )?;
@@ -4693,7 +4693,7 @@ fn smoke_doom_impl(
         )?;
         wait_for_prompt_settle_after(
             &log,
-            "doom keyup right",
+            "doom: injected keyup 0x64",
             Duration::from_secs(4),
             "doom right keyup prompt",
         )?;
