@@ -1547,7 +1547,74 @@ fn build_doom_c_backend_artifact(target: &str) -> Result<DoomCBackendArtifact> {
     }
 }
 
+/// Resolve the main worktree root from a git worktree `.git` file.
+/// Returns `None` if CWD is not in a worktree or the path cannot be parsed.
+fn find_main_worktree_root() -> Option<PathBuf> {
+    let git_path = PathBuf::from(".git");
+    // In a worktree, `.git` is a file; in the main repo, it is a directory.
+    if !git_path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&git_path).ok()?;
+    // Format: "gitdir: /abs/path/to/main/.git/worktrees/<name>"
+    let gitdir = content
+        .lines()
+        .next()?
+        .strip_prefix("gitdir:")?
+        .trim()
+        .to_string();
+    let gitdir_path = PathBuf::from(&gitdir);
+    // Walk up: strip `.git/worktrees/<name>` to reach the main repo root.
+    // That is three components from the end.
+    let main_git = gitdir_path.parent()?.parent()?; // strips worktrees/<name>
+    let main_root = main_git.parent()?; // strips .git
+    if main_root.is_dir() {
+        Some(main_root.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// If the local doomgeneric tree is empty (worktree, no submodule init),
+/// try to create a symlink pointing at the main repo's vendored copy so
+/// every worktree gets Doom for free without re-cloning.
+fn ensure_doomgeneric_available() {
+    let local = PathBuf::from(DOOM_GENERIC_ROOT);
+    let sentinel = local.join("doomgeneric/doomgeneric.c");
+    if sentinel.exists() {
+        return; // already present
+    }
+    let Some(main_root) = find_main_worktree_root() else {
+        return; // not in a worktree or can't resolve
+    };
+    let main_doomgeneric = main_root.join(DOOM_GENERIC_ROOT);
+    if !main_doomgeneric.join("doomgeneric/doomgeneric.c").exists() {
+        return; // main repo also missing — nothing we can do
+    }
+    // Remove the empty stub directory left by git, then symlink.
+    if local.exists() && std::fs::remove_dir(&local).is_err() {
+        eprintln!("warning: could not remove empty doomgeneric stub dir");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::os::unix::fs::symlink(&main_doomgeneric, &local) {
+            eprintln!(
+                "warning: could not symlink doomgeneric from main repo: {e}\n  src={}\n  dst={}",
+                main_doomgeneric.display(),
+                local.display()
+            );
+        } else {
+            println!(
+                "info: doomgeneric symlinked from main repo ({})",
+                main_doomgeneric.display()
+            );
+        }
+    }
+}
+
 fn build_doom_generic_artifact(target: &str) -> Result<DoomGenericArtifact> {
+    ensure_doomgeneric_available();
     let root = PathBuf::from(DOOM_GENERIC_ROOT);
     let core_source = PathBuf::from(DOOM_GENERIC_CORE_SOURCE);
     let include_dir = PathBuf::from(DOOM_GENERIC_INCLUDE_DIR);
