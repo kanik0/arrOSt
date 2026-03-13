@@ -70,7 +70,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 
 - Ring-3 address-space roots currently clone the active kernel root table and map a fixed trampoline user page; syscall/fault/sync transitions consume trampoline entry/exit paths with KPTI scratch-assisted CR3/TTBR switching while full kernel-mapping trimming remains deferred.
 - `fork` + CoW + demand paging are implemented (M13); swap to virtio-blk is not.
-- No `execve` syscall yet: `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
+- `execve` (SYS_EXECVE=54, M22) is implemented: ring-3 processes can replace their image in-place via VFS path. Shell `/bin/*` dispatch still uses kernel-mediated spawn-from-path; `ring3 run <init|doom>` remains an embedded smoke/debug path.
 - Timer-driven hard preemption (M14 complete): PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) preempt ring-3 processes at any instruction boundary with full GPR save/restore. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`). Syscall-timeslice preemption also remains active.
 - Capability masks remain policy checks layered on top of hardware user/kernel separation.
 - External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.

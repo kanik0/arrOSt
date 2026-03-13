@@ -67,9 +67,9 @@ The same registry IDs are used by cooperative `spawn` and ring-3 `ring3 run`.
 ## Current limits
 
 - Ring-3 address-space roots currently clone the active kernel root table and map a fixed trampoline user page as KPTI groundwork; trimming kernel mappings remains deferred until the kernel no longer executes from low virtual addresses during CR3/TTBR switches.
-- There is no `execve` syscall yet; `/bin/*` uses a kernel-mediated spawn-from-path flow, while `ring3 run <init|doom>` still uses embedded smoke/debug artifacts.
+- `execve` (SYS_EXECVE=54, M22) is implemented: ring-3 processes can replace their image via VFS path. Shell `/bin/*` dispatch still uses kernel-mediated spawn-from-path; `ring3 run <init|doom>` remains as embedded smoke/debug path.
 - Timer-driven hard preemption is implemented (M14 complete): PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) preempt ring-3 at any instruction boundary. Quantum = 10 ticks.
-- Syscall surface: 52 syscalls at ABI revision 5 (lifecycle, filesystem, directory/path, process identity, pipe IPC, BSD sockets, plus signal/memory stubs).
+- Syscall surface: 54 syscalls at ABI revision 5 (lifecycle, filesystem, directory/path, process identity, pipe IPC, BSD sockets, execve, plus signal/memory stubs).
 
 ## Relevant files
 

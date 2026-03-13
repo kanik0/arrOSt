@@ -16,13 +16,14 @@ use arrostd::syscall::{
     FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, O_ACCMODE, O_CREAT,
     O_RDONLY, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SEEK_CUR, SEEK_END, SEEK_SET,
     SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET,
-    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT,
-    SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID, SYS_GETPPID, SYS_GETUID,
-    SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN,
-    SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM, SYS_RENAME,
-    SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
-    SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
-    TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
+    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK,
+    SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
+    SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
+    SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV,
+    SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK,
+    SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app,
+    caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -1832,6 +1833,16 @@ impl Scheduler {
             }
             // M13: fork
             SYS_FORK => self.syscall_fork_ring3(),
+            // M22: execve — replace current process image with executable at path
+            SYS_EXECVE => {
+                // arg0 = path_ptr, arg1 = path_len
+                let rc = self.syscall_execve_ring3(arg0, arg1);
+                if rc == 0 {
+                    // Success: do not return to user callsite; restart from new ELF entry.
+                    action = Ring3SyscallAction::ReturnKernel;
+                }
+                rc
+            }
             // M15 Phase A4: pipe IPC
             SYS_PIPE => {
                 self.stats.pipe = self.stats.pipe.saturating_add(1);
@@ -2019,6 +2030,132 @@ impl Scheduler {
             self.ring3_context.process.pid, child_pid
         ));
         child_pid as isize
+    }
+
+    /// SYS_EXECVE: replace the current process image with the ELF at `path`.
+    ///
+    /// On success updates `ring3_context.process` and `ring3_tasks[slot].image_ptr` in-place,
+    /// then returns 0.  The caller sets `action = ReturnKernel` so the scheduler loop relaunches
+    /// the task from the new ELF entry point.  Returns negative errno on failure.
+    fn syscall_execve_ring3(&mut self, path_ptr: u64, path_len: u64) -> isize {
+        let Some(slot) = self.ring3_active_slot else {
+            return errno::EPERM;
+        };
+
+        // Validate arguments.
+        if path_ptr == 0 || path_len == 0 {
+            return errno::EINVAL;
+        }
+        let path_len = path_len as usize;
+        if path_len > MAX_OPEN_PATH_BYTES {
+            return errno::EINVAL;
+        }
+
+        // Copy path from user memory into a kernel buffer.
+        let mut path_buf = [0u8; MAX_OPEN_PATH_BYTES];
+        let process = self.ring3_context.process;
+        if process.user_range_count == 0 {
+            // SAFETY: policy smoke path uses kernel-space pointers directly.
+            let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+            path_buf[..path_len].copy_from_slice(bytes);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            path_ptr,
+            &mut path_buf[..path_len],
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+        let ctx = process;
+        let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+            Ok(s) => s,
+            Err(_) => return errno::EINVAL,
+        };
+
+        // Stat the target file: must be a regular executable.
+        let stat = match with_fs_identity_override(FsIdentity::user(), || {
+            fs::stat_path(path_str, Some(ctx.pid))
+        }) {
+            Ok(s) => s,
+            Err(e) => return map_fs_error(e),
+        };
+        if stat.file_type != fs::FileType::Regular {
+            serial::write_fmt(format_args!(
+                "execve: pid={} path={} not a regular file\n",
+                ctx.pid, path_str
+            ));
+            return errno::ENOEXEC;
+        }
+        if (stat.mode & 0o111) == 0 {
+            serial::write_fmt(format_args!(
+                "execve: pid={} path={} missing execute bit mode={:#o}\n",
+                ctx.pid, path_str, stat.mode
+            ));
+            return errno::EPERM;
+        }
+
+        // Read ELF bytes from the VFS.
+        let file_size = match usize::try_from(stat.size) {
+            Ok(s) => s,
+            Err(_) => return errno::EINVAL,
+        };
+        let mut elf_bytes = Vec::<u8>::new();
+        if elf_bytes.try_reserve_exact(file_size).is_err() {
+            return errno::ENOMEM;
+        }
+        elf_bytes.resize(file_size, 0);
+        let read = match with_fs_identity_override(FsIdentity::user(), || {
+            fs::read_file_for_pid(path_str, elf_bytes.as_mut_slice(), Some(ctx.pid))
+        }) {
+            Ok(n) => n,
+            Err(e) => return map_fs_error(e),
+        };
+        elf_bytes.truncate(read);
+
+        // Load the new process image (allocates new page tables, stacks, etc.).
+        let new_image =
+            match ring3_groundwork::load_native_process_image_with_args(&elf_bytes, &[path_str]) {
+                Ok(img) => img,
+                Err(error) => {
+                    serial::write_fmt(format_args!(
+                        "execve: pid={} path={} ELF load failed: {}\n",
+                        ctx.pid, path_str, error
+                    ));
+                    return errno::ENOEXEC;
+                }
+            };
+
+        // Install the new image: drop the old one, store the new Box raw pointer.
+        let new_img_ptr = Box::into_raw(Box::new(new_image));
+        if let Some(ref mut task) = self.ring3_tasks[slot] {
+            let old_ptr = task.image_ptr;
+            task.image_ptr = new_img_ptr;
+            if !old_ptr.is_null() {
+                // SAFETY: old_ptr was allocated via Box::into_raw and is exclusively owned here;
+                // the kernel CR3 is active (KPTI ensures user pages are not mapped), so dropping
+                // the old address space is safe.
+                unsafe { drop(Box::from_raw(old_ptr)) };
+            }
+        } else {
+            // Task disappeared while we were loading — clean up the new image.
+            // SAFETY: freshly allocated above, never shared.
+            unsafe { drop(Box::from_raw(new_img_ptr)) };
+            return errno::ENODEV;
+        }
+
+        // Apply the new image to the active process context.
+        // SAFETY: new_img_ptr is valid and exclusively owned by the task we just updated.
+        let new_img_ref = unsafe { &*new_img_ptr };
+        self.ring3_context.process.apply_process_image(new_img_ref);
+        // Preserve identity (pid, name, caps) and fd table from the original process.
+        self.ring3_context.process.pid = ctx.pid;
+        self.ring3_context.process.name = ctx.name;
+        self.ring3_context.process.syscall_caps = ctx.syscall_caps;
+        self.ring3_context.process.fd_table = ctx.fd_table;
+
+        serial::write_fmt(format_args!("execve: pid={} path={}\n", ctx.pid, path_str));
+        0
     }
 
     /// Called by the arch page-fault handler for ring-3 CoW and demand-page faults.
@@ -5770,6 +5907,8 @@ fn syscall_required_caps(number: u64) -> u32 {
         SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => caps::CORE,
         // M15 Phase A4: pipe IPC
         SYS_PIPE | SYS_PIPE2 => caps::CORE,
+        // M22: execve
+        SYS_EXECVE => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
         // M15 Phase A2: process identity and control
         SYS_GETPPID | SYS_GETUID | SYS_GETGID | SYS_KILL | SYS_SIGACTION | SYS_SIGRETURN => {

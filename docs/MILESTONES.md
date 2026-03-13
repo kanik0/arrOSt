@@ -21,7 +21,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M19** | Production TCP/IP + Unix Utilities | **Complete** |
 | **M20** | Signal Infrastructure | Not started |
 | **M21** | Full mmap / VMA Layer | Not started |
-| **M22** | execve Syscall | Not started |
+| **M22** | execve Syscall | **Complete** |
 | **M23** | /dev Filesystem + Device Nodes | Not started |
 | **M24** | Shell Pipes + Process Groups | Not started |
 | **M25** | ANSI Terminal Emulation | Not started |
@@ -63,7 +63,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 - Cross-architecture ring-3 launch on x86_64 and aarch64.
 - `ring3 run <init|doom>` preserved as embedded smoke/debug path.
 
-**Not delivered** (tracked in M22): a true `execve` syscall exposing VFS-backed ELF loading to user-space processes.
+**Delivered in M22**: a true `execve` syscall (SYS_EXECVE=54) exposing VFS-backed ELF loading to user-space processes.
 
 ---
 
@@ -150,7 +150,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 **Deferred** (not meaningful in QEMU user-mode networking, tracked informally):
 - TCP retransmission queue with RTO and Karn's algorithm: QEMU's slirp stack provides reliable delivery; retransmission does not affect observable behavior in this environment.
-- User-space ring-3 ELF binaries for each utility: depends on M22 (`execve`); kernel-mediated dispatch remains the active path.
+- User-space ring-3 ELF binaries for each utility: `execve` (M22) is now available; switching shell dispatch to the user-space path is deferred.
 
 ### M13: fork + Copy-on-Write + Demand Paging
 
@@ -293,40 +293,30 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ### M22: execve Syscall
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: True `execve` syscall exposing VFS-backed ELF loading to user-space processes.
 
-**Dependencies**: M13 (VMA tracking), M21 (mmap for stack/heap setup).
+**Dependencies**: M13 (VMA tracking; M21 dependency bypassed — M13 VMA infrastructure is sufficient).
 
-#### Step 1: Add `SYS_EXECVE`
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`
+#### Delivered
 
-1. Add `pub const SYS_EXECVE: u64 = 54;`.
-2. Gate under `CAP_PROC`.
+- `SYS_EXECVE = 54` added to `crates/arrostd/src/lib.rs`; gated under `caps::CORE`.
+- `syscall_execve_ring3` in `kernel/src/proc/mod.rs`:
+  - Copies path from user memory via physical page-walk (`copy_from_user_bytes`).
+  - Stats the VFS target (must be regular file with execute bit set).
+  - Reads ELF bytes via `fs::read_file_for_pid` wrapped in `with_fs_identity_override` (avoids scheduler lock deadlock).
+  - Loads new process image with `ring3_groundwork::load_native_process_image_with_args`.
+  - Drops old `Box<Ring3ProcessImage>` (safe: kernel CR3 active via KPTI), installs new image pointer.
+  - Calls `apply_process_image` to replace all process state (page tables, trap frame, VMAs, brk).
+  - Preserves pid, name, capability mask, and fd table across exec.
+  - Returns 0; dispatcher sets `action = ReturnKernel` so the scheduler relaunches from the new ELF entry.
+- `arrostd::runtime::execve(path)` helper added.
+- `ring3_init` smoke test: calls `SYS_EXECVE("/bin/ls")` after fork; kernel logs `execve: pid=X path=...`.
+- `cargo xtask smoke-execve [--arch <x86_64|aarch64>]` smoke harness.
 
-#### Step 2: Implement `sys_execve`
-**Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/proc/ring3_groundwork.rs`
-
-1. `sys_execve(path_ptr, argv_ptr, envp_ptr) -> i64`:
-   - Copy `path` from user memory.
-   - Read ELF from VFS via `fs::read_file(path)`.
-   - Validate ELF magic, architecture, `PT_LOAD` segments.
-   - Tear down current process address space: unmap all user VMAs, free frames.
-   - Create fresh VMA entries for new ELF segments + stack.
-   - Set up user stack with `argc`, `argv[]`, `envp[]`, strings.
-   - Set process entry point to ELF `e_entry`.
-   - Return to user mode at new entry (this syscall does not return on success).
-2. On failure: return `-ENOENT` (not found), `-ENOEXEC` (bad ELF), `-ENOMEM`.
-
-#### Step 3: Shell integration
-**Files to modify**: `kernel/src/shell.rs`
-
-1. For `/bin/*` dispatch, optionally use the `execve` path instead of kernel-mediated spawn.
-2. Preserves backward compatibility: kernel-mediated spawn remains available for kernel tasks.
-
-#### Testing
-1. `smoke-execve`: ring-3 process calls `execve("/bin/ls", ...)`, verifies ls output.
-2. All existing `smoke-bin-exec` tests pass.
+#### Not delivered (deferred)
+- Shell integration: `/bin/*` dispatch still uses kernel-mediated spawn-from-path (requires further work to switch the shell over).
+- `envp` argument: only `argv[0]` (path) is passed; full environment vector deferred to M26.
 
 ---
 
