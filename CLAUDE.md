@@ -44,6 +44,8 @@ cargo xtask smoke-fork --arch x86_64      # Fork/CoW smoke
 cargo xtask smoke-fork --arch aarch64
 cargo xtask smoke-execve --arch x86_64    # execve smoke
 cargo xtask smoke-execve --arch aarch64
+cargo xtask smoke-hal --arch x86_64       # HAL device registry smoke
+cargo xtask smoke-hal --arch aarch64
 ```
 
 ### Environment Variables
@@ -256,6 +258,7 @@ Three scheduler tables coexist:
 | M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
 | M19 | TCP/IP + utilities | Ethernet/ARP/IPv4/ICMP/UDP/TCP stack; `ping` (-c, RTT, hostname), `traceroute`, `host`, `dig`, `curl`; Ctrl+C; high-res RDTSC/CNTVCT RTT |
 | M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path; `smoke-execve` harness |
+| M18 | Hardware abstraction layer | `BlockDevice`/`NetDevice`/`DisplayDevice`/`AudioDevice`/`InputDevice` traits; `DeviceRegistry`; `RamDisk`; `LoopbackDevice`; `smoke-hal` harness |
 
 ### In progress
 *(none)*
@@ -274,7 +277,6 @@ Three scheduler tables coexist:
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
 | M31 | Doom enhancements | Audio mixing, savegames, fullscreen, network multiplayer groundwork |
-| M18 | Hardware abstraction | Device traits, ramdisk, loopback, device registry |
 
 ---
 

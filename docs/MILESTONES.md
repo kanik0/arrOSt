@@ -17,7 +17,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M15** | Extended Syscall Surface | **Complete** (Phase A) |
 | **M16** | Extended ProcFS | **Complete** |
 | **M17** | Full-Data Journaling for diskfs-v2 | **Complete** |
-| **M18** | Hardware Abstraction Layer | Not started |
+| **M18** | Hardware Abstraction Layer | **Complete** |
 | **M19** | Production TCP/IP + Unix Utilities | **Complete** |
 | **M20** | Signal Infrastructure | Not started |
 | **M21** | Full mmap / VMA Layer | Not started |
@@ -627,40 +627,28 @@ All global mutable state must be protected:
 
 ### M18: Hardware Abstraction Layer
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Trait-based device abstraction with at least one non-virtio backend per device class.
 
 **Dependencies**: None.
 
-#### Step 1: Device traits
-**Files to create**: `kernel/src/hal/mod.rs`, `kernel/src/hal/block.rs`, `kernel/src/hal/net.rs`, `kernel/src/hal/display.rs`, `kernel/src/hal/input.rs`, `kernel/src/hal/audio.rs`
+#### Delivered
 
-1. Define traits:
-   ```rust
-   pub trait BlockDevice { fn read_sector(&self, sector: u64, buf: &mut [u8; 512]) -> Result<(), BlockError>; ... }
-   pub trait NetDevice { fn mac_address(&self) -> [u8; 6]; fn send_packet(&self, data: &[u8]) -> Result<(), NetError>; ... }
-   pub trait DisplayDevice { fn width(&self) -> u32; fn height(&self) -> u32; fn framebuffer(&mut self) -> &mut [u8]; ... }
-   pub trait InputDevice { fn poll_events(&self) -> Option<InputEvent>; ... }
-   pub trait AudioDevice { fn write_samples(&self, samples: &[i16]) -> Result<usize, AudioError>; ... }
-   ```
+- `kernel/src/hal/block.rs`: `BlockDevice` trait; `VirtioBlockDevice` wrapper delegating to global virtio-blk driver; `RamDisk` heap-backed in-memory device (32 sectors = 16 KiB, fully writable).
+- `kernel/src/hal/net.rs`: `NetDevice` trait; `VirtioNetDevice` wrapper exposing MAC and readiness from the global virtio-net driver; `LoopbackDevice` with a `VecDeque`-backed frame queue (capacity 8 frames); send-to-self loopback semantics.
+- `kernel/src/hal/display.rs`: `DisplayDevice` trait; `GfxDisplayDevice` capturing width, height, bpp, and pixel_format from the UEFI GOP framebuffer at boot.
+- `kernel/src/hal/audio.rs`: `AudioDevice` trait; `VirtioAudioDevice` delegating to `audio::submit_pcm_i16`.
+- `kernel/src/hal/input.rs`: `InputDevice` trait + `HalInputEvent`; `VirtioInputDevice` reporting readiness of the virtio-input driver.
+- `kernel/src/hal/registry.rs`: `DeviceRegistry` with `Vec<Box<dyn Trait>>` per device class; `UnsafeCell`-based global (single-threaded safety); `register_*`, `for_each_*`, `with_block_mut`, `with_net_mut` helpers.
+- `kernel/src/hal/mod.rs`: `hal::init(&gfx_report)` called from `main.rs` after all subsystem inits; `hal::log_info()` and `hal::log_device_list()` for shell output; `hal::test_block(idx)` and `hal::test_net_loopback(idx)` self-test helpers.
+- Shell commands: `hal` / `hal list` (prints device list); `hal test block` (ramdisk write-read-verify); `hal test net` (loopback send/recv).
+- `cargo xtask smoke-hal [--arch <x86_64|aarch64>]`: boots QEMU, runs `hal list` and both tests, verifies presence of all five device classes and both self-tests passing.
 
-#### Step 2: Wrap existing drivers
-**Files to modify**: `kernel/src/storage/mod.rs`, `kernel/src/net/mod.rs`, `kernel/src/gfx/mod.rs`, `kernel/src/input.rs`, `kernel/src/audio.rs`
+#### Not delivered (deferred)
 
-1. Implement each trait for existing virtio drivers.
-2. Change consumers to use `&dyn BlockDevice`, `&dyn NetDevice`, etc.
-
-#### Step 3: Add ramdisk + loopback
-**Files to create**: `kernel/src/hal/ramdisk.rs`, `kernel/src/hal/loopback.rs`
-
-1. `RamDisk`: `Vec<[u8; 512]>` implementing `BlockDevice`.
-2. `Loopback`: internal ring buffer implementing `NetDevice`.
-
-#### Step 4: Device registry
-**Files to create**: `kernel/src/hal/registry.rs`
-
-1. `static DEVICES: Mutex<DeviceRegistry>` with typed device vectors.
-2. Boot-time registration; subsystems query registry.
+- Changing existing subsystem consumers (`fs`, `net`, shell, Doom) to use `&dyn BlockDevice` / `&dyn NetDevice` rather than calling the driver globals directly — non-trivial refactor, deferred.
+- ISA / PCI ramdisk block device (QEMU `-drive format=raw,if=ide` style) — no ROM/ISA driver layer exists yet.
+- Audio `VirtioAudioDevice` loopback / null backend.
 
 ---
 

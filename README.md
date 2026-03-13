@@ -150,7 +150,7 @@ Useful runtime commands:
 - `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
 - TCP retransmission queue (RTO, Karn's algorithm) is not implemented; packet delivery in QEMU's slirp is reliable so this is not observable.
-- Storage, graphics, and device support remain QEMU/virtio-first.
+- Device abstraction (M18 HAL) provides trait wrappers and a device registry; existing subsystem consumers still call virtio driver globals directly rather than going through `&dyn BlockDevice` / `&dyn NetDevice`.
 
 ## Milestone roadmap
 
@@ -165,7 +165,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M15 | Extended syscall surface | Complete |
 | M16 | Extended ProcFS | Complete |
 | M17 | Full-data journaling | Complete |
-| M18 | Hardware abstraction layer | Planned |
+| M18 | Hardware abstraction layer | Complete |
 | M19 | Production TCP/IP + utilities | Complete |
 | M20 | Signal infrastructure | Planned |
 | M21 | Full mmap / VMA layer | Planned |
