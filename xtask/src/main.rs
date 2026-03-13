@@ -3004,7 +3004,17 @@ fn smoke_net_impl(arch: RuntimeArch) -> Result<()> {
         thread::sleep(Duration::from_millis(300));
         let ls_snapshot = snapshot_log(&log);
         let ls_lines = lines_after_matching_until_prompt(&ls_snapshot, "ls /bin");
-        for marker in ["netstat", "ifconfig", "arp", "ss", "nc", "ip"] {
+        for marker in [
+            "netstat",
+            "ifconfig",
+            "arp",
+            "ss",
+            "nc",
+            "ip",
+            "traceroute",
+            "host",
+            "dig",
+        ] {
             if !ls_lines.contains(&marker) {
                 bail!("missing `{marker}` in ls /bin output: {ls_lines:?}");
             }

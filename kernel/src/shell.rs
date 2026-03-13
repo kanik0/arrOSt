@@ -48,6 +48,9 @@ const SERIAL_BIN_SS: &str = "/bin/ss";
 const SERIAL_BIN_NC: &str = "/bin/nc";
 const SERIAL_BIN_IP: &str = "/bin/ip";
 const SERIAL_BIN_PING: &str = "/bin/ping";
+const SERIAL_BIN_TRACEROUTE: &str = "/bin/traceroute";
+const SERIAL_BIN_HOST: &str = "/bin/host";
+const SERIAL_BIN_DIG: &str = "/bin/dig";
 const VERSION_MAJOR: &str = match option_env!("ARROST_VERSION_MAJOR") {
     Some(value) => value,
     None => "0",
@@ -1006,6 +1009,47 @@ fn run_command(shell: &mut ShellState) {
         .or_else(|| input.strip_prefix("/bin/ip "))
     {
         net::ip_to_serial(rest.trim());
+        return;
+    }
+
+    if input == "traceroute" || input == SERIAL_BIN_TRACEROUTE {
+        serial::write_line("usage: traceroute <a.b.c.d>");
+        return;
+    }
+    if let Some(ip) = input
+        .strip_prefix("traceroute ")
+        .or_else(|| input.strip_prefix("/bin/traceroute "))
+    {
+        net::traceroute_to_serial(ip.trim());
+        return;
+    }
+
+    if input == "host" || input == SERIAL_BIN_HOST {
+        serial::write_line("usage: host <hostname>");
+        return;
+    }
+    if let Some(name) = input
+        .strip_prefix("host ")
+        .or_else(|| input.strip_prefix("/bin/host "))
+    {
+        net::host_to_serial(name.trim());
+        return;
+    }
+
+    if input == "dig" || input == SERIAL_BIN_DIG {
+        serial::write_line("usage: dig <hostname> [A]");
+        return;
+    }
+    if let Some(rest) = input
+        .strip_prefix("dig ")
+        .or_else(|| input.strip_prefix("/bin/dig "))
+    {
+        let rest = rest.trim();
+        let (name, qtype) = match rest.find(char::is_whitespace) {
+            Some(i) => (&rest[..i], rest[i..].trim()),
+            None => (rest, "A"),
+        };
+        net::dig_to_serial(name, qtype);
         return;
     }
 
