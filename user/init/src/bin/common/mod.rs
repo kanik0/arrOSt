@@ -8,6 +8,7 @@ static mut LINE_BUFFER: [u8; 256] = [0; 256];
 static mut PATH_BUFFER: [u8; arrostd::abi::USERLAND_PATH_MAX] =
     [0; arrostd::abi::USERLAND_PATH_MAX];
 
+#[allow(dead_code)]
 pub fn args(argc: usize, argv: *const *const u8) -> runtime::Args {
     // SAFETY: `_start` forwards the kernel-provided stack ABI unchanged.
     unsafe { runtime::Args::from_raw(argc, argv) }
@@ -60,6 +61,7 @@ pub fn write_errno_line(prefix: &str, target: &str, rc: isize) {
     let _ = runtime::write_stdout(&buffer[..used]);
 }
 
+#[allow(dead_code)]
 pub fn write_usage(command: &str, usage: &str) -> i32 {
     write_text(command);
     write_text(": ");

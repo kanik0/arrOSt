@@ -30,6 +30,10 @@ pub(crate) enum FdTarget {
     File(OpenFile),
     /// TCP socket; the u8 is an index into the kernel-global TcpTable.
     TcpSocket(u8),
+    /// Unbound SOCK_STREAM socket before bind/connect.
+    TcpUnbound,
+    /// Listening TCP socket; u8 is index into kernel tcp_listeners array.
+    TcpListener(u8),
     /// Read end of a kernel pipe; the u8 is the index in PIPE_TABLE.
     PipeRead(u8),
     /// Write end of a kernel pipe; the u8 is the index in PIPE_TABLE.
@@ -137,6 +141,45 @@ impl FdTable {
         self.descriptions[desc_index] = FdSlot::new(FdTarget::TcpSocket(conn_idx), O_RDWR, 1);
         self.fd_slots[fd_index] = Some(desc_index as u8);
         Ok(fd_index as u32)
+    }
+
+    pub fn open_tcp_unbound(&mut self) -> Result<u32, FdError> {
+        let fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
+        let Some(desc_index) = self.alloc_description_slot() else {
+            self.fd_slots[fd_index] = None;
+            return Err(FdError::TooManyFiles);
+        };
+        self.descriptions[desc_index] = FdSlot::new(FdTarget::TcpUnbound, O_RDWR, 1);
+        self.fd_slots[fd_index] = Some(desc_index as u8);
+        Ok(fd_index as u32)
+    }
+
+    #[allow(dead_code)]
+    pub fn open_tcp_listener(&mut self, listener_idx: u8) -> Result<u32, FdError> {
+        let fd_index = self.alloc_fd_slot().ok_or(FdError::TooManyFiles)?;
+        let Some(desc_index) = self.alloc_description_slot() else {
+            self.fd_slots[fd_index] = None;
+            return Err(FdError::TooManyFiles);
+        };
+        self.descriptions[desc_index] = FdSlot::new(FdTarget::TcpListener(listener_idx), O_RDWR, 1);
+        self.fd_slots[fd_index] = Some(desc_index as u8);
+        Ok(fd_index as u32)
+    }
+
+    pub fn upgrade_unbound_to_listener(
+        &mut self,
+        fd: u32,
+        listener_idx: u8,
+    ) -> Result<(), FdError> {
+        let desc_index = Self::desc_index(&self.fd_slots, fd)?;
+        if !self.descriptions[desc_index].used {
+            return Err(FdError::BadFd);
+        }
+        if !matches!(self.descriptions[desc_index].target, FdTarget::TcpUnbound) {
+            return Err(FdError::BadFd);
+        }
+        self.descriptions[desc_index].target = FdTarget::TcpListener(listener_idx);
+        Ok(())
     }
 
     /// Open both ends of a pipe.  Returns `(read_fd, write_fd)` or `TooManyFiles`.
@@ -253,6 +296,8 @@ impl FdTable {
         match slot.target {
             FdTarget::PipeRead(idx) => pipe::close_pipe_read(idx),
             FdTarget::PipeWrite(idx) => pipe::close_pipe_write(idx),
+            FdTarget::TcpUnbound => { /* nothing to clean up */ }
+            FdTarget::TcpListener(idx) => super::net_tcp_listener_close(idx),
             _ => {}
         }
         *slot = FdSlot::empty();

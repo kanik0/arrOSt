@@ -10,6 +10,9 @@ fn main() {
     emit_user_linker_script("ss");
     emit_user_linker_script("ifconfig");
     emit_user_linker_script("nc");
+    emit_user_linker_script("route");
+    emit_user_linker_script("ip");
+    emit_user_linker_script("ping");
 }
 
 fn emit_user_linker_script(bin_name: &str) {

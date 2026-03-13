@@ -66,6 +66,15 @@ const USER_BIN_IFCONFIG_ELF_HINT_ENV: &str = "ARROST_USER_BIN_IFCONFIG_ELF_HINT"
 const USER_BIN_IFCONFIG_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_IFCONFIG_ELF_PRESENT";
 const USER_BIN_NC_ELF_HINT_ENV: &str = "ARROST_USER_BIN_NC_ELF_HINT";
 const USER_BIN_NC_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_NC_ELF_PRESENT";
+const USER_BIN_ROUTE: &str = "route";
+const USER_BIN_IP: &str = "ip";
+const USER_BIN_PING: &str = "ping";
+const USER_BIN_ROUTE_ELF_HINT_ENV: &str = "ARROST_USER_BIN_ROUTE_ELF_HINT";
+const USER_BIN_ROUTE_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_ROUTE_ELF_PRESENT";
+const USER_BIN_IP_ELF_HINT_ENV: &str = "ARROST_USER_BIN_IP_ELF_HINT";
+const USER_BIN_IP_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_IP_ELF_PRESENT";
+const USER_BIN_PING_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PING_ELF_HINT";
+const USER_BIN_PING_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PING_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
 const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]>";
@@ -426,6 +435,30 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
+    let user_bin_route = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_ROUTE,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_ip = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_IP,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
+    let user_bin_ping = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_PING,
+        KERNEL_TARGET,
+        &build_count_env,
+        &major_env,
+        &minor_env,
+    )?;
     let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET)?;
     let doom_generic = build_doom_generic_artifact(KERNEL_TARGET)?;
     println!(
@@ -582,6 +615,42 @@ fn build_impl(
         .env(
             USER_BIN_NC_ELF_PRESENT_ENV,
             if user_bin_nc.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_ROUTE_ELF_HINT_ENV,
+            user_bin_route.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_ROUTE_ELF_PRESENT_ENV,
+            if user_bin_route.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_IP_ELF_HINT_ENV,
+            user_bin_ip.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_IP_ELF_PRESENT_ENV,
+            if user_bin_ip.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_PING_ELF_HINT_ENV,
+            user_bin_ping.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_PING_ELF_PRESENT_ENV,
+            if user_bin_ping.size > 0 {
                 "true"
             } else {
                 "false"
@@ -832,6 +901,30 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
+    let user_bin_route = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_ROUTE,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_ip = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_IP,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
+    let user_bin_ping = build_userland_fs_binary(
+        USER_INIT_PACKAGE,
+        USER_BIN_PING,
+        KERNEL_TARGET_AARCH64,
+        version.build_count,
+        version.major,
+        version.minor,
+    )?;
     let doom_c_backend = build_doom_c_backend_artifact(KERNEL_TARGET_AARCH64)?;
     let doom_generic = build_doom_generic_artifact(KERNEL_TARGET_AARCH64)?;
     println!(
@@ -987,6 +1080,42 @@ fn build_secondary_target(
         .env(
             USER_BIN_NC_ELF_PRESENT_ENV,
             if user_bin_nc.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_ROUTE_ELF_HINT_ENV,
+            user_bin_route.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_ROUTE_ELF_PRESENT_ENV,
+            if user_bin_route.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_IP_ELF_HINT_ENV,
+            user_bin_ip.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_IP_ELF_PRESENT_ENV,
+            if user_bin_ip.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
+            USER_BIN_PING_ELF_HINT_ENV,
+            user_bin_ping.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_PING_ELF_PRESENT_ENV,
+            if user_bin_ping.size > 0 {
                 "true"
             } else {
                 "false"

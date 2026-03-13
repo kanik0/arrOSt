@@ -289,19 +289,25 @@ Three scheduler tables coexist:
 **Status**: In Progress
 **Limitation**: "Networking is sufficient for current tooling and smoke coverage, not a full production TCP/IP stack."
 **Delivered**:
-- TCP state machine (SYN_SENT → ESTABLISHED → FIN_WAIT_1/CLOSE_WAIT → CLOSING/LAST_ACK)
-- BSD socket syscalls: socket/connect/send/recv (TCP), sendto/recvfrom (UDP), bind/listen/accept (stubs)
+- TCP state machine: SYN_SENT → ESTABLISHED → FIN_WAIT_1 → **FIN_WAIT_2** → **TIME_WAIT** (2*MSL timer, ~4 s) → CLOSED; CLOSE_WAIT → LAST_ACK; simultaneous-close path via CLOSING → TIME_WAIT
+- **TCP congestion control**: slow-start (`cwnd < ssthresh` → `cwnd += MSS`/ACK) + congestion-avoidance (`cwnd += MSS²/cwnd`/ACK); `sent_una` tracks unacknowledged data; `tcp_send_data` gated by cwnd
+- BSD socket syscalls: socket/connect/send/recv (TCP), sendto/recvfrom (UDP); **bind/listen/accept fully implemented** (kernel + ring-3 dispatch); `FdTarget::TcpUnbound` → `TcpListener` → `TcpSocket` fd lifecycle
 - ABI revision 5 with `TcpConnectReq` / `TcpSendReq` / `TcpRecvReq` kernel structures
-- `arrostd::runtime` TCP shims: `tcp_connect()`, `tcp_send()`, `tcp_recv()`
+- `arrostd::runtime` shims: `tcp_connect()`, `tcp_send()`, `tcp_recv()`, `ping()`, **`socket()`, `bind_tcp()`, `listen()`, `accept()`**
+- **SYS_PING (53)**: kernel ICMP echo syscall; `arrostd::runtime::ping(ip)` ring-3 shim
+- **`/proc/net/route`**: synthetic Linux-format routing table (gateway + connected route + loopback)
 - Kernel-side shell commands and `/bin/*` stubs: netstat, ifconfig, route, arp, ss, nc, ip, ping
-- **User-space ring-3 ELF binaries** (M19 Phase 2): `/bin/netstat`, `/bin/ifconfig`, `/bin/arp`, `/bin/ss`, `/bin/nc`
+- **User-space ring-3 ELF binaries** (M19 Phase 2): `/bin/netstat`, `/bin/ifconfig`, `/bin/arp`, `/bin/ss`, `/bin/nc`, **`/bin/route`**, **`/bin/ip`**, **`/bin/ping`**
   - `netstat`: reads `/proc/net/tcp`, prints "Active Internet connections" header + table
   - `ifconfig`: reads `/proc/net/dev`, relays interface statistics
   - `arp`: reads `/proc/net/arp`, relays ARP cache (Linux format with "IP address" header)
   - `ss`: reads `/proc/net/tcp`, prints "Netid" header + socket stats
-  - `nc`: TCP client using `tcp_connect/tcp_send/tcp_recv`; listen mode documented as unsupported until bind/listen/accept are functional
+  - `nc`: TCP client + **TCP server** (`nc -l <port>` uses socket/bind/listen/accept, relays traffic)
+  - `route`: reads `/proc/net/route`, relays routing table
+  - `ip`: multi-subcommand (`addr`/`link` → `/proc/net/dev`; `route` → `/proc/net/route`; `neigh` → `/proc/net/arp`)
+  - `ping`: sends ICMP echo via SYS_PING, prints per-reply RTT in Linux ping format
 - Updated `smoke-net` harness to verify user-space binary output
-**Remaining**: `/bin/route` (needs `/proc/net/route`); `/bin/ip` user-space binary; `/bin/ping` (needs SOCK_RAW or kernel ping syscall); congestion control; full TIME_WAIT state; traceroute, host, dig utilities.
+**Remaining**: `/bin/route` needs `/proc/net/route` live gateway data; `/bin/ip` full subcommand surface; `/bin/ping` flood/count modes; congestion control retransmit timer; traceroute, host, dig (not planned).
 
 ---
 

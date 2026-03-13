@@ -17,10 +17,11 @@ use arrostd::syscall::{
     SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2,
     SYS_EXIT, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
     SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
-    SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM,
-    SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP,
-    SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK, SYS_WAITPID, SYS_WRITE, SYS_YIELD,
-    TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
+    SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV,
+    SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK,
+    SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app,
+    caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -1691,10 +1692,9 @@ impl Scheduler {
                 self.stats.recvfrom = self.stats.recvfrom.saturating_add(1);
                 self.syscall_recvfrom_ring3(ctx, arg0, arg1, arg2)
             }
-            SYS_BIND | SYS_LISTEN | SYS_ACCEPT => {
-                // Passive TCP (server-side) not yet implemented.
-                errno::ENOSYS
-            }
+            SYS_BIND => self.syscall_bind_ring3(ctx, arg0, arg1),
+            SYS_LISTEN => self.syscall_listen_ring3(ctx, arg0),
+            SYS_ACCEPT => self.syscall_accept_ring3(ctx, arg0),
             SYS_CONNECT => {
                 // arg0 = req_ptr, arg1 = req_len (sizeof TcpConnectReq)
                 self.syscall_connect_ring3(ctx, arg0, arg1)
@@ -1706,6 +1706,10 @@ impl Scheduler {
             SYS_RECV => {
                 // arg0 = fd, arg1 = buf_ptr, arg2 = buf_cap
                 self.syscall_recv_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_PING => {
+                // arg0 = ip_ptr, arg1 = ip_len (4)
+                self.syscall_ping_ring3(ctx, arg0, arg1)
             }
             // M15 Phase A1: filesystem / directory syscalls
             SYS_MKDIR => {
@@ -2817,6 +2821,11 @@ impl Scheduler {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 errno::EBADF
             }
+            // Unbound/listening sockets are not data endpoints.
+            FdTarget::TcpUnbound | FdTarget::TcpListener(_) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
         }
     }
 
@@ -2885,6 +2894,11 @@ impl Scheduler {
             }
             // Read-only ends must not reach fd_write_from; can_write() guards this.
             FdTarget::PipeRead(_) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EBADF
+            }
+            // Unbound/listening sockets are not data endpoints.
+            FdTarget::TcpUnbound | FdTarget::TcpListener(_) => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
                 errno::EBADF
             }
@@ -2962,6 +2976,7 @@ impl Scheduler {
             },
             FdTarget::TcpSocket(_) => Ok(serial_fd_stat(true)),
             FdTarget::PipeRead(_) | FdTarget::PipeWrite(_) => Ok(serial_fd_stat(true)),
+            FdTarget::TcpUnbound | FdTarget::TcpListener(_) => Ok(serial_fd_stat(true)),
         }
     }
 
@@ -3507,10 +3522,10 @@ impl Scheduler {
                     self.stats.errors = self.stats.errors.saturating_add(1);
                     return errno::EPROTONOSUPPORT;
                 }
-                // A SOCK_STREAM socket is represented as a TCP_SOCKET fd once connected.
-                // Until connect() is called, return a placeholder fd > UDP_SOCKET_FD that
-                // maps to "unconnected TCP socket" state. We encode it as 2 (first available).
-                2_isize
+                self.with_ring3_fd_table(|_, fd_table| match fd_table.open_tcp_unbound() {
+                    Ok(fd) => fd as isize,
+                    Err(e) => e.as_errno(),
+                })
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
@@ -3640,6 +3655,121 @@ impl Scheduler {
                 net_error_to_errno(err)
             }
         }
+    }
+
+    fn syscall_ping_ring3(&mut self, _ctx: Ring3ProcessContext, ip_ptr: u64, ip_len: u64) -> isize {
+        if ip_len != 4 {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let mut ip = [0u8; 4];
+        if let Err(e) = self.ring3_copy_slice_from_user(ip_ptr, &mut ip) {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return e;
+        }
+        match net::ping(ip) {
+            Ok(rtt_ticks) => rtt_ticks.saturating_mul(10) as isize,
+            Err(err) => net_error_to_errno(err),
+        }
+    }
+
+    fn syscall_bind_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64, port: u64) -> isize {
+        let Ok(fd32) = u32::try_from(fd) else {
+            return errno::EBADF;
+        };
+        let is_unbound = self.with_ring3_fd_table(|_, fd_table| {
+            matches!(
+                fd_table.description(fd32).map(|d| d.target),
+                Ok(FdTarget::TcpUnbound)
+            )
+        });
+        if !is_unbound {
+            self.stats.errors = self.stats.errors.saturating_add(1);
+            return errno::EINVAL;
+        }
+        let bind_port = (port & 0xFFFF) as u16;
+        match net::tcp_bind(bind_port) {
+            Ok(listener_idx) => {
+                let rc = self.with_ring3_fd_table(|_, fd_table| {
+                    fd_table.upgrade_unbound_to_listener(fd32, listener_idx)
+                });
+                match rc {
+                    Ok(()) => 0,
+                    Err(_) => {
+                        net::tcp_listener_close(listener_idx);
+                        errno::EMFILE
+                    }
+                }
+            }
+            Err(_) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                errno::EADDRINUSE
+            }
+        }
+    }
+
+    fn syscall_listen_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+        let Ok(fd32) = u32::try_from(fd) else {
+            return errno::EBADF;
+        };
+        let listener_idx =
+            self.with_ring3_fd_table(|_, fd_table| match fd_table.description(fd32) {
+                Ok(desc) => match desc.target {
+                    FdTarget::TcpListener(idx) => Ok(idx),
+                    _ => Err(errno::EINVAL),
+                },
+                Err(e) => Err(e.as_errno()),
+            });
+        match listener_idx {
+            Ok(idx) => match net::tcp_listen(idx) {
+                Ok(()) => 0,
+                Err(_) => errno::EINVAL,
+            },
+            Err(e) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                e
+            }
+        }
+    }
+
+    fn syscall_accept_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+        let Ok(fd32) = u32::try_from(fd) else {
+            return errno::EBADF;
+        };
+        let listener_idx =
+            self.with_ring3_fd_table(|_, fd_table| match fd_table.description(fd32) {
+                Ok(desc) => match desc.target {
+                    FdTarget::TcpListener(idx) => Ok(idx),
+                    _ => Err(errno::EINVAL),
+                },
+                Err(e) => Err(e.as_errno()),
+            });
+        let listener_idx = match listener_idx {
+            Ok(idx) => idx,
+            Err(e) => {
+                self.stats.errors = self.stats.errors.saturating_add(1);
+                return e;
+            }
+        };
+        let start = crate::time::ticks();
+        loop {
+            if let Some(conn_idx) = net::tcp_accept(listener_idx) {
+                return self.with_ring3_fd_table(|_, fd_table| {
+                    match fd_table.open_tcp_socket(conn_idx) {
+                        Ok(new_fd) => new_fd as isize,
+                        Err(e) => {
+                            net::tcp_close(conn_idx);
+                            e.as_errno()
+                        }
+                    }
+                });
+            }
+            if crate::time::ticks().saturating_sub(start) > 500 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        errno::EAGAIN
     }
 
     fn syscall_cap_drop(&mut self, task: &mut Task, drop_mask: u64) -> isize {
@@ -5389,7 +5519,7 @@ fn syscall_required_caps(number: u64) -> u32 {
         }
         SYS_TIME_MS => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
-        | SYS_LISTEN | SYS_ACCEPT => caps::NET,
+        | SYS_LISTEN | SYS_ACCEPT | SYS_PING => caps::NET,
         _ => 0,
     }
 }
