@@ -932,18 +932,52 @@ fn run_command(shell: &mut ShellState) {
         || input == SERIAL_BIN_DOOM
         || input == "/bin/doom status"
     {
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "status"]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_status_command());
         return;
     }
     if input == "doom play" || input == "/bin/doom play" {
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "play"]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_play_command(shell));
         return;
     }
     if input == "doom run" || input == "/bin/doom run" {
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "run"]) {
+            Ok(Some(pid)) => {
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_run_command());
         return;
     }
     if input == "doom stop" || input == "/bin/doom stop" {
+        match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "stop"]) {
+            Ok(Some(pid)) => {
+                shell.release_all_serial_capture_keys();
+                shell.doom_capture = false;
+                shell.waiting_vfs_pid = Some(pid);
+                return;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
         with_shell_bin_process(SERIAL_BIN_DOOM, |_pid| run_shell_doom_stop_command(shell));
         return;
     }

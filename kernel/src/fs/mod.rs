@@ -69,6 +69,8 @@ pub const BIN_EXEC_PATHS: [&str; 21] = [
 pub const MAX_SYMLINK_DEPTH: usize = 8;
 const DEFAULT_HOME_DIRS: [&str; 2] = ["/home", "/home/user"];
 const DEFAULT_HISTORY_PATH: &str = "/home/user/.history";
+const USR_SHARE_DOOM_DIRS: [&str; 3] = ["/usr", "/usr/share", "/usr/share/doom"];
+const USR_SHARE_DOOM_WAD_PATH: &str = "/usr/share/doom/doom1.wad";
 
 #[derive(Clone, Copy)]
 pub struct BinCommand<'a> {
@@ -1537,6 +1539,7 @@ impl FsState {
             .write("/MILESTONE.TXT", b"M2: inode-based diskfs-v2\n");
         self.ensure_builtin_bins();
         self.ensure_default_home_tree();
+        self.ensure_usr_share_doom();
     }
 
     fn seed_defaults_diskfs(&mut self) {
@@ -1552,6 +1555,7 @@ impl FsState {
         );
         self.ensure_builtin_bins();
         self.ensure_default_home_tree();
+        self.ensure_usr_share_doom();
         let _ = self.diskfs_v2.sync_metadata();
     }
 
@@ -1617,6 +1621,33 @@ impl FsState {
                 DEFAULT_HISTORY_PATH,
                 err.as_str()
             )),
+        }
+    }
+
+    fn ensure_usr_share_doom(&mut self) {
+        let wad = crate::doom::wad_bytes();
+        if wad.is_empty() {
+            return;
+        }
+        for path in USR_SHARE_DOOM_DIRS {
+            match self.mkdir_path(path, 0o755, None) {
+                Ok(()) | Err(FsError::AlreadyExists) => {}
+                Err(err) => {
+                    serial::write_fmt(format_args!(
+                        "FS: seed {} mkdir failed ({})\n",
+                        path,
+                        err.as_str()
+                    ));
+                    return;
+                }
+            }
+        }
+        if let Err(err) = self.seed_file_with_mode(USR_SHARE_DOOM_WAD_PATH, wad, 0o644) {
+            serial::write_fmt(format_args!(
+                "FS: seed {} failed ({})\n",
+                USR_SHARE_DOOM_WAD_PATH,
+                err.as_str()
+            ));
         }
     }
 
@@ -1715,6 +1746,9 @@ fn builtin_bin_seed_payload(path: &str) -> (&'static [u8], u16) {
         }
         "/bin/ping" if !user_bin_embed::ARROST_USER_BIN_PING_ELF_BYTES.is_empty() => {
             (user_bin_embed::ARROST_USER_BIN_PING_ELF_BYTES, 0o755)
+        }
+        "/bin/doom" if !user_bin_embed::ARROST_USER_BIN_DOOM_ELF_BYTES.is_empty() => {
+            (user_bin_embed::ARROST_USER_BIN_DOOM_ELF_BYTES, 0o755)
         }
         _ => (b"#!/arrost/bin\n", 0o755),
     }

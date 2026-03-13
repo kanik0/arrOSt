@@ -1294,6 +1294,12 @@ pub fn render_ui_status() {
     });
 }
 
+/// Returns the embedded WAD bytes (empty if doom was built without a WAD file).
+/// Used by the filesystem to seed `/usr/share/doom/doom1.wad` at boot.
+pub fn wad_bytes() -> &'static [u8] {
+    doom_bridge::wad_bytes()
+}
+
 fn with_state_mut<R>(f: impl FnOnce(&mut DoomState) -> R) -> R {
     // SAFETY: ArrOSt scheduler loop is single-threaded for this milestone.
     unsafe { f(&mut *DOOM_STATE.0.get()) }

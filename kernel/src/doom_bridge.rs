@@ -517,6 +517,11 @@ pub extern "C" fn arr_dg_wad_len() -> usize {
     wad_embed::ARROST_DOOM_WAD_BYTES.len()
 }
 
+/// Returns the embedded WAD bytes (empty if doom was built without a WAD file).
+pub fn wad_bytes() -> &'static [u8] {
+    wad_embed::ARROST_DOOM_WAD_BYTES
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn arr_dg_log(bytes: *const u8, len: usize) {
     if bytes.is_null() || len == 0 {

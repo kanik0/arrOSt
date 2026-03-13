@@ -30,7 +30,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M28** | RTC + Wall-Clock Time | Not started |
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
-| **M31** | Doom Enhancements | Not started |
+| **M31** | Doom as First-Class Executable | **Complete** (Phase A) |
 
 ---
 
@@ -652,45 +652,44 @@ All global mutable state must be protected:
 
 ---
 
-### M31: Doom Enhancements
+### M31: Doom as First-Class Executable
 
-**Status**: Not started
-**Goal**: Improve Doom runtime fidelity and features.
+**Status**: Complete (Phase A — Doom-as-ELF)
+**Goal**: Make Doom a proper executable in the VFS, just like `ls` or `cat`.
 
-**Dependencies**: Various (audio depends on M18 HAL, savegames depend on VFS).
+**Delivered (Phase A)**:
+- `SYS_DOOM_LAUNCH = 55`: new ring-3 syscall bridging user space to the kernel Doom engine.
+  - Subcommands: `DOOM_CMD_PLAY=0` / `DOOM_CMD_RUN=1` / `DOOM_CMD_STOP=2` / `DOOM_CMD_STATUS=3`.
+  - Defined in `crates/arrostd/src/lib.rs` alongside `doom_launch(cmd) -> isize` runtime helper.
+- `/bin/doom` ELF binary: thin ring-3 launcher (`user/doom/src/bin/ring3_doom.rs`) that calls
+  `SYS_DOOM_LAUNCH` with the appropriate subcommand; avoids `arrostd::runtime` to prevent
+  R_X86_64_32S relocations at the high user load address.
+- `build_userland_package` in `xtask/src/main.rs` now applies `-C code-model=large` for
+  `x86_64-unknown-none` targets (was missing, caused linker errors at `0x0000_2000_...`).
+- Kernel embeds `/bin/doom` ELF in the kernel image and seeds it into the VFS at boot
+  (`kernel/build.rs` + `kernel/src/fs/mod.rs`).
+- `/usr/share/doom/doom1.wad`: WAD file seeded into the VFS at boot via
+  `fs::ensure_usr_share_doom()`, making the game data accessible from user space.
+- Shell dispatch updated: `doom` / `doom play` / `doom run` / `doom stop` / `doom status`
+  now try `/bin/doom` via `try_launch_shell_vfs_user_bin` first, falling back to kernel-direct.
 
-#### Step 1: Audio mixing improvements
-**Files to modify**: `kernel/src/audio/virtio_sound.rs`, `kernel/src/doom_bridge.rs`
+**Phase B (future — not yet implemented)**:
+- Audio mixing: PCM sample mixing, volume control, 11025 Hz → 48000 Hz conversion.
+- Savegames: intercept DoomGeneric save/load, persist to `/home/user/.doom/save*.dsg`.
+- Fullscreen: `doom fullscreen` command, compositor hides taskbar.
+- Network multiplayer: route DoomGeneric net calls through kernel UDP.
 
-1. Implement basic PCM sample mixing (multiple sound effects + music).
-2. Volume control per channel.
-3. Proper sample rate conversion (11025 Hz Doom -> 48000 Hz output).
-
-#### Step 2: Savegame support
-**Files to modify**: `kernel/src/doom.rs`, `kernel/src/doom_bridge.rs`
-
-1. Intercept DoomGeneric save/load calls.
-2. Write savegame files to `/home/user/.doom/save*.dsg` via VFS.
-3. Load savegames from VFS on game load.
-
-#### Step 3: Full-screen mode
-**Files to modify**: `kernel/src/gfx/mod.rs`, `kernel/src/doom.rs`
-
-1. `doom fullscreen` command toggles Doom window to fill entire framebuffer.
-2. Compositor hides taskbar and other windows.
-3. `Esc` exits fullscreen.
-
-#### Step 4: Network multiplayer groundwork
-**Files to modify**: `kernel/src/doom.rs`, `kernel/src/net/mod.rs`
-
-1. Intercept DoomGeneric network calls.
-2. Route through kernel UDP socket to QEMU user-net.
-3. Two QEMU instances can play together (stretch goal).
-
-#### Testing
-1. `doom play` starts with audible sound effects.
-2. Save game, quit, reload, continue from save.
-3. `doom fullscreen` fills the screen.
+**Testing**:
+```
+doom              # runs /bin/doom (play subcommand)
+doom play
+doom run
+doom stop
+doom status
+/bin/doom play    # direct path
+ls /bin/doom      # should show the ELF
+ls /usr/share/doom/doom1.wad  # WAD present
+```
 
 ---
 
