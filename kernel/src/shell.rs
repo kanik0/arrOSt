@@ -357,8 +357,14 @@ impl ShellState {
 
 fn serial_capture_hold_ticks(byte: u8) -> u64 {
     match byte {
+        // WASD movement (legacy serial mapping, kept for backwards compat).
         b'w' | b'a' | b's' | b'd' | b'W' | b'A' | b'S' | b'D' => SERIAL_CAPTURE_HOLD_TICKS_MOVE,
-        b' ' | b'e' | b'E' | b'f' | b'F' | b'\n' | b'\r' => SERIAL_CAPTURE_HOLD_TICKS_ACTION,
+        // Doom arrow keys (movement).
+        0xAC..=0xAF => SERIAL_CAPTURE_HOLD_TICKS_MOVE,
+        // Fire (KEY_RCTRL 0x9D), strafe (KEY_RALT 0xB8), use/action.
+        0x9D | 0xB8 | b' ' | b'e' | b'E' | b'f' | b'F' | b'\n' | b'\r' => {
+            SERIAL_CAPTURE_HOLD_TICKS_ACTION
+        }
         _ => SERIAL_CAPTURE_HOLD_TICKS_DEFAULT,
     }
 }
@@ -413,6 +419,10 @@ pub fn poll() {
 fn process_keyboard_event(event: keyboard::KeyEvent) {
     if !event.pressed {
         if doom_capture_enabled() {
+            // F12 release is handled in the pressed path; ignore here.
+            if event.code == keyboard::KeyCode::F12 {
+                return;
+            }
             if let Some(byte) = map_doom_capture_key(event.code) {
                 let _ = doom::inject_key_release(byte);
             }
@@ -445,27 +455,49 @@ fn process_keyboard_event(event: keyboard::KeyEvent) {
         return;
     }
 
-    let Some(byte) = map_doom_capture_key(event.code) else {
-        return;
-    };
-    if byte == 0x1b && event.pressed {
-        shell.release_all_serial_capture_keys();
-        shell.doom_capture = false;
-        let _ = doom::set_capture(false);
-        serial::write_line("\ndoom: capture disabled");
-        print_prompt();
+    // F12 always releases capture regardless of press/release.
+    if event.code == keyboard::KeyCode::F12 {
+        if event.pressed {
+            shell.release_all_serial_capture_keys();
+            shell.doom_capture = false;
+            let _ = doom::set_capture(false);
+            gfx::set_doom_fullscreen(false);
+            serial::write_line("\ndoom: keys released (F12)");
+            print_prompt();
+        }
         return;
     }
 
-    let _ = doom::inject_key(byte);
+    let Some(byte) = map_doom_capture_key(event.code) else {
+        return;
+    };
+    // ESC (0x1b) is forwarded to Doom so the in-game menu opens/closes.
+    let _ = if event.pressed {
+        doom::inject_key(byte)
+    } else {
+        doom::inject_key_release(byte)
+    };
 }
 
 fn map_doom_capture_key(code: keyboard::KeyCode) -> Option<u8> {
     match code {
-        keyboard::KeyCode::ArrowUp => Some(b'w'),
-        keyboard::KeyCode::ArrowDown => Some(b's'),
-        keyboard::KeyCode::ArrowLeft => Some(b'a'),
-        keyboard::KeyCode::ArrowRight => Some(b'd'),
+        // Arrow keys → Doom movement constants (KEY_UPARROW/DOWNARROW/LEFTARROW/RIGHTARROW).
+        keyboard::KeyCode::ArrowUp => Some(0xAD),
+        keyboard::KeyCode::ArrowDown => Some(0xAF),
+        keyboard::KeyCode::ArrowLeft => Some(0xAC),
+        keyboard::KeyCode::ArrowRight => Some(0xAE),
+        // Modifier keys → Doom action constants.
+        // KEY_RCTRL (0x9D) = fire / run; KEY_RALT (0xB8) = strafe.
+        keyboard::KeyCode::LeftCtrl => Some(0x9D),
+        keyboard::KeyCode::LeftAlt => Some(0xB8),
+        // F-keys → Doom function-key constants (KEY_Fn = 0x80 + PS/2 scancode).
+        keyboard::KeyCode::F1 => Some(0xBB), // help / menu
+        keyboard::KeyCode::F3 => Some(0xBD), // load game
+        keyboard::KeyCode::F5 => Some(0xBF), // detail level toggle
+        keyboard::KeyCode::F7 => Some(0xC1), // end game
+        // F12 is handled before this call as a capture-release key.
+        keyboard::KeyCode::F12 => None,
+        // All other bytes (including ESC 0x1b) pass through to Doom directly.
         keyboard::KeyCode::Byte(byte) => Some(byte),
     }
 }
@@ -511,7 +543,7 @@ fn process_byte(byte: u8) {
             shell.release_all_serial_capture_keys();
             shell.doom_capture = false;
             let _ = doom::set_capture(false);
-            serial::write_line("\ndoom: capture disabled");
+            serial::write_line("\ndoom: keys released (serial ESC)");
             print_prompt();
             return;
         }
@@ -1190,13 +1222,23 @@ fn run_command(shell: &mut ShellState) {
         }
         return;
     }
+    if input == "doom fullscreen" {
+        gfx::set_doom_fullscreen(true);
+        serial::write_line("doom: fullscreen enabled (F12: exit)");
+        return;
+    }
+    if input == "doom window" {
+        gfx::set_doom_fullscreen(false);
+        serial::write_line("doom: windowed mode");
+        return;
+    }
     if input == "doom capture on" {
         if !doom::set_capture(true) {
             serial::write_line("doom: capture requires `doom play` running");
             return;
         }
         shell.doom_capture = true;
-        serial::write_line("doom: capture enabled (press ESC to exit)");
+        serial::write_line("doom: capture enabled (F12: release keys | ESC: in-game menu)");
         return;
     }
     if input == "doom capture off" {
@@ -1267,6 +1309,16 @@ fn run_command(shell: &mut ShellState) {
             }
             _ => serial::write_line("usage: doom audio <on|off|virtio|status|test>"),
         }
+        return;
+    }
+    if input == "doom fullscreen" {
+        gfx::set_doom_fullscreen(true);
+        serial::write_line("doom: fullscreen enabled (F12: exit)");
+        return;
+    }
+    if input == "doom window" {
+        gfx::set_doom_fullscreen(false);
+        serial::write_line("doom: windowed mode");
         return;
     }
     if let Some(rest) = input.strip_prefix("doom view ") {
@@ -1940,7 +1992,7 @@ fn run_shell_doom_play_command(shell: &mut ShellState) {
     if !matches!(start, doom::PlayStart::AlreadyRunning) {
         if doom::set_capture(true) {
             shell.doom_capture = true;
-            serial::write_line("doom: capture enabled (press ESC to exit)");
+            serial::write_line("doom: capture enabled (F12: release keys | ESC: in-game menu)");
         } else {
             shell.doom_capture = false;
             serial::write_line("doom: capture unavailable (fallback mode)");

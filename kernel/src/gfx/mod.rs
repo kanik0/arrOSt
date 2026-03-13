@@ -762,6 +762,7 @@ struct GfxState {
     present_partial: u64,
     present_full: u64,
     doom_window_open: bool,
+    doom_fullscreen: bool,
     doom_view: DoomViewLayer,
     next_terminal_tty: u32,
     pending_ui_action: UiAction,
@@ -826,6 +827,7 @@ impl GfxState {
             present_partial: 0,
             present_full: 0,
             doom_window_open: false,
+            doom_fullscreen: false,
             doom_view: DoomViewLayer::new(),
             next_terminal_tty: TERMINAL_BASE_TTY,
             pending_ui_action: UiAction::None,
@@ -848,11 +850,11 @@ impl GfxState {
         #[cfg(target_arch = "aarch64")]
         let doom_w = min(360, info.width.saturating_sub(140)).max(280);
         #[cfg(not(target_arch = "aarch64"))]
-        let doom_w = min(560, info.width.saturating_sub(120)).max(340);
+        let doom_w = min(660, info.width.saturating_sub(120)).max(340);
         #[cfg(target_arch = "aarch64")]
         let doom_h = min(260, info.height.saturating_sub(140)).max(200);
         #[cfg(not(target_arch = "aarch64"))]
-        let doom_h = min(420, info.height.saturating_sub(100)).max(260);
+        let doom_h = min(440, info.height.saturating_sub(100)).max(260);
         let doom_x = info.width.saturating_sub(doom_w) / 2;
         let doom_y = (info.height.saturating_sub(doom_h) / 2).max(TASKBAR_HEIGHT + 8);
         self.backend = backend;
@@ -903,6 +905,7 @@ impl GfxState {
         self.present_partial = 0;
         self.present_full = 0;
         self.doom_window_open = false;
+        self.doom_fullscreen = false;
         self.doom_view = DoomViewLayer::new();
         self.next_terminal_tty = TERMINAL_BASE_TTY;
         self.pending_ui_action = UiAction::None;
@@ -1172,7 +1175,8 @@ impl GfxState {
     }
 
     fn doom_capture_target(&self) -> bool {
-        self.doom_window_open && self.focused_window == DOOM_WINDOW_INDEX
+        (self.doom_window_open && self.focused_window == DOOM_WINDOW_INDEX)
+            || (self.doom_fullscreen && self.doom_view.active)
     }
 
     fn apps_button_rect(&self) -> Rect {
@@ -4751,6 +4755,15 @@ impl GfxState {
     }
 
     fn redraw_region(&mut self, rect: Rect) {
+        if self.doom_fullscreen && self.doom_view.active {
+            self.clip = None;
+            self.draw_doom_fullscreen();
+            self.present_rect(Rect::new(0, 0, self.info.width, self.info.height));
+            self.frames = self.frames.saturating_add(1);
+            self.full_redraws = self.full_redraws.saturating_add(1);
+            self.present_full = self.present_full.saturating_add(1);
+            return;
+        }
         self.clip = Some(rect);
         self.draw_desktop_background();
         self.draw_top_bar();
@@ -4854,6 +4867,14 @@ impl GfxState {
 
     fn redraw(&mut self) {
         self.clip = None;
+        if self.doom_fullscreen && self.doom_view.active {
+            self.draw_doom_fullscreen();
+            self.present_rect(Rect::new(0, 0, self.info.width, self.info.height));
+            self.frames = self.frames.saturating_add(1);
+            self.full_redraws = self.full_redraws.saturating_add(1);
+            self.present_full = self.present_full.saturating_add(1);
+            return;
+        }
         self.draw_desktop_background();
         self.draw_top_bar();
 
@@ -5430,13 +5451,137 @@ impl GfxState {
             }
         });
 
+        // Hint pill inside the Doom frame at bottom-right.
+        let hint = "F12: release | ESC: menu";
+        let pill_pad_x: usize = 4;
+        let pill_pad_y: usize = 2;
+        let pill_w = hint.len().saturating_mul(FONT_CELL_W) + pill_pad_x.saturating_mul(2);
+        let pill_h = FONT_CELL_H + pill_pad_y.saturating_mul(2);
+        if pill_w <= draw_w && pill_h <= draw_h {
+            let pill_x = draw_x.saturating_add(draw_w).saturating_sub(pill_w);
+            let pill_y = draw_y.saturating_add(draw_h).saturating_sub(pill_h);
+            self.fill_rect(pill_x, pill_y, pill_w, pill_h, Color::rgb(18, 18, 18));
+            self.draw_text(
+                pill_x.saturating_add(pill_pad_x),
+                pill_y.saturating_add(pill_pad_y),
+                hint,
+                Color::rgb(220, 220, 180),
+                None,
+            );
+        }
+    }
+
+    fn draw_doom_fullscreen(&mut self) {
+        let scr_w = self.info.width;
+        let scr_h = self.info.height;
+        if scr_w == 0 || scr_h == 0 {
+            return;
+        }
+        // Fill entire screen with black.
+        self.fill_rect(0, 0, scr_w, scr_h, Color::rgb(0, 0, 0));
+
+        let src_w = self.doom_view.width;
+        let src_h = self.doom_view.height;
+        if src_w == 0 || src_h == 0 {
+            return;
+        }
+
+        // Compute aspect-fitted draw rect.
+        let (draw_w, draw_h) = if (scr_w as u64).saturating_mul(src_h as u64)
+            <= (scr_h as u64).saturating_mul(src_w as u64)
+        {
+            let w = scr_w;
+            let h = ((scr_w as u64).saturating_mul(src_h as u64) / src_w.max(1) as u64) as usize;
+            (w, h.max(1))
+        } else {
+            let h = scr_h;
+            let w = ((scr_h as u64).saturating_mul(src_w as u64) / src_h.max(1) as u64) as usize;
+            (w.max(1), h)
+        };
+        let draw_x = scr_w.saturating_sub(draw_w) / 2;
+        let draw_y = scr_h.saturating_sub(draw_h) / 2;
+
+        // Use the same blit/scale logic as draw_doom_view.
+        with_doom_view_pixels(|pixels| {
+            if self.blit_doom_native_rgb(draw_x, draw_y, draw_w, draw_h, src_w, src_h, pixels) {
+                return;
+            }
+            if draw_w == src_w && draw_h == src_h {
+                for y in 0..src_h {
+                    for x in 0..src_w {
+                        let source =
+                            pixels[y.saturating_mul(src_w).saturating_add(x)] & 0x00FF_FFFF;
+                        self.write_pixel(
+                            draw_x.saturating_add(x),
+                            draw_y.saturating_add(y),
+                            color_from_rgb24(source),
+                        );
+                    }
+                }
+            } else {
+                let src_w_last = src_w.saturating_sub(1);
+                let src_h_last = src_h.saturating_sub(1);
+                let draw_w_den = draw_w.saturating_sub(1).max(1) as u64;
+                let draw_h_den = draw_h.saturating_sub(1).max(1) as u64;
+                let step_x_fp =
+                    ((src_w_last as u64).saturating_mul(1u64 << 16) / draw_w_den) as u32;
+                let step_y_fp =
+                    ((src_h_last as u64).saturating_mul(1u64 << 16) / draw_h_den) as u32;
+                let x_last_fp = (src_w_last as u32).saturating_mul(1u32 << 16);
+                let y_last_fp = (src_h_last as u32).saturating_mul(1u32 << 16);
+                let mut sy_fp = 0u32;
+                for y in 0..draw_h {
+                    let sy_cur = if y + 1 == draw_h { y_last_fp } else { sy_fp };
+                    let y0 = ((sy_cur >> 16) as usize).min(src_h_last);
+                    let y1 = (y0 + 1).min(src_h_last);
+                    let wy = sy_cur & 0xFFFF;
+                    let row0 = y0.saturating_mul(src_w);
+                    let row1 = y1.saturating_mul(src_w);
+                    let mut sx_fp = 0u32;
+                    for x in 0..draw_w {
+                        let sx_cur = if x + 1 == draw_w { x_last_fp } else { sx_fp };
+                        let x0 = ((sx_cur >> 16) as usize).min(src_w_last);
+                        let x1 = (x0 + 1).min(src_w_last);
+                        let wx = sx_cur & 0xFFFF;
+                        let c00 = pixels[row0.saturating_add(x0)] & 0x00FF_FFFF;
+                        let c10 = pixels[row0.saturating_add(x1)] & 0x00FF_FFFF;
+                        let c01 = pixels[row1.saturating_add(x0)] & 0x00FF_FFFF;
+                        let c11 = pixels[row1.saturating_add(x1)] & 0x00FF_FFFF;
+                        self.write_pixel(
+                            draw_x.saturating_add(x),
+                            draw_y.saturating_add(y),
+                            bilinear_rgb24(c00, c10, c01, c11, wx, wy),
+                        );
+                        sx_fp = sx_fp.saturating_add(step_x_fp);
+                    }
+                    sy_fp = sy_fp.saturating_add(step_y_fp);
+                }
+            }
+        });
+
+        // Draw hint pill in bottom-right corner.
+        let hint = "F12: release keys | ESC: menu";
+        let pill_pad_x: usize = 6;
+        let pill_pad_y: usize = 3;
+        let pill_w = hint.len().saturating_mul(FONT_CELL_W) + pill_pad_x.saturating_mul(2);
+        let pill_h = FONT_CELL_H + pill_pad_y.saturating_mul(2);
+        let margin: usize = 8;
+        let pill_x = scr_w.saturating_sub(pill_w).saturating_sub(margin);
+        let pill_y = scr_h.saturating_sub(pill_h).saturating_sub(margin);
+        self.fill_rect(pill_x, pill_y, pill_w, pill_h, Color::rgb(18, 18, 18));
         self.draw_text(
-            draw_x,
-            draw_y.saturating_sub(CHROME_CHAR_H),
-            "DOOM VIEWPORT",
-            Color::rgb(238, 229, 214),
+            pill_x.saturating_add(pill_pad_x),
+            pill_y.saturating_add(pill_pad_y),
+            hint,
+            Color::rgb(220, 220, 180),
             None,
         );
+    }
+
+    fn set_doom_fullscreen_impl(&mut self, enabled: bool) {
+        self.doom_fullscreen = enabled;
+        // Force a full redraw so the mode change is visible immediately.
+        self.redraw();
     }
 
     fn draw_close_button(&mut self, index: usize, focused: bool) {
@@ -5891,6 +6036,10 @@ pub fn clear_file_manager_doom_view() {
             state.flush_damage();
         }
     });
+}
+
+pub fn set_doom_fullscreen(enabled: bool) {
+    let _ = with_state_mut(|state| state.set_doom_fullscreen_impl(enabled));
 }
 
 pub fn focus_next() {
