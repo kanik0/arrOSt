@@ -21,7 +21,8 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Timer-driven hard preemption via PIT IRQ0 (x86_64) / GIC virtual timer IRQ27 (aarch64) with 10-tick quantum.
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
 - Full-data journaling: `MetadataOnly`, `Ordered` (default), and `Full` modes with on-disk persistence and runtime shell control.
-- Syscall ABI revision `5` with 52 syscalls, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, and memory/signal stubs.
+- `fork` + CoW + demand paging: `SYS_FORK` clones ring-3 processes with CoW-shared address spaces; write faults trigger per-page copy; anonymous VMAs via `mmap`/`brk` are demand-paged on first access.
+- Syscall ABI revision `5` with 52+ syscalls, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, `fork`, `mmap` (anonymous), and `brk`.
 - VFS-backed `/bin/*` command dispatch: shell and GUI terminal auto-execute ring-3 ELF binaries from the mounted filesystem.
 - Extended `/proc` with global system files, per-PID directories, and `/proc/net/` subsystem.
 - TCP/IP networking with state machine (SYN_SENT through LAST_ACK), BSD socket syscalls, and kernel-side Unix network utilities.
@@ -96,7 +97,7 @@ Representative commands:
 - Kernel/user copies for ring-3 syscalls are translated through the owning process page tables instead of dereferencing user pointers directly.
 - `x86_64` ring-3 entry uses `int 0x80` with DPL3 gate and TSS `RSP0`; aarch64 uses EL0 `SVC`.
 - KPTI (M11): ring-3 page tables preserve only upper-half kernel mappings; each process maps a dedicated trampoline page; syscall/fault/sync transitions route through per-architecture trampoline entry/exit paths with per-CPU scratch root/RSP tracking.
-- `fork` (M13): `SYS_FORK` clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
+- `fork` (M13, complete): `SYS_FORK` clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
 - User-mode CPU faults transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
 - ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
@@ -138,7 +139,7 @@ Useful runtime commands:
 ## Known limitations
 
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
-- `fork` (M13) is implemented with CoW page sharing and demand-paged anonymous VMAs; swap to virtio-blk and `/proc/<pid>/maps` are remaining follow-ups.
+- `munmap`, `mprotect`, full VMA shrink, and `/proc/<pid>/maps` are not yet implemented (tracked in M21).
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - No `/dev` filesystem or device nodes.
 - No ANSI/VT100 terminal escape sequence support.
@@ -159,7 +160,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 |---|-----------|--------|
 | M11 | KPTI | Complete |
 | M12 | VFS-backed ELF launch | Complete |
-| M13 | fork + CoW + demand paging | Planned |
+| M13 | fork + CoW + demand paging | Complete |
 | M14 | Timer-driven hard preemption | Complete |
 | M15 | Extended syscall surface | Complete |
 | M16 | Extended ProcFS | Complete |

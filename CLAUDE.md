@@ -246,6 +246,7 @@ Three scheduler tables coexist:
 |---|-----------|---------|
 | M11 | KPTI | Trampoline infrastructure, per-CPU scratch, CR3/TTBR0 switching on entry/exit |
 | M12 | VFS-backed ELF launch | `/bin/*` auto-dispatch, kernel-mediated spawn-from-path, 18 seeded binaries |
+| M13 | fork + CoW + demand paging | `SYS_FORK` with CoW pages via `Arc<UserPageHolder>`; demand-paged anonymous VMAs; `mmap`/`brk` live |
 | M14 | Timer-driven preemption | PIT IRQ0 / GIC IRQ27, 10-tick quantum, full GPR save/restore |
 | M15 | Extended syscalls | 52 syscalls total, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
 | M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
@@ -258,9 +259,8 @@ Three scheduler tables coexist:
 ### Planned
 | # | Milestone | Goal |
 |---|-----------|------|
-| M13 | fork + CoW + demand paging | `fork()` with CoW pages, VMA tracking, demand-paged mappings |
 | M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
-| M21 | Full mmap / VMA | Replace mmap/munmap/mprotect/brk stubs with real VMA manager |
+| M21 | Full mmap / VMA | Add `munmap`/`mprotect`, file-backed mappings, VMA shrink, `/proc/<pid>/maps` |
 | M22 | execve syscall | True `execve` exposing VFS ELF loading to user-space |
 | M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
 | M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |

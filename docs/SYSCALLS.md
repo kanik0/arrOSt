@@ -40,6 +40,7 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | 20 | `fstat` | `(fd, stat_buf) -> 0` | Get file status |
 | 21 | `dup` | `(fd) -> new_fd` | Duplicate fd |
 | 22 | `dup2` | `(old_fd, new_fd) -> new_fd` | Duplicate fd to specific number |
+| 23 | `fork` | `() -> child_pid or 0` | Clone ring-3 process with CoW address space; returns child PID to parent, 0 to child |
 
 ### Directory and path (25-34)
 
@@ -72,14 +73,14 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | 39 | `sigaction` | Returns `ENOSYS` (not yet implemented) |
 | 40 | `sigreturn` | Returns `ENOSYS` (not yet implemented) |
 
-### Memory stubs (41-44)
+### Memory (41-44)
 
 | Number | Name | Notes |
 |--------|------|-------|
-| 41 | `mmap` | Returns `ENOSYS` (not yet implemented) |
-| 42 | `munmap` | Returns `ENOSYS` (not yet implemented) |
-| 43 | `mprotect` | Returns `ENOSYS` (not yet implemented) |
-| 44 | `brk` | Returns `ENOSYS` (not yet implemented) |
+| 41 | `mmap` | `MAP_ANONYMOUS \| MAP_PRIVATE`: demand-paged anonymous VMA. Returns start address. File-backed and `MAP_SHARED` return `ENOSYS`. |
+| 42 | `munmap` | Returns `ENOSYS` (tracked in M21) |
+| 43 | `mprotect` | Returns `ENOSYS` (tracked in M21) |
+| 44 | `brk` | Query (`brk(0)`) returns current break. Extend grows heap VMA (demand-paged). Shrink returns current break unchanged. |
 
 ### Pipe IPC (45-46)
 
@@ -202,6 +203,7 @@ On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DP
 On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to process-layer ring-3 syscall dispatch.
 On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, arguments in `x0..x5`, return value in `x0`.
 Filesystem-backed `/bin/*` launch does not change the ABI revision: it currently uses a kernel-mediated spawn-from-path flow over the existing ABI, with no new `exec`/`execve` syscall yet.
+`fork` (M13), anonymous `mmap`, and `brk` are fully implemented: they are no longer stubs. `munmap`, `mprotect`, and file-backed `mmap` remain `ENOSYS` (tracked in M21).
 
 ## Userland shim
 
