@@ -30,7 +30,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M28** | RTC + Wall-Clock Time | Not started |
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
-| **M31** | Doom as First-Class Executable | **Complete** (Phase A) |
+| **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
 
 ---
 
@@ -654,7 +654,7 @@ All global mutable state must be protected:
 
 ### M31: Doom as First-Class Executable
 
-**Status**: Complete (Phase A — Doom-as-ELF)
+**Status**: Complete (Phase A + Phase B)
 **Goal**: Make Doom a proper executable in the VFS, just like `ls` or `cat`.
 
 **Delivered (Phase A)**:
@@ -673,10 +673,26 @@ All global mutable state must be protected:
 - Shell dispatch updated: `doom` / `doom play` / `doom run` / `doom stop` / `doom status`
   now try `/bin/doom` via `try_launch_shell_vfs_user_bin` first, falling back to kernel-direct.
 
-**Phase B (future — not yet implemented)**:
-- Audio mixing: PCM sample mixing, volume control, 11025 Hz → 48000 Hz conversion.
+**Delivered (Phase B — UX enhancements)**:
+- **Keyboard capture rework** (`keyboard.rs`, `shell.rs`):
+  - F12 releases keyboard capture (was ESC); ESC now forwards to Doom's in-game menu.
+  - New `KeyCode` variants: `F1`/`F3`/`F5`/`F7`/`F12`/`LeftCtrl`/`LeftAlt` with full encode/decode.
+  - CTRL → `KEY_RCTRL=0x9D` (fire/run), ALT → `KEY_RALT=0xB8` (strafe).
+  - Arrow keys send Doom key constants `0xAC`–`0xAF` instead of WASD ASCII.
+  - F1/F3/F5/F7 map to Doom function keys (help/load game/detail/end game).
+  - Serial ESC still releases capture as a fallback.
+- **Fullscreen mode** (`gfx/mod.rs`):
+  - `doom fullscreen` / `doom window` shell commands.
+  - Fullscreen: aspect-fitted Doom view fills whole screen with black letterbox.
+  - Hint pill overlay "F12: release keys | ESC: menu" shown in both windowed and fullscreen modes.
+  - Default Doom window increased to 660×440 (≈2× native 320×200).
+  - Keyboard capture active in fullscreen mode via updated `doom_capture_target()`.
+- **Audio** (`user/doom/c/doomgeneric_audio_stub.c`):
+  - Music voices increased from 32 → 64 (`ARR_MUSIC_VOICES`).
+  - Comb-filter reverb: ~30 ms delay (1323 frames at 44.1 kHz), 30% wet mix on all audio output.
+
+**Phase C (future)**:
 - Savegames: intercept DoomGeneric save/load, persist to `/home/user/.doom/save*.dsg`.
-- Fullscreen: `doom fullscreen` command, compositor hides taskbar.
 - Network multiplayer: route DoomGeneric net calls through kernel UDP.
 
 **Testing**:
@@ -686,6 +702,9 @@ doom play
 doom run
 doom stop
 doom status
+doom fullscreen   # switch to fullscreen mode (F12 to exit)
+doom window       # return to windowed mode
+doom capture on   # re-enable keyboard capture
 /bin/doom play    # direct path
 ls /bin/doom      # should show the ELF
 ls /usr/share/doom/doom1.wad  # WAD present
