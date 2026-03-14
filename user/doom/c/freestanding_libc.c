@@ -58,11 +58,24 @@ static unsigned char *g_heap = NULL;
 static size_t g_heap_capacity = 0;
 static size_t g_heap_top = 0;
 
-/* Called by kernel/src/doom_bridge.rs::create_engine() before each Doom run. */
+/* Called by kernel/src/doom_bridge.rs::create_engine() before each Doom run.
+ * The Rust allocator may hand us a u8* with alignment 1, but malloc() must
+ * return pointers usable as uint32_t* (4-byte alignment required by
+ * slice::from_raw_parts in arr_dg_draw_frame).  Align the base to 16 bytes
+ * so the very first allocation (DG_ScreenBuffer) is always 16-byte aligned. */
 void arr_dg_heap_init(unsigned char *ptr, size_t cap) {
-    g_heap = ptr;
-    g_heap_capacity = cap;
-    g_heap_top = 0; /* reset bump pointer so each run starts fresh */
+    size_t base    = (size_t)(void *)ptr;
+    size_t aligned = (base + 15u) & ~(size_t)15u;
+    size_t waste   = aligned - base;
+    if (waste >= cap) {
+        /* Degenerate: caller passed a tiny or already-at-limit buffer. */
+        g_heap          = ptr;
+        g_heap_capacity = 0u;
+    } else {
+        g_heap          = (unsigned char *)(void *)aligned;
+        g_heap_capacity = cap - waste;
+    }
+    g_heap_top = 0u; /* reset bump pointer so each run starts fresh */
 }
 static struct arr_freestd_file g_file_pool[ARROST_FILE_POOL_SIZE];
 static struct arr_freestd_file g_stdin = {ARR_FILE_SINK, 0, 0, 0, 0, 0};
