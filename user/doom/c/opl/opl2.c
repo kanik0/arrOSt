@@ -149,9 +149,14 @@ static int32_t op_waveform(const opl2_chip_t *chip,
  * Rate 0-15 → per-sample Q15 increment (approximate OPL2 timing).
  * Rate 15 = instant (32767 / 1 sample).
  * Rate 0  = never (0).
- * Doubling each rate step: rate N ≈ rate 15 / 2^(15-N).
+ *
+ * The `base` parameter controls overall speed:
+ *   - Attack uses base=15  (AR=8 → ~17ms, AR=4 → ~280ms)
+ *   - Decay/Release uses base=4 (DR=1 → ~0.7s, DR=8 → ~5ms)
+ * Real OPL2 attack is inherently faster than decay/release;
+ * splitting the base approximates this asymmetry.
  */
-static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate)
+static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate, uint32_t base)
 {
     if (rate == 0u) {
         return 0;
@@ -159,9 +164,7 @@ static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate)
     if (rate >= 15u) {
         return 32767;
     }
-    /* step = 32767 * 280 * 2^(rate-1) / sample_rate
-     * Use 64-bit to avoid overflow: 32767*280*2^13 ~ 75M, fits in uint64. */
-    uint64_t num = (uint64_t)32767u * 280u;
+    uint64_t num = (uint64_t)32767u * base;
     int shift = (int)rate - 1;
     if (shift > 0) {
         num <<= (uint32_t)shift;
@@ -179,9 +182,9 @@ static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate)
 /* Compute all envelope step sizes for one operator after a parameter change. */
 static void op_recompute_envelope(opl2_op_t *op, uint32_t sample_rate)
 {
-    op->atk_step = rate_to_step(op->ar, sample_rate);
-    op->dec_step = rate_to_step(op->dr, sample_rate);
-    op->rel_step = rate_to_step(op->rr, sample_rate);
+    op->atk_step = rate_to_step(op->ar, sample_rate, 15u);
+    op->dec_step = rate_to_step(op->dr, sample_rate, 4u);
+    op->rel_step = rate_to_step(op->rr, sample_rate, 4u);
     /* Sustain level: sl 0 = full volume, sl 15 = silence */
     op->sus_level = (int32_t)((15u - (uint32_t)op->sl) * 32767u / 15u);
 }
