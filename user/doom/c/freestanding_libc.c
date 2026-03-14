@@ -16,7 +16,6 @@
 
 int errno = 0;
 
-#define ARROST_LIBC_HEAP_SIZE (16u * 1024u * 1024u)
 #define ARROST_FILE_POOL_SIZE 8u
 #define ARROST_PRINTF_BUF_SIZE 1024u
 #define ARROST_CFG_CAPACITY (32u * 1024u)
@@ -49,8 +48,22 @@ extern void arr_dg_log(const char *bytes, size_t len);
 extern size_t arr_dg_cfg_load(uint8_t *out, size_t cap);
 extern int arr_dg_cfg_store(const uint8_t *data, size_t len);
 
-static unsigned char g_heap[ARROST_LIBC_HEAP_SIZE];
+/*
+ * Heap for Doom's bump allocator.  NOT a static array: the kernel allocates
+ * this from its own heap and hands the pointer + size to us via
+ * arr_dg_heap_init() before calling doomgeneric_Create().  This removes the
+ * large BSS contribution that was colliding with the bootloader's GDT frame.
+ */
+static unsigned char *g_heap = NULL;
+static size_t g_heap_capacity = 0;
 static size_t g_heap_top = 0;
+
+/* Called by kernel/src/doom_bridge.rs::create_engine() before each Doom run. */
+void arr_dg_heap_init(unsigned char *ptr, size_t cap) {
+    g_heap = ptr;
+    g_heap_capacity = cap;
+    g_heap_top = 0; /* reset bump pointer so each run starts fresh */
+}
 static struct arr_freestd_file g_file_pool[ARROST_FILE_POOL_SIZE];
 static struct arr_freestd_file g_stdin = {ARR_FILE_SINK, 0, 0, 0, 0, 0};
 static struct arr_freestd_file g_stdout = {ARR_FILE_SINK, 0, 0, 0, 0, 0};
@@ -234,7 +247,7 @@ void *malloc(size_t size) {
     }
 
     total = align_up(sizeof(alloc_header_t) + size, 8u);
-    if (g_heap_top > ARROST_LIBC_HEAP_SIZE || total > (ARROST_LIBC_HEAP_SIZE - g_heap_top)) {
+    if (g_heap == NULL || g_heap_top > g_heap_capacity || total > (g_heap_capacity - g_heap_top)) {
         errno = ENOMEM;
         return 0;
     }

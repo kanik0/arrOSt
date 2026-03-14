@@ -31,6 +31,8 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
 | **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
+| **M31D** | Doom Authentic Music (OPL2) | Not started |
+| **M32** | Doom 100% in Userland | Not started |
 
 ---
 
@@ -712,6 +714,92 @@ ls /usr/share/doom/doom1.wad  # WAD present
 
 ---
 
+### M31D: Doom Authentic Music via OPL2 Emulation
+
+**Status**: Not started
+**Goal**: Replace the custom waveform synthesizer with an OPL2/OPL3 emulator so Doom music sounds identical to the original DOS experience.
+
+**Background**: Doom's original music uses the MUS format (MIDI derivative) played through an OPL2 FM synthesis chip (Yamaha YM3812) on Sound Blaster cards.
+The current `doomgeneric_audio_stub.c` synthesizer uses square/triangle/noise waveforms — functional but tonally inaccurate.
+SFX are PCM samples and already sound correct.
+
+**Dependencies**: None beyond M31B (audio infrastructure in place).
+
+#### Step 1: Integrate an OPL2 emulator
+**Files to modify**: `user/doom/c/`, `kernel/build.rs`
+
+1. Choose an emulator: [Nuked-OPL3](https://github.com/nukeykt/Nuked-OPL3) (most accurate, single `.c`+`.h`) or the lighter dbopl from DOSBox.
+2. Add the source to `user/doom/c/opl/` (or inline in the C bridge).
+3. Wire register-write calls: DoomGeneric calls `OPL_WritePort(0x388, value)` and `OPL_WritePort(0x389, value)`; route these to the OPL2 emulator's `OPL3_WriteRegBuffered` / `OPL2_WriteReg`.
+4. In the audio tick, call `OPL3_GenerateStream(opl, buf, frames)` to produce PCM output at 44 100 Hz and mix it into the existing PCM pipeline instead of the waveform synth.
+
+#### Step 2: Update `doomgeneric_audio_stub.c`
+**Files to modify**: `user/doom/c/doomgeneric_audio_stub.c`
+
+1. Remove `ARR_MUSIC_VOICES` FM synth path.
+2. Allocate OPL2 state (`opl3_chip`) from the kernel-provided heap (`g_heap`).
+3. Redirect `I_OPL_InitMusic` / `I_OPL_WriteRegister` / `I_OPL_ShutdownMusic` to the emulator.
+4. In `mix_and_submit_audio_slice`: call `OPL3_GenerateStream` and mix OPL output at volume `music_volume / 15`.
+
+#### Testing
+1. `doom play` → music sounds like original DOS Doom (E1M1 "At Doom's Gate", etc.).
+2. SFX still work (PCM path unchanged).
+3. No performance regression (OPL2 emulation is fast enough at 44 100 Hz).
+
+---
+
+### M32: Doom 100% in Userland
+
+**Status**: Not started
+**Goal**: Remove Doom engine from the kernel entirely; `/bin/doom` becomes a self-contained ring-3 ELF that uses syscalls for video, audio, and input — like any other userland binary.
+
+**Background**: Today `/bin/doom` is a thin shell calling `SYS_DOOM_LAUNCH=55` which runs the Doom C engine in ring-0 kernel space. `kernel/src/doom.rs`, `kernel/src/doom_bridge.rs`, and all C code in `user/doom/c/` + `user/doom/third_party/` are compiled *into the kernel binary*. This adds ~12 MB to the kernel text/data and the 16 MiB runtime heap from the kernel heap pool.
+
+**Dependencies**: M21 (mmap — needed for shared framebuffer or large anonymous mapping), M25 (ANSI terminal — nice to have), M26 (environment variables — `DOOMWADDIR`).
+
+#### Step 1: New syscalls `video_blit` and `audio_write`
+**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`, `kernel/src/gfx/mod.rs`, `kernel/src/audio.rs`
+
+1. `SYS_VIDEO_BLIT = 56 (ptr: *const u32, w: u32, h: u32) -> isize`: kernel copies the user-provided RGBX pixel buffer into the Doom compositor viewport (`gfx::set_doom_view`). Cap at 320×200 (Doom native); no scaling in syscall.
+2. `SYS_AUDIO_WRITE = 57 (ptr: *const i16, frames: u32) -> isize`: kernel enqueues up to 4096 stereo PCM frames into the virtio-snd audio queue (`audio::submit_pcm_i16`).
+3. Both syscalls validate the user pointer via `copy_from_user_bytes` (physical page walk), requiring no `mmap` of the framebuffer itself.
+
+#### Step 2: Move C compilation to userland build
+**Files to modify**: `user/doom/build.rs`, `kernel/build.rs`
+
+1. Remove all Doom C compilation from `kernel/build.rs` (`doomgeneric_audio_stub.c`, `doomgeneric_arrost.c`, `doomgeneric_runner.c`, `freestanding_libc.c`, `third_party/`).
+2. Add them to `user/doom/build.rs`, compiling for the userland target (bare-metal but targeting user ABI).
+3. Replace Rust→C callbacks (`arr_dg_wad_ptr`, `arr_dg_audio_pcm16`, etc.) with userland syscall wrappers in `user/doom/c/doomgeneric_arrost.c`:
+   - `DG_DrawFrame(pixels)` → `syscall(SYS_VIDEO_BLIT, pixels, 320, 200)`
+   - `DG_SubmitAudio(pcm, n)` → `syscall(SYS_AUDIO_WRITE, pcm, n)`
+   - `DG_GetKey()` → `syscall(SYS_READ, STDIN_FD, &key, 1)` (or new SYS_INPUT_READ)
+   - WAD path: `open("/usr/share/doom/doom1.wad", O_RDONLY)` → `mmap` or sequential `read`
+
+#### Step 3: Remove kernel Doom engine
+**Files to remove**: `kernel/src/doom.rs`, `kernel/src/doom_bridge.rs`
+**Files to modify**: `kernel/src/main.rs`, `kernel/src/shell.rs`, `crates/arrostd/src/lib.rs`
+
+1. Remove `SYS_DOOM_LAUNCH = 55` from ABI.
+2. Remove `doom::play`, `doom::stop`, `doom::tick`, `doom_bridge::*` from kernel.
+3. Shell `doom` command now just calls `try_launch_shell_vfs_user_bin("/bin/doom", ...)`.
+4. Remove `doom_window_open` / `doom_view` from compositor; use the new `SYS_VIDEO_BLIT` path instead.
+
+#### Benefits
+- Kernel binary ~12 MB smaller.
+- Doom crashes no longer affect kernel stability.
+- Doom can be killed with `kill <pid>` like any other process.
+- Foundation for running other C games or applications in userland.
+
+#### Testing
+```
+doom              # runs /bin/doom as a ring-3 ELF, no kernel Doom engine
+ls /proc/<pid>/   # Doom appears as a normal process
+kill <doom_pid>   # terminates cleanly
+cargo xtask smoke-doom --arch x86_64   # still passes
+```
+
+---
+
 ## Priority Order
 
 | Priority | Milestone | Rationale |
@@ -726,9 +814,10 @@ ls /usr/share/doom/doom1.wad  # WAD present
 | 8 | **M28**: RTC + Wall-Clock Time | Timestamps |
 | 9 | **M29**: Block Cache | Performance improvement |
 | 10 | **M30**: Multi-User + Login | Security model |
-| 11 | **M31**: Doom Enhancements | Fun factor |
-| 12 | **M27**: SMP / Multi-Core | Advanced scheduling |
-| 13 | **M18**: Hardware Abstraction | Platform portability |
+| 11 | **M31D**: Doom OPL2 Music | Authentic Doom audio |
+| 12 | **M32**: Doom 100% Userland | Clean kernel / smaller binary / process isolation |
+| 13 | **M27**: SMP / Multi-Core | Advanced scheduling |
+| 14 | **M18**: Hardware Abstraction | Platform portability |
 
 ### Dependency graph
 
@@ -747,6 +836,8 @@ M25 (ANSI) ── standalone
 M28 (RTC) ── standalone
 M29 (cache) ── standalone
 M18 (HAL) ── standalone
-M31 (Doom) ── partially depends on M18 (audio), M22 (user-mode doom)
+M31D (OPL2) ── standalone (replaces waveform synth in user/doom/c/)
+M32 (Doom userland) ── depends on M21 (mmap for WAD or large anon mapping)
+                    ── depends on M31D (OPL2 should be moved along with music engine)
 M27 (SMP) ── depends on M13 (done, per-process page tables)
 ```

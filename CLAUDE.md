@@ -279,6 +279,8 @@ Three scheduler tables coexist:
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
 | M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
+| M31D | Doom authentic music (OPL2) | Replace waveform synth with OPL2 emulation (Nuked-OPL3/dbopl) for authentic DOS sound |
+| M32 | Doom 100% userland | `video_blit`+`audio_write` syscalls; move Doom C to user build; remove kernel Doom engine |
 
 ---
 
