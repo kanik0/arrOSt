@@ -61,6 +61,7 @@ fn main() {
     let runner = c_dir.join("doomgeneric_runner.c");
     let platform = c_dir.join("doomgeneric_arrost.c");
     let audio_stub = c_dir.join("doomgeneric_audio_stub.c");
+    let opl2 = c_dir.join("opl/opl2.c");
     let libc_shim = c_dir.join("freestanding_libc.c");
     let shim_include = c_dir.join("freestanding_include");
 
@@ -82,6 +83,7 @@ fn main() {
         build
             .include(&shim_include)
             .include(&include_dir)
+            .include(&c_dir)   /* for opl/opl2.h resolution from audio_stub */
             // DoomGeneric i_video path expects a framebuffer at least 320x200.
             // Using smaller values leads to fb_scaling=0 and black frames.
             .define("DOOMGENERIC_RESX", "320")
@@ -89,6 +91,7 @@ fn main() {
             .file(&libc_shim)
             .file(&runner)
             .file(&audio_stub)
+            .file(&opl2)
             .file(&platform);
         for file in &core_files {
             build.file(file);
@@ -132,6 +135,11 @@ fn main() {
     println!("cargo:rerun-if-changed={}", runner.display());
     println!("cargo:rerun-if-changed={}", platform.display());
     println!("cargo:rerun-if-changed={}", audio_stub.display());
+    println!("cargo:rerun-if-changed={}", opl2.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        c_dir.join("opl/opl2.h").display()
+    );
     println!("cargo:rerun-if-changed={}", libc_shim.display());
     println!("cargo:rerun-if-changed={}", core_source.display());
     println!("cargo:rerun-if-changed={}", makefile_soso.display());

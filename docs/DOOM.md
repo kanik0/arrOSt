@@ -183,7 +183,7 @@ Key indicators in status output:
 
 ## Known limitations
 
-- Music fidelity is functional but not yet equivalent to original Doom OPL/MIDI rendering.
+- Music uses a self-contained OPL2 FM emulator with GENMIDI patches (M31D); fidelity is close to original DOS Doom but not cycle-accurate (no vibrato LFO, simplified KSL).
 - Doom currently runs through kernel-integrated bridge flow, not isolated user-mode execution.
 - Runtime polish is ongoing for full gameplay responsiveness and broader device coverage.
 
@@ -224,5 +224,7 @@ Key indicators in status output:
 - `user/doom/c/doomgeneric_runner.c`
 - `user/doom/c/doomgeneric_arrost.c`
 - `user/doom/c/doomgeneric_audio_stub.c`
+- `user/doom/c/opl/opl2.h`
+- `user/doom/c/opl/opl2.c`
 - `user/doom/c/freestanding_libc.c`
 - `xtask/src/main.rs`
