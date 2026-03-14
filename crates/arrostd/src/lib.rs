@@ -468,9 +468,9 @@ pub mod runtime {
     use crate::syscall::{
         FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_DOOM_LAUNCH, SYS_EXECVE, SYS_EXIT,
         SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID,
-        SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_OPEN, SYS_PIPE,
-        SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK, SYS_UNLINK,
-        SYS_WRITE,
+        SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
+        SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK,
+        SYS_UNLINK, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -915,6 +915,18 @@ pub mod runtime {
     /// Returns the mapped address (as isize) or negative errno.
     pub fn mmap_anon(addr: u64, len: u64, prot: u32, flags: u32) -> isize {
         syscall4(SYS_MMAP, addr, len, prot as u64, flags as u64)
+    }
+
+    /// Unmap a virtual address range. Returns 0 on success or negative errno.
+    pub fn munmap(addr: u64, len: u64) -> isize {
+        syscall2(SYS_MUNMAP, addr, len)
+    }
+
+    /// Change permissions on a virtual address range.
+    /// `prot` is a combination of PROT_READ | PROT_WRITE | PROT_EXEC.
+    /// Returns 0 on success or negative errno.
+    pub fn mprotect(addr: u64, len: u64, prot: u32) -> isize {
+        syscall3(SYS_MPROTECT, addr, len, prot as u64)
     }
 
     /// `brk(addr)` — returns new program break or negative errno.

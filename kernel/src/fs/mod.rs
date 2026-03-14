@@ -519,6 +519,7 @@ impl FsState {
             ProcOpenFile::PidStatus { pid } => self.render_proc_pid_status_text(pid),
             ProcOpenFile::PidCmdline { pid } => self.render_proc_pid_cmdline_text(pid),
             ProcOpenFile::PidStat { pid } => self.render_proc_pid_stat_text(pid),
+            ProcOpenFile::PidMaps { pid } => self.render_proc_pid_maps_text(pid),
             _ => Err(FsError::InvalidPath),
         }
     }
@@ -538,6 +539,7 @@ impl FsState {
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
+                | ProcOpenFile::PidMaps { .. }
         );
         if is_generated {
             let len = self.proc_generated_text(file)?.len();
@@ -571,6 +573,7 @@ impl FsState {
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
+                | ProcOpenFile::PidMaps { .. }
         );
         if is_generated {
             let text = self.proc_generated_text(file)?;
@@ -869,6 +872,40 @@ impl FsState {
             "{} ({}) {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
             snap.pid, snap.name, state_char, snap.parent_pid,
         );
+        Ok(text)
+    }
+
+    fn render_proc_pid_maps_text(&self, pid: u32) -> Result<String, FsError> {
+        let mut snaps = [proc::VmaSnapshot::empty(); proc::MAX_VMA_SNAPSHOTS];
+        let count = proc::vma_snapshot_for_pid(pid, &mut snaps);
+        if count == 0 {
+            // No VMAs found — process may not exist or have no mappings.
+            return Ok(String::new());
+        }
+        let mut text = String::new();
+        for snap in snaps.iter().take(count) {
+            let r = if snap.flags & crate::mem::vma::VmaFlags::READ != 0 {
+                'r'
+            } else {
+                '-'
+            };
+            let w = if snap.flags & crate::mem::vma::VmaFlags::WRITE != 0 {
+                'w'
+            } else {
+                '-'
+            };
+            let x = if snap.flags & crate::mem::vma::VmaFlags::EXEC != 0 {
+                'x'
+            } else {
+                '-'
+            };
+            // 'p' for private mapping (all ArrOSt mappings are private).
+            let _ = writeln!(
+                text,
+                "{:016x}-{:016x} {}{}{}p 00000000 00:00 0",
+                snap.start, snap.end, r, w, x,
+            );
+        }
         Ok(text)
     }
 

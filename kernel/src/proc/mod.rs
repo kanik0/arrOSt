@@ -213,6 +213,27 @@ impl ProcessSnapshot {
     }
 }
 
+/// A snapshot of a single VMA entry for /proc/<pid>/maps output.
+#[derive(Clone, Copy)]
+pub struct VmaSnapshot {
+    pub start: u64,
+    pub end: u64,
+    /// VmaFlags bits (READ=1, WRITE=2, EXEC=4, COW=8, ANON=16).
+    pub flags: u8,
+}
+
+impl VmaSnapshot {
+    pub const fn empty() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            flags: 0,
+        }
+    }
+}
+
+pub const MAX_VMA_SNAPSHOTS: usize = crate::mem::vma::MAX_VMAS;
+
 #[derive(Clone, Copy)]
 pub struct FsIdentity {
     pub uid: u16,
@@ -1826,7 +1847,11 @@ impl Scheduler {
                 // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
                 self.syscall_mmap_ring3(arg1, arg2, arg3)
             }
-            SYS_MUNMAP | SYS_MPROTECT => errno::ENOSYS,
+            SYS_MUNMAP => self.syscall_munmap_ring3(arg0, arg1),
+            SYS_MPROTECT => {
+                // arg0=addr, arg1=len, arg2=prot
+                self.syscall_mprotect_ring3(arg0, arg1, arg2)
+            }
             SYS_BRK => {
                 // arg0 = new brk address (0 = query)
                 self.syscall_brk_ring3(arg0)
@@ -1938,7 +1963,14 @@ impl Scheduler {
         let new_brk = (addr.saturating_add(0xFFF)) & !0xFFF_u64;
         let old_brk = ctx_ref.brk_end;
         if new_brk <= old_brk {
-            return old_brk as isize; // shrink not implemented for M13
+            if new_brk < old_brk {
+                // Shrink: munmap pages between new_brk and old_brk.
+                self.syscall_munmap_ring3(new_brk, old_brk.saturating_sub(new_brk));
+                // Update brk_end after shrink.
+                let ctx_ref = &mut self.ring3_context.process;
+                ctx_ref.brk_end = new_brk;
+            }
+            return self.ring3_context.process.brk_end as isize;
         }
         let additional_len = new_brk.saturating_sub(old_brk);
         if ctx_ref.vma_count < MAX_VMAS {
@@ -1949,6 +1981,145 @@ impl Scheduler {
         }
         ctx_ref.brk_end = new_brk;
         new_brk as isize
+    }
+
+    /// SYS_MUNMAP: unmap a virtual address range.
+    fn syscall_munmap_ring3(&mut self, addr: u64, len: u64) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let page_start = addr & !0xFFF_u64;
+        let aligned_len = (len.saturating_add(0xFFF)) & !0xFFF_u64;
+        let end = page_start.saturating_add(aligned_len);
+
+        let Some(slot) = self.ring3_active_slot else {
+            return errno::ESRCH;
+        };
+        let img_ptr = match self.ring3_tasks[slot].as_ref() {
+            Some(task) if !task.image_ptr.is_null() => task.image_ptr,
+            _ => return errno::ESRCH,
+        };
+        let token = self.ring3_context.process.address_space;
+
+        // Rebuild VMA list excluding (or splitting) entries that overlap [page_start, end).
+        let ctx = &mut self.ring3_context.process;
+        let old_list = ctx.vma_list;
+        let old_count = ctx.vma_count;
+        let mut new_list = [None; MAX_VMAS];
+        let mut new_count = 0usize;
+
+        for vma_opt in old_list.iter().take(old_count) {
+            let Some(vma) = *vma_opt else {
+                continue;
+            };
+            let vma_end = vma.start.saturating_add(vma.len);
+            if vma.start >= end || vma_end <= page_start {
+                // No overlap — keep as-is.
+                if new_count < MAX_VMAS {
+                    new_list[new_count] = Some(vma);
+                    new_count += 1;
+                }
+            } else {
+                // Partial or full overlap — keep the non-overlapping tails.
+                if vma.start < page_start && new_count < MAX_VMAS {
+                    new_list[new_count] = Some(VmaEntry::new(
+                        vma.start,
+                        page_start.saturating_sub(vma.start),
+                        vma.flags,
+                    ));
+                    new_count += 1;
+                }
+                if vma_end > end && new_count < MAX_VMAS {
+                    new_list[new_count] =
+                        Some(VmaEntry::new(end, vma_end.saturating_sub(end), vma.flags));
+                    new_count += 1;
+                }
+            }
+        }
+        ctx.vma_list = new_list;
+        ctx.vma_count = new_count;
+
+        // Unmap and drop any demand-paged pages that fall within the range.
+        // SAFETY: img_ptr is valid while the task is in ring3_tasks.
+        let image = unsafe { &mut *img_ptr };
+        let mut i = 0;
+        while i < image._owned_user_pages.len() {
+            let vaddr = image._owned_user_pages[i].vaddr;
+            if vaddr >= page_start && vaddr < end {
+                ring3_groundwork::unmap_user_page_for_token(token, vaddr);
+                image._owned_user_pages.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        0
+    }
+
+    /// SYS_MPROTECT: change permissions on a virtual address range.
+    fn syscall_mprotect_ring3(&mut self, addr: u64, len: u64, prot: u64) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let page_start = addr & !0xFFF_u64;
+        let aligned_len = (len.saturating_add(0xFFF)) & !0xFFF_u64;
+        let end = page_start.saturating_add(aligned_len);
+        let writable = prot & u64::from(PROT_WRITE) != 0;
+        let executable = prot & u64::from(PROT_EXEC) != 0;
+
+        let Some(slot) = self.ring3_active_slot else {
+            return errno::ESRCH;
+        };
+        let img_ptr = match self.ring3_tasks[slot].as_ref() {
+            Some(task) if !task.image_ptr.is_null() => task.image_ptr,
+            _ => return errno::ESRCH,
+        };
+        let token = self.ring3_context.process.address_space;
+
+        // Update VMA flags for overlapping entries.
+        let ctx = &mut self.ring3_context.process;
+        let mut found = false;
+        for i in 0..ctx.vma_count {
+            if let Some(ref mut vma) = ctx.vma_list[i] {
+                let vma_end = vma.start.saturating_add(vma.len);
+                if vma.start < end && vma_end > page_start {
+                    found = true;
+                    let mut f = vma.flags.0;
+                    if writable {
+                        f |= VmaFlags::WRITE;
+                    } else {
+                        f &= !VmaFlags::WRITE;
+                    }
+                    if executable {
+                        f |= VmaFlags::EXEC;
+                    } else {
+                        f &= !VmaFlags::EXEC;
+                    }
+                    // Making writable directly clears any pending CoW obligation.
+                    if writable {
+                        f &= !VmaFlags::COW;
+                    }
+                    vma.flags = VmaFlags(f);
+                }
+            }
+        }
+        if !found {
+            return errno::EINVAL;
+        }
+
+        // Update PTEs for already-mapped pages in the range.
+        // SAFETY: img_ptr is valid while the task is in ring3_tasks.
+        let image = unsafe { &*img_ptr };
+        for holder in &image._owned_user_pages {
+            if holder.vaddr >= page_start && holder.vaddr < end {
+                ring3_groundwork::update_page_perms_for_token(
+                    token,
+                    holder.vaddr,
+                    writable,
+                    executable,
+                );
+            }
+        }
+        0
     }
 
     /// SYS_FORK: create a child process with CoW-shared address space.
@@ -4837,6 +5008,38 @@ impl Scheduler {
         written
     }
 
+    fn vma_snapshot_for_pid_inner(&self, pid: u32, out: &mut [VmaSnapshot]) -> usize {
+        // Find the process context for this pid (active or in task list).
+        let ctx_opt: Option<&Ring3ProcessContext> =
+            if self.ring3_context.active && self.ring3_context.process.pid == pid {
+                Some(&self.ring3_context.process)
+            } else {
+                self.ring3_tasks
+                    .iter()
+                    .flatten()
+                    .find(|t| t.pid == pid)
+                    .map(|t| &t.process)
+            };
+        let Some(ctx) = ctx_opt else {
+            return 0;
+        };
+        let mut written = 0usize;
+        for i in 0..ctx.vma_count {
+            if written >= out.len() {
+                break;
+            }
+            if let Some(vma) = ctx.vma_list[i] {
+                out[written] = VmaSnapshot {
+                    start: vma.start,
+                    end: vma.start.saturating_add(vma.len),
+                    flags: vma.flags.0,
+                };
+                written += 1;
+            }
+        }
+        written
+    }
+
     fn fs_identity(&self, current_pid: Option<u32>) -> FsIdentity {
         let Some(pid) = current_pid else {
             return FsIdentity::root();
@@ -6387,6 +6590,15 @@ pub fn snapshot_processes(out: &mut [ProcessSnapshot]) -> usize {
         unsafe { (&*SCHEDULER.0.get()).snapshot_processes(out) }
     } else {
         with_scheduler(|scheduler| scheduler.snapshot_processes(out))
+    }
+}
+
+pub fn vma_snapshot_for_pid(pid: u32, out: &mut [VmaSnapshot]) -> usize {
+    if SCHED_LOCK.is_locked() {
+        // SAFETY: scheduler lock already held on single-core path.
+        unsafe { (&*SCHEDULER.0.get()).vma_snapshot_for_pid_inner(pid, out) }
+    } else {
+        with_scheduler(|s| s.vma_snapshot_for_pid_inner(pid, out))
     }
 }
 
