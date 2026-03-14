@@ -365,9 +365,11 @@ static void genmidi_load_patch(opl2_chip_t *chip,
     /* Feedback / connection (byte between mod and car in DMX format) */
     opl2_write_reg(chip, 0xC0u + (uint8_t)opl_ch, patch[10]);
 
-    /* Base note offset: signed LE int16 at byte 18 */
-    int8_t off = (int8_t)patch[18];
-    int adjusted_note = (int)note + (int)off;
+    /* Base note offset: signed LE int16 at bytes 18-19.
+     * In chocolate-doom: freq_index = 64 + 32*note + base_note_offset
+     * where 32 sub-steps = 1 semitone.  Convert to semitone adjustment. */
+    int16_t bno = (int16_t)((uint16_t)patch[18] | ((uint16_t)patch[19] << 8u));
+    int adjusted_note = (int)note + (int)bno / 32;
     if (adjusted_note < 0)   adjusted_note = 0;
     if (adjusted_note > 127) adjusted_note = 127;
 
