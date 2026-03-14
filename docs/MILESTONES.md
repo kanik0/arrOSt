@@ -31,7 +31,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
 | **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
-| **M31D** | Doom Authentic Music (OPL2) | **Complete** |
+| **M31D** | Doom Authentic Music (OPL2) | **In progress** — OPL2 emulator implemented, music plays but sounds incorrect (quasi-monotone, wrong timbres) |
 | **M32** | Doom 100% in Userland | Not started |
 
 ---
@@ -716,8 +716,10 @@ ls /usr/share/doom/doom1.wad  # WAD present
 
 ### M31D: Doom Authentic Music via OPL2 Emulation
 
-**Status**: **Complete**
+**Status**: **In progress**
 **Goal**: Replace the custom waveform synthesizer with an OPL2 emulator so Doom music sounds like the original DOS experience using GENMIDI patches.
+
+**Known issue**: Music plays but sounds quasi-monotone — notes do not vary correctly in pitch/timbre. Multiple fixes have been applied (GENMIDI stride 36, base_note_offset int16 LE, Q20 envelope resolution, dB-correct TL, FM modulation depth, voice leak prevention, frequency-preserving key-off) but the root cause has not been fully resolved. Further debugging requires interactive QEMU testing to isolate whether the issue is in the OPL2 synthesis, GENMIDI patch loading, MUS event parsing, or voice allocation.
 
 **Background**: Doom's original music uses the MUS format (MIDI derivative) played through an OPL2 FM synthesis chip (Yamaha YM3812) on Sound Blaster cards.
 The pre-M31D `doomgeneric_audio_stub.c` synthesizer used square/triangle/noise waveforms — functional but tonally inaccurate.
