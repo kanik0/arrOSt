@@ -402,7 +402,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 - **Per-process env storage** (`Ring3ProcessContext`, `kernel/src/proc/mod.rs`):
   - Fixed-size arrays (no heap): `env_vars: [Option<EnvEntry>; MAX_ENV_VARS]`, `env_count: usize`.
-  - `MAX_ENV_VARS=16`, key max 32 bytes, value max 128 bytes.
+  - `MAX_ENV_VARS=8`, key max 32 bytes, value max 64 bytes.
   - `Ring3ProcessContext::seed_default_env()` seeds: `HOME=/home/user`, `PATH=/bin`, `USER=user`, `SHELL=/bin/sh`, `TERM=arrost`.
   - `set_env(key, val)`, `get_env(key)` helper methods.
 - **`fork` inheritance**: child `env_vars`/`env_count` copied from parent.

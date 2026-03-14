@@ -348,9 +348,9 @@ pub struct Ring3SyscallDispatch {
 pub const MAX_CWD_LEN: usize = arrostd::abi::USERLAND_PATH_MAX;
 
 /// M26: per-process environment variable entry.
-const MAX_ENV_VARS: usize = 16;
+const MAX_ENV_VARS: usize = 8;
 const MAX_ENV_KEY_LEN: usize = 32;
-const MAX_ENV_VAL_LEN: usize = 128;
+const MAX_ENV_VAL_LEN: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct EnvEntry {
