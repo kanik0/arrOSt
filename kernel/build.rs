@@ -83,7 +83,7 @@ fn main() {
         build
             .include(&shim_include)
             .include(&include_dir)
-            .include(&c_dir)   /* for opl/opl2.h resolution from audio_stub */
+            .include(&c_dir) /* for opl/opl2.h resolution from audio_stub */
             // DoomGeneric i_video path expects a framebuffer at least 320x200.
             // Using smaller values leads to fb_scaling=0 and black frames.
             .define("DOOMGENERIC_RESX", "320")
