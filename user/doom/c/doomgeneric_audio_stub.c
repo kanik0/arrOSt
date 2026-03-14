@@ -163,7 +163,7 @@ static const uint8_t      *g_genmidi        = NULL;
 static uint16_t g_note_data[128];
 
 /* Scratch buffer for OPL2 PCM output */
-static int16_t g_opl_buf[ARR_AUDIO_SLICE_FRAMES * ARR_AUDIO_OUTPUT_CHANNELS];
+/* g_opl_buf removed: mix_music_slice generates one stereo pair at a time */
 
 /* ------------------------------------------------------------------ */
 /* SFX device / music device lists (unchanged from M31)               */
@@ -722,22 +722,17 @@ static int mix_music_slice(int32_t *mix_buf, uint32_t frames)
     if (g_music_paused || !g_opl) return 0;
     if (!g_music_playing) return 0;
 
-    /* Advance the MUS timeline for this slice */
+    /* Interleave: advance MUS timeline and generate OPL2 audio sample-by-sample.
+     * This ensures register writes (key-on/off, pitch) take effect in the correct
+     * sample rather than at the end of the entire slice (which caused "tick" silence). */
+    int32_t vol_scale = clamp_int((int)g_music_volume, 0, 127);
     uint32_t i;
     for (i = 0u; i < frames; ++i) {
         music_advance_timeline();
-    }
-
-    /* Generate OPL2 PCM for this slice */
-    opl2_generate(g_opl, g_opl_buf, frames);
-
-    /* Mix OPL2 output (stereo) into mix_buf with music volume scaling */
-    int32_t vol_scale = clamp_int((int)g_music_volume, 0, 127);
-    for (i = 0u; i < frames; ++i) {
-        int32_t l = ((int32_t)g_opl_buf[i * 2u]     * vol_scale) / 127;
-        int32_t r = ((int32_t)g_opl_buf[i * 2u + 1u] * vol_scale) / 127;
-        mix_buf[i * 2u]     += l;
-        mix_buf[i * 2u + 1u] += r;
+        int16_t opl_lr[2];
+        opl2_generate(g_opl, opl_lr, 1u);
+        mix_buf[i * 2u]     += ((int32_t)opl_lr[0] * vol_scale) / 127;
+        mix_buf[i * 2u + 1u] += ((int32_t)opl_lr[1] * vol_scale) / 127;
     }
     return 1;
 }

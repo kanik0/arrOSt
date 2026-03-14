@@ -159,18 +159,21 @@ static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate)
     if (rate >= 15u) {
         return 32767;
     }
-    /* samples_to_complete ≈ sample_rate / (2^(rate-1) * 280) */
-    /* simplified: step = 32767 * 280 * 2^(rate-1) / sample_rate */
-    uint32_t sr = (uint32_t)sample_rate;
-    uint32_t num = 32767u * 280u;
+    /* step = 32767 * 280 * 2^(rate-1) / sample_rate
+     * Use 64-bit to avoid overflow: 32767*280*2^13 ~ 75M, fits in uint64. */
+    uint64_t num = (uint64_t)32767u * 280u;
     int shift = (int)rate - 1;
     if (shift > 0) {
         num <<= (uint32_t)shift;
     }
-    if (num / sr == 0u) {
+    uint64_t result = num / (uint64_t)sample_rate;
+    if (result < 1u) {
         return 1;
     }
-    return (int32_t)(num / sr);
+    if (result > 32767u) {
+        return 32767;
+    }
+    return (int32_t)result;
 }
 
 /* Compute all envelope step sizes for one operator after a parameter change. */
