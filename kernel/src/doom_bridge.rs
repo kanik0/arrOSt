@@ -614,18 +614,22 @@ fn with_bridge_mut<R>(f: impl FnOnce(&mut BridgeState) -> R) -> R {
     unsafe { f(&mut *BRIDGE_STATE.0.get()) }
 }
 
-/// Provide the Doom C heap buffer before `doomgeneric_Create` is called.
-/// Defined in `user/doom/c/freestanding_libc.c`.
-unsafe extern "C" {
-    fn arr_dg_heap_init(ptr: *mut u8, cap: usize);
-}
-
+// arr_dg_heap_init, arr_doomgeneric_create/tick/frame_counter:
+// When the DoomGeneric bridge C objects are linked in, import the real symbols.
+// When they are absent (clippy / non-doom builds), provide no-op stubs so the
+// kernel still compiles and links.
 #[cfg(arrost_doomgeneric_bridge)]
 unsafe extern "C" {
+    // Defined in user/doom/c/freestanding_libc.c — sets up the C bump-allocator heap.
+    fn arr_dg_heap_init(ptr: *mut u8, cap: usize);
     fn arr_doomgeneric_create();
     fn arr_doomgeneric_tick();
     fn arr_doomgeneric_frame_counter() -> u32;
 }
+
+#[cfg(not(arrost_doomgeneric_bridge))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arr_dg_heap_init(_ptr: *mut u8, _cap: usize) {}
 
 #[cfg(not(arrost_doomgeneric_bridge))]
 #[unsafe(no_mangle)]
@@ -640,9 +644,3 @@ unsafe extern "C" fn arr_doomgeneric_tick() {}
 unsafe extern "C" fn arr_doomgeneric_frame_counter() -> u32 {
     0
 }
-
-/// No-op stub used when DoomGeneric bridge is absent.  The real implementation
-/// lives in `freestanding_libc.c` and is linked in when `arrost_doomgeneric_bridge` is set.
-#[cfg(not(arrost_doomgeneric_bridge))]
-#[unsafe(no_mangle)]
-unsafe extern "C" fn arr_dg_heap_init(_ptr: *mut u8, _cap: usize) {}
