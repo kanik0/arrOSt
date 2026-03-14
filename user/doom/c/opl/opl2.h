@@ -41,11 +41,11 @@ typedef struct {
 
     /* Runtime synthesis state */
     uint8_t  env_state; /* OPL2_ENV_* */
-    int32_t  env_level; /* Q15: 32767 = maximum amplitude, 0 = silent */
+    int32_t  env_level; /* 0..ENV_MAX (1<<20), higher = louder */
     int32_t  atk_step;  /* per-sample envelope increment (attack) */
     int32_t  dec_step;  /* per-sample envelope decrement (decay) */
     int32_t  rel_step;  /* per-sample envelope decrement (release) */
-    int32_t  sus_level; /* sustain threshold in Q15 */
+    int32_t  sus_level; /* sustain threshold (same scale as env_level) */
     uint32_t phase_fp;  /* 32-bit phase: bits 31-22 = table index (0-1023) */
     uint32_t phase_step;/* phase increment per output sample */
     int32_t  last_out;  /* last output for carrier feedback path */
