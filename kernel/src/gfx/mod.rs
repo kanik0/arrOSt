@@ -69,6 +69,10 @@ const CLOSE_BUTTON_W: usize = 16;
 const CLOSE_BUTTON_H: usize = 16;
 const TERMINAL_LINE_MAX: usize = 96;
 const TERMINAL_BASE_TTY: u32 = 1;
+// M26: terminal environment variable storage limits.
+const TERM_MAX_ENV_VARS: usize = 32;
+const TERM_ENV_KEY_MAX: usize = 32;
+const TERM_ENV_VAL_MAX: usize = 256;
 const FILE_MANAGER_LIST_LINES: usize = 5;
 const FILE_MANAGER_PREVIEW_BYTES: usize = 180;
 const EXTERNAL_EXIT_SIGNAL_BASE: i32 = 128;
@@ -320,6 +324,22 @@ enum UiAction {
     Shutdown,
 }
 
+// M26: per-entry storage for one terminal environment variable.
+#[derive(Clone, Copy)]
+struct TermEnvEntry {
+    key: [u8; TERM_ENV_KEY_MAX],
+    key_len: usize,
+    val: [u8; TERM_ENV_VAL_MAX],
+    val_len: usize,
+}
+
+const EMPTY_TERM_ENV_ENTRY: TermEnvEntry = TermEnvEntry {
+    key: [0; TERM_ENV_KEY_MAX],
+    key_len: 0,
+    val: [0; TERM_ENV_VAL_MAX],
+    val_len: 0,
+};
+
 #[derive(Clone, Copy)]
 struct TerminalProcess {
     pid: u32,
@@ -329,6 +349,9 @@ struct TerminalProcess {
     cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
     cwd_len: usize,
     history_nav: shell::HistoryBrowseState,
+    // M26: terminal environment variables.
+    env_vars: [Option<TermEnvEntry>; TERM_MAX_ENV_VARS],
+    env_count: usize,
 }
 
 impl TerminalProcess {
@@ -337,7 +360,7 @@ impl TerminalProcess {
         let default_cwd = shell::default_working_directory().as_bytes();
         let cwd_len = default_cwd.len().min(fs::MAX_OPEN_PATH_BYTES);
         cwd[..cwd_len].copy_from_slice(&default_cwd[..cwd_len]);
-        Self {
+        let mut process = Self {
             pid,
             tty,
             line: [0; TERMINAL_LINE_MAX],
@@ -345,7 +368,11 @@ impl TerminalProcess {
             cwd,
             cwd_len,
             history_nav: shell::HistoryBrowseState::new(),
-        }
+            env_vars: [None; TERM_MAX_ENV_VARS],
+            env_count: 0,
+        };
+        process.seed_default_env(); // M26
+        process
     }
 
     fn clear_line(&mut self) {
@@ -368,6 +395,92 @@ impl TerminalProcess {
     fn resolve_path(&self, path: &str) -> Result<String, fs::FsError> {
         fs::resolve_path_from(self.cwd(), path)
     }
+
+    // M26: look up an environment variable by name.
+    fn get_env(&self, key: &str) -> Option<&str> {
+        let key_bytes = key.as_bytes();
+        for slot in &self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                return core::str::from_utf8(&entry.val[..entry.val_len]).ok();
+            }
+        }
+        None
+    }
+
+    // M26: set (or insert) an environment variable. Returns false if too long or table full.
+    fn set_env(&mut self, key: &str, val: &str) -> bool {
+        let key_bytes = key.as_bytes();
+        let val_bytes = val.as_bytes();
+        if key_bytes.len() > TERM_ENV_KEY_MAX || val_bytes.len() > TERM_ENV_VAL_MAX {
+            return false;
+        }
+        for slot in &mut self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+                entry.val[val_bytes.len()..].fill(0);
+                entry.val_len = val_bytes.len();
+                return true;
+            }
+        }
+        if self.env_count >= TERM_MAX_ENV_VARS {
+            return false;
+        }
+        let mut entry = EMPTY_TERM_ENV_ENTRY;
+        entry.key[..key_bytes.len()].copy_from_slice(key_bytes);
+        entry.key_len = key_bytes.len();
+        entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+        entry.val_len = val_bytes.len();
+        self.env_vars[self.env_count] = Some(entry);
+        self.env_count += 1;
+        true
+    }
+
+    // M26: seed well-known default variables.
+    fn seed_default_env(&mut self) {
+        self.set_env("HOME", "/home/user");
+        self.set_env("PATH", "/bin");
+        self.set_env("USER", "user");
+        self.set_env("SHELL", "/bin/sh");
+        self.set_env("TERM", "arrost");
+    }
+
+    // M26: expand $VAR references in `input` into `out_buf`. Returns the expanded str.
+    fn expand_vars<'a>(&self, input: &'a str, out_buf: &'a mut [u8; TERMINAL_LINE_MAX]) -> &'a str {
+        let mut out_len = 0usize;
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && out_len < TERMINAL_LINE_MAX {
+            if bytes[i] == b'$' && i + 1 < bytes.len() {
+                let name_start = i + 1;
+                let mut name_end = name_start;
+                while name_end < bytes.len()
+                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+                {
+                    name_end += 1;
+                }
+                if name_end > name_start
+                    && let Ok(name) = core::str::from_utf8(&bytes[name_start..name_end])
+                {
+                    if let Some(val) = self.get_env(name) {
+                        for &b in val.as_bytes() {
+                            if out_len < TERMINAL_LINE_MAX {
+                                out_buf[out_len] = b;
+                                out_len += 1;
+                            }
+                        }
+                    }
+                    i = name_end;
+                    continue;
+                }
+            }
+            out_buf[out_len] = bytes[i];
+            out_len += 1;
+            i += 1;
+        }
+        core::str::from_utf8(&out_buf[..out_len]).unwrap_or(input)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -386,6 +499,12 @@ struct UiWindow {
     rows: usize,
     cursor_row: usize,
     cursor_col: usize,
+    // M25: ANSI color state per cell and current SGR state.
+    fg_lines: [[u8; WINDOW_MAX_COLS]; WINDOW_MAX_ROWS],
+    bg_lines: [[u8; WINDOW_MAX_COLS]; WINDOW_MAX_ROWS],
+    current_fg: u8, // ANSI 4-bit color index (default 7 = white)
+    current_bg: u8, // ANSI 4-bit color index (default 0 = black)
+    ansi: crate::console::ansi::AnsiParser,
 }
 
 #[derive(Clone, Copy)]
@@ -433,6 +552,11 @@ impl UiWindow {
             rows,
             cursor_row: 0,
             cursor_col: 0,
+            fg_lines: [[7u8; WINDOW_MAX_COLS]; WINDOW_MAX_ROWS],
+            bg_lines: [[0u8; WINDOW_MAX_COLS]; WINDOW_MAX_ROWS],
+            current_fg: 7,
+            current_bg: 0,
+            ansi: crate::console::ansi::AnsiParser::new(),
         }
     }
 
@@ -480,6 +604,75 @@ impl UiWindow {
     }
 
     fn append_byte_with_change(&mut self, byte: u8) -> TextChange {
+        use crate::console::ansi::AnsiEvent;
+        match self.ansi.feed(byte) {
+            None => TextChange::None,
+            Some(AnsiEvent::Literal(b)) => self.append_raw_byte(b),
+            Some(AnsiEvent::CursorUp(n)) => {
+                self.cursor_row = self.cursor_row.saturating_sub(n as usize);
+                TextChange::None
+            }
+            Some(AnsiEvent::CursorDown(n)) => {
+                self.cursor_row = (self.cursor_row + n as usize).min(self.rows.saturating_sub(1));
+                TextChange::None
+            }
+            Some(AnsiEvent::CursorLeft(n)) => {
+                self.cursor_col = self.cursor_col.saturating_sub(n as usize);
+                TextChange::None
+            }
+            Some(AnsiEvent::CursorRight(n)) => {
+                self.cursor_col = (self.cursor_col + n as usize).min(self.cols.saturating_sub(1));
+                TextChange::None
+            }
+            Some(AnsiEvent::CursorPos { row, col }) => {
+                self.cursor_row = (row as usize).min(self.rows.saturating_sub(1));
+                self.cursor_col = (col as usize).min(self.cols.saturating_sub(1));
+                TextChange::None
+            }
+            Some(AnsiEvent::ClearScreen) => {
+                for r in 0..self.rows {
+                    self.lines[r] = [0; WINDOW_MAX_COLS];
+                    self.fg_lines[r] = [7; WINDOW_MAX_COLS];
+                    self.bg_lines[r] = [0; WINDOW_MAX_COLS];
+                    self.line_len[r] = 0;
+                }
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+                TextChange::FullText
+            }
+            Some(AnsiEvent::ClearScreenToEnd) => {
+                for r in self.cursor_row..self.rows {
+                    self.lines[r] = [0; WINDOW_MAX_COLS];
+                    self.fg_lines[r] = [7; WINDOW_MAX_COLS];
+                    self.bg_lines[r] = [0; WINDOW_MAX_COLS];
+                    self.line_len[r] = 0;
+                }
+                TextChange::FullText
+            }
+            Some(AnsiEvent::ClearLine) => {
+                let r = self.cursor_row;
+                for c in self.cursor_col..self.cols {
+                    self.lines[r][c] = 0;
+                    self.fg_lines[r][c] = 7;
+                    self.bg_lines[r][c] = 0;
+                }
+                self.line_len[r] = self.cursor_col;
+                TextChange::FullText
+            }
+            Some(AnsiEvent::Sgr(params)) => {
+                params.apply(
+                    &mut self.current_fg,
+                    &mut self.current_bg,
+                    &mut false, // bold (ignored for now — we don't have a bold font)
+                    &mut false, // underline (ignored for now)
+                );
+                TextChange::None
+            }
+            Some(AnsiEvent::Ignore) => TextChange::None,
+        }
+    }
+
+    fn append_raw_byte(&mut self, byte: u8) -> TextChange {
         match byte {
             b'\r' => TextChange::None,
             b'\n' => {
@@ -495,10 +688,11 @@ impl UiWindow {
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
                     self.lines[self.cursor_row][self.cursor_col] = 0;
+                    self.fg_lines[self.cursor_row][self.cursor_col] = 7;
+                    self.bg_lines[self.cursor_row][self.cursor_col] = 0;
                     self.line_len[self.cursor_row] = self.cursor_col;
                     return TextChange::Cell;
                 }
-
                 if self.cursor_row > 0 {
                     self.cursor_row -= 1;
                     self.cursor_col = self.line_len[self.cursor_row].min(self.cols);
@@ -517,12 +711,12 @@ impl UiWindow {
                     self.cursor_col = 0;
                     scrolled = true;
                 }
-
                 self.lines[self.cursor_row][self.cursor_col] = byte;
+                self.fg_lines[self.cursor_row][self.cursor_col] = self.current_fg;
+                self.bg_lines[self.cursor_row][self.cursor_col] = self.current_bg;
                 self.cursor_col += 1;
                 self.line_len[self.cursor_row] =
                     self.line_len[self.cursor_row].max(self.cursor_col);
-
                 if scrolled {
                     TextChange::FullText
                 } else {
@@ -546,9 +740,13 @@ impl UiWindow {
         for row in 1..self.rows {
             self.lines[row - 1] = self.lines[row];
             self.line_len[row - 1] = self.line_len[row];
+            self.fg_lines[row - 1] = self.fg_lines[row];
+            self.bg_lines[row - 1] = self.bg_lines[row];
         }
         self.lines[self.rows - 1] = [0; WINDOW_MAX_COLS];
         self.line_len[self.rows - 1] = 0;
+        self.fg_lines[self.rows - 1] = [7; WINDOW_MAX_COLS];
+        self.bg_lines[self.rows - 1] = [0; WINDOW_MAX_COLS];
     }
 
     const fn visible_cols(&self) -> usize {
@@ -2132,6 +2330,20 @@ impl GfxState {
             return true;
         }
         shell::record_command_in_history(command);
+        // M26: expand $VAR references in the command.
+        let mut expanded_buf = [0u8; TERMINAL_LINE_MAX];
+        let expanded_owned: String;
+        let command = if let Some(process) = self.terminal_process_for_window(index) {
+            let expanded = process.expand_vars(command, &mut expanded_buf);
+            if expanded != command {
+                expanded_owned = String::from(expanded);
+                expanded_owned.as_str()
+            } else {
+                command
+            }
+        } else {
+            command
+        };
         let normalized_command = normalize_terminal_bin_command(command);
         let command = normalized_command.as_str();
         if is_missing_terminal_bin_command(command) {
@@ -2234,6 +2446,55 @@ impl GfxState {
                     let mut line = String::new();
                     let _ = writeln!(line, "cd: {} ({})", path, err.as_str());
                     self.push_terminal_text(index, &line);
+                }
+            }
+            return true;
+        }
+
+        // M26: env command — list all terminal environment variables.
+        if command == "env" {
+            if let Some(process) = self.terminal_process_for_window(index).copied() {
+                let mut out = String::new();
+                for slot in &process.env_vars[..process.env_count] {
+                    let Some(entry) = slot else { continue };
+                    let key = core::str::from_utf8(&entry.key[..entry.key_len]).unwrap_or("?");
+                    let val = core::str::from_utf8(&entry.val[..entry.val_len]).unwrap_or("?");
+                    let _ = writeln!(out, "{}={}", key, val);
+                }
+                self.push_terminal_text(index, &out);
+            }
+            return true;
+        }
+
+        // M26: export command — set or display a terminal environment variable.
+        if command == "export" {
+            self.push_terminal_text(index, "usage: export VAR=value\n");
+            return true;
+        }
+        if let Some(rest) = command.strip_prefix("export ") {
+            let rest = rest.trim();
+            if let Some(eq_pos) = rest.find('=') {
+                let key = rest[..eq_pos].trim();
+                let val = &rest[eq_pos + 1..];
+                if key.is_empty() {
+                    self.push_terminal_text(index, "usage: export VAR=value\n");
+                } else if let Some(process) = self.terminal_process_for_window_mut(index) {
+                    process.set_env(key, val);
+                }
+            } else if rest.is_empty() {
+                self.push_terminal_text(index, "usage: export VAR=value\n");
+            } else {
+                // export VAR (no value — display current value if set)
+                if let Some(process) = self.terminal_process_for_window(index).copied() {
+                    if let Some(val) = process.get_env(rest) {
+                        let mut line = String::new();
+                        let _ = writeln!(line, "declare -x {}={}", rest, val);
+                        self.push_terminal_text(index, &line);
+                    } else {
+                        let mut line = String::new();
+                        let _ = writeln!(line, "export: {}: not set", rest);
+                        self.push_terminal_text(index, &line);
+                    }
                 }
             }
             return true;
@@ -5174,12 +5435,18 @@ impl GfxState {
                 let draw_end = min(len, col_end);
                 for col in col_start..draw_end {
                     let draw_x = origin_x.saturating_add(col.saturating_mul(CONTENT_CHAR_W));
+                    let fg_idx = window.fg_lines[row][col] as usize;
+                    let bg_idx = window.bg_lines[row][col] as usize;
+                    let (fr, fg, fb) = crate::console::ansi::ANSI_PALETTE[fg_idx.min(15)];
+                    let (br, bgg, bb) = crate::console::ansi::ANSI_PALETTE[bg_idx.min(15)];
+                    let fg_color = Color::rgb(fr, fg, fb);
+                    let bg_color = Color::rgb(br, bgg, bb);
                     self.draw_content_char(
                         draw_x,
                         draw_y,
                         window.lines[row][col],
-                        text,
-                        Some(body),
+                        fg_color,
+                        Some(bg_color),
                     );
                 }
             }

@@ -46,6 +46,10 @@ cargo xtask smoke-execve --arch x86_64    # execve smoke
 cargo xtask smoke-execve --arch aarch64
 cargo xtask smoke-hal --arch x86_64       # HAL device registry smoke
 cargo xtask smoke-hal --arch aarch64
+cargo xtask smoke-env --arch x86_64       # M26 env vars smoke
+cargo xtask smoke-env --arch aarch64
+cargo xtask smoke-signals --arch x86_64   # M20 signals smoke
+cargo xtask smoke-signals --arch aarch64
 ```
 
 ### Environment Variables
@@ -124,6 +128,7 @@ kernel/                     Rust no_std kernel crate
     input.rs                Shared input handling (virtio-input)
     console/
       mod.rs                Console abstraction
+      ansi.rs               ANSI/VT100 CSI escape sequence parser (M25)
       vga_text.rs           VGA text mode (legacy)
   kernel.ld                 x86_64 kernel linker script (load @ 0x200000)
   kernel_aarch64.ld         aarch64 kernel linker script (load @ 0x40200000)
@@ -173,7 +178,7 @@ Three scheduler tables coexist:
 2. **Ring-3 ELF processes** - Per-process page tables, dedicated user virtual range (`0x0000_2000_...`). Round-robin scheduling. State: `ready/running/sleep/exited/faulted`.
 3. **External process table** - Compositor-launched entries (GUI terminals, Doom sessions, `/bin/*` helpers).
 
-### Syscall ABI (revision 5)
+### Syscall ABI (revision 6)
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
 - Numbers:
@@ -181,11 +186,12 @@ Three scheduler tables coexist:
   - filesystem: open(15) close(16) fread(17) fwrite(18) seek(19) fstat(20) dup(21) dup2(22)
   - directory/path: mkdir(25) rmdir(26) unlink(27) rename(28) link(29) symlink(30) readlink(31) getcwd(32) chdir(33) getdents(34)
   - process identity: getppid(35) getuid(36) getgid(37) kill(38)
-  - signal stubs (ENOSYS): sigaction(39) sigreturn(40)
-  - memory stubs (ENOSYS): mmap(41) munmap(42) mprotect(43) brk(44)
+  - signals (M20): sigaction(39) sigreturn(40)
+  - memory: mmap(41) munmap(42) mprotect(43) brk(44)
   - ipc: pipe(45) pipe2(46)
   - networking: socket(6) sendto(7) recvfrom(8) bind(47) listen(48) accept(49) connect(50) send(51) recv(52) ping(53)
-  - process image: execve(54)
+  - process image: execve(54) doom_launch(55)
+  - env vars (M26): getenv(56) setenv(57) unsetenv(58)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -272,6 +278,9 @@ Non saltare mai questi step, anche se sembra inutile.
 | M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; comb-filter reverb |
 | M31D | Doom authentic music (OPL2) | OPL2 emulator implemented, GENMIDI loading, MUS player — **audio plays but sounds incorrect (quasi-monotone); root cause not resolved** |
 | M21 | Full mmap / VMA layer | `munmap` (VMA split/remove + PTE clear + TLB flush + physical page free); `mprotect` (VMA flag update + PTE permission update); `brk` shrink; `/proc/<pid>/maps`; `arrostd::runtime::{munmap,mprotect}` |
+| M20 | Signal infrastructure | `sigaction`/`sigreturn` for ring-3; `pending_signals` bitmask; POSIX default actions; `SYS_KILL` ring-3 via `pending_signals`; fork inheritance; `arrostd::runtime::{sigaction,sigreturn,signal_signum}` |
+| M25 | ANSI terminal | `kernel/src/console/ansi.rs` CSI parser; per-cell 16-color rendering in GUI terminal; `ANSI_PALETTE`; `smoke-signals` + `smoke-env` harnesses |
+| M26 | Environment variables | Per-process env arrays (no heap); `SYS_GETENV=56`/`SYS_SETENV=57`/`SYS_UNSETENV=58`; shell `env`/`export`/`$VAR` expansion; GUI terminal env integration; ABI rev 6 |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -279,11 +288,8 @@ Non saltare mai questi step, anche se sembra inutile.
 ### Planned
 | # | Milestone | Goal |
 |---|-----------|------|
-| M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
 | M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
 | M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
-| M25 | ANSI terminal | VT100 escape sequences, 16-color palette, cursor control |
-| M26 | Environment variables | Per-process env, `export`, `$VAR` expansion, inheritance |
 | M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
 | M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
 | M29 | Block cache | LRU sector cache, write-back, cache stats |

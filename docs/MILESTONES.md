@@ -19,13 +19,13 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M17** | Full-Data Journaling for diskfs-v2 | **Complete** |
 | **M18** | Hardware Abstraction Layer | **Complete** |
 | **M19** | Production TCP/IP + Unix Utilities | **Complete** |
-| **M20** | Signal Infrastructure | Not started |
+| **M20** | Signal Infrastructure | **Complete** |
 | **M21** | Full mmap / VMA Layer | **Complete** |
 | **M22** | execve Syscall | **Complete** |
 | **M23** | /dev Filesystem + Device Nodes | Not started |
 | **M24** | Shell Pipes + Process Groups | Not started |
-| **M25** | ANSI Terminal Emulation | Not started |
-| **M26** | Environment Variables + Inheritance | Not started |
+| **M25** | ANSI Terminal Emulation | **Complete** |
+| **M26** | Environment Variables + Inheritance | **Complete** |
 | **M27** | SMP / Multi-Core | Not started |
 | **M28** | RTC + Wall-Clock Time | Not started |
 | **M29** | Block Cache / Buffer Cache | Not started |
@@ -180,70 +180,38 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ### M20: Signal Infrastructure
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Deliver, mask, and handle POSIX signals in ring-3 processes.
 
-**Dependencies**: M14 (preemption, done), M15 Phase A (syscalls, done). Replaces M15 Phase B.
+**Dependencies**: M14 (preemption, done), M15 Phase A (syscalls, done).
 
-#### Step 1: Per-process signal state
-**Files to create**: `kernel/src/proc/signal.rs`
-**Files to modify**: `kernel/src/proc/mod.rs`
+#### Delivered
 
-1. Define signal numbers:
-   ```rust
-   pub const SIGHUP:  u8 = 1;
-   pub const SIGINT:  u8 = 2;
-   pub const SIGQUIT: u8 = 3;
-   pub const SIGILL:  u8 = 4;
-   pub const SIGSEGV: u8 = 11;
-   pub const SIGTERM: u8 = 15;
-   pub const SIGCHLD: u8 = 17;
-   pub const SIGSTOP: u8 = 19;
-   pub const SIGCONT: u8 = 18;
-   pub const SIGUSR1: u8 = 10;
-   pub const SIGUSR2: u8 = 12;
-   pub const SIGKILL: u8 = 9;
-   ```
-2. Per-process state in `Ring3ProcessContext`:
-   ```rust
-   pub pending_signals: u64,           // bitmask
-   pub signal_mask: u64,               // blocked signals
-   pub signal_handlers: [SignalAction; 32],
-   ```
-3. `SignalAction`: `Default`, `Ignore`, `Handler(u64)` (user function address).
+- **Signal constants** in `crates/arrostd/src/lib.rs`: `SIGHUP(1)`, `SIGINT(2)`, `SIGQUIT(3)`, `SIGILL(4)`, `SIGKILL(9)`, `SIGUSR1(10)`, `SIGSEGV(11)`, `SIGUSR2(12)`, `SIGTERM(15)`, `SIGCHLD(17)`, `SIGCONT(18)`, `SIGSTOP(19)`, `NSIG(32)`, `SIG_DFL(0)`, `SIG_IGN(1)`.
+- **Per-process signal state** in `Ring3ProcessContext` (`kernel/src/proc/mod.rs`):
+  - `pending_signals: u64` — bitmask of queued signals.
+  - `signal_mask: u64` — blocked (masked) signals.
+  - `signal_handlers: [SignalAction; 32]` — per-signal action (Default / Ignore / Handler(u64)).
+  - `signal_saved_frame: Option<Ring3TrapFrame>` — trap frame snapshot saved on signal entry; restored by `sigreturn`.
+- **`SYS_SIGACTION` (39)**: installs a handler function address (or `SIG_DFL`/`SIG_IGN`). SIGKILL and SIGSTOP cannot be caught or ignored (returns `EINVAL`).
+- **`SYS_SIGRETURN` (40)**: restores the pre-signal `Ring3TrapFrame` from `signal_saved_frame` and resumes normal execution.
+- **`SYS_KILL` (38) for ring-3**: sets `pending_signals` bit for non-SIGKILL signals; SIGKILL still terminates immediately.
+- **Signal delivery hook** in `prepare_ring3_run_plan`: `deliver_pending_signal_if_any()` runs before each user-mode dispatch.
+  - Lowest-numbered pending unmasked signal selected.
+  - Default actions: SIGCHLD/SIGCONT → ignore; SIGSTOP → set process state to `Sleeping`; all others → terminate (`Exited`).
+  - Custom handler: saves current `trap_frame` → `signal_saved_frame`; redirects `ip` → handler address; `ret0` = signum (maps to `rax` on x86_64, `x0` on aarch64 — first arg register).
+- **`fork` inheritance**: child inherits `signal_handlers` and `signal_mask`; `pending_signals` and `signal_saved_frame` are cleared.
+- **`arrostd::runtime` helpers** (for userland ELF binaries):
+  - `sigaction(signum, handler_fn) -> isize`
+  - `sigreturn() -> !`
+  - `signal_signum() -> u32` (reads signum from `rax` on x86_64 / `x0` on aarch64)
+- **Smoke test**: `cargo xtask smoke-signals [--arch <x86_64|aarch64>]` — launches ring-3 init, sends `kill <pid>` and verifies `kill: pid=N rc=0`.
 
-#### Step 2: Replace `sigaction`/`sigreturn` stubs
-**Files to modify**: `kernel/src/proc/mod.rs`
-
-1. `sys_sigaction(signum, new_action_ptr, old_action_ptr)`:
-   - Validate signum (1..31, not SIGKILL/SIGSTOP).
-   - Copy old handler to `old_action_ptr` if non-null.
-   - Install new handler from `new_action_ptr`.
-2. `sys_sigreturn()`:
-   - Pop the signal frame from user stack.
-   - Restore saved registers (rip/rsp on x86_64, ELR/SP_EL0 on aarch64).
-   - Resume normal execution.
-
-#### Step 3: Signal delivery
-**Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/arch/x86_64/trampoline.rs`, `kernel/src/arch/aarch64/trampoline.rs`
-
-1. Before returning to user mode (syscall exit or preemption resume), call `deliver_pending_signal(pid)`.
-2. If a signal is pending and not masked:
-   - Push a signal frame on user stack: save all registers + signal number.
-   - Set user return address (`rip`/`ELR_EL1`) to the handler.
-   - Set up trampoline: push address of `sigreturn` stub as return address.
-3. Default actions: `SIGKILL` -> immediate exit, `SIGSEGV` -> exit with core dump flag, `SIGCHLD` -> ignore, `SIGSTOP` -> set state to `Sleeping`, `SIGCONT` -> set state to `Ready`.
-
-#### Step 4: `sys_kill` enhancement
-**Files to modify**: `kernel/src/proc/mod.rs`
-
-1. Current `kill` marks process as `Exited`. Change to: set bit in `pending_signals`.
-2. Special cases: `SIGKILL` and `SIGSTOP` cannot be caught or ignored.
-
-#### Testing
-1. `smoke-signal`: parent sends `SIGUSR1` to child, child handler runs and writes to shared memory.
-2. `smoke-signal-kill`: `SIGKILL` terminates process immediately.
-3. Run `smoke-ring3`, `smoke-ring3-run` for regression.
+#### Not delivered (deferred)
+- Signal masking via `sigprocmask` (no syscall yet).
+- `sa_restorer` trampoline on user stack (handler must call `sigreturn()` explicitly).
+- Nested signal delivery (blocked while `signal_saved_frame` is occupied).
+- `SIGSEGV` default action does not emit a core dump file.
 
 ---
 
@@ -394,77 +362,70 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ### M25: ANSI Terminal Emulation
 
-**Status**: Not started
-**Goal**: Support ANSI/VT100 escape sequences in serial and GUI terminal output.
+**Status**: **Complete**
+**Goal**: Support ANSI/VT100 escape sequences in the GUI terminal with 16-color rendering.
 
 **Dependencies**: None.
 
-#### Step 1: ANSI escape parser
-**Files to create**: `kernel/src/console/ansi.rs`
-**Files to modify**: `kernel/src/console/mod.rs`, `kernel/src/gfx/mod.rs`
+#### Delivered
 
-1. Implement a state machine that parses `\x1b[...` CSI sequences:
-   - Cursor movement: `\x1b[nA` (up), `\x1b[nB` (down), `\x1b[nC` (forward), `\x1b[nD` (back).
-   - Cursor positioning: `\x1b[row;colH`.
-   - Erase: `\x1b[2J` (screen), `\x1b[K` (line).
-   - SGR (colors): `\x1b[0m` (reset), `\x1b[31m` (red fg), `\x1b[42m` (green bg), bold, underline.
-   - Scrolling: `\x1b[nS` (up), `\x1b[nT` (down).
-2. 16-color palette: 8 standard + 8 bright colors.
+- **`kernel/src/console/ansi.rs`** — compact, `Copy`-safe CSI escape sequence parser (new file):
+  - `AnsiParser` struct: `Normal → Esc → Csi` state machine. All fields trivially copyable (no heap).
+  - `AnsiEvent` enum: `Literal(u8)`, `CursorUp/Down/Left/Right(u16)`, `CursorPos{row,col}`, `ClearScreen`, `ClearScreenToEnd`, `ClearLine`, `Sgr(SgrParams)`, `Ignore`.
+  - `SgrParams::apply()` updates `(fg, bg, bold, underline)` from CSI `m` parameters.
+  - Up to `MAX_PARAMS=8` semicolon-separated parameters per sequence.
+  - Supported sequences: cursor movement (`A/B/C/D`), cursor position (`H/f`), erase screen (`2J`/`3J`), erase EOL (`K`), SGR colors/attributes (`m`).
+  - `ANSI_PALETTE: [(u8,u8,u8); 16]` — CGA-compatible 16-color RGB table (indices 0-15).
+- **GUI terminal (`kernel/src/gfx/mod.rs`)** — ANSI-aware rendering:
+  - `UiWindow` extended with `fg_lines: [[u8; COLS]; ROWS]`, `bg_lines: [[u8; COLS]; ROWS]`, `current_fg: u8`, `current_bg: u8`, inline `AnsiParser`.
+  - `append_byte_with_change()` routes bytes through `ansi.feed()` and dispatches `AnsiEvent` variants.
+  - `append_raw_byte()` writes the literal byte and records the per-cell `(fg, bg)` color indices.
+  - `scroll_up()` scrolls both the character grid and the `fg_lines`/`bg_lines` arrays in step.
+  - Rendering loop samples `ANSI_PALETTE[fg_lines[r][c]]` and `ANSI_PALETTE[bg_lines[r][c]]` per cell.
+- **GUI terminal env integration** (`TerminalProcess`): `env_vars`/`env_count` arrays + `seed_default_env` / `get_env` / `set_env` methods; `env` and `export VAR=val` commands; `$VAR` expansion in command strings.
 
-#### Step 2: Integrate into GUI terminal
-**Files to modify**: `kernel/src/gfx/mod.rs`
-
-1. Terminal window maintains a character grid with per-cell foreground/background color attributes.
-2. Write output passes through ANSI parser before rendering.
-3. Cursor position tracked; cursor blink optional.
-
-#### Step 3: Integrate into serial
-**Files to modify**: `kernel/src/serial.rs`
-
-1. Pass-through ANSI sequences to serial port (host terminal interprets them).
-2. Shell prompt and colorized output work naturally over serial.
-
-#### Testing
-1. `echo -e "\x1b[31mRed text\x1b[0m"` displays red text in GUI terminal.
-2. `ls` with colored output (directories in blue, executables in green).
-3. `clear` sends `\x1b[2J\x1b[H`.
+#### Not delivered (deferred)
+- Serial pass-through of ANSI codes (serial always strips sequences; host terminal already handles raw escape codes on its own).
+- Bold / underline visual rendering (attribute tracked but rendering uses color only).
+- 256-color / truecolor (`\x1b[38;5;Nm` / `\x1b[38;2;r;g;bm`) extended SGR modes.
 
 ---
 
 ### M26: Environment Variables + Process Inheritance
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Per-process environment variable table inherited across fork/exec.
 
 **Dependencies**: M13 (fork), M22 (execve).
 
-#### Step 1: Kernel environment storage
-**Files to modify**: `kernel/src/proc/mod.rs`
+#### Delivered
 
-1. Add `env: BTreeMap<String, String>` to `Ring3ProcessContext` (or a fixed-size array for simplicity).
-2. Init process starts with: `HOME=/home/user`, `PATH=/bin`, `USER=user`, `SHELL=/bin/sh`, `TERM=arrost`.
-3. `fork` clones the env table.
-4. `execve` passes `envp` to the new process.
+- **Per-process env storage** (`Ring3ProcessContext`, `kernel/src/proc/mod.rs`):
+  - Fixed-size arrays (no heap): `env_vars: [Option<EnvEntry>; MAX_ENV_VARS]`, `env_count: usize`.
+  - `MAX_ENV_VARS=16`, key max 32 bytes, value max 128 bytes.
+  - `Ring3ProcessContext::seed_default_env()` seeds: `HOME=/home/user`, `PATH=/bin`, `USER=user`, `SHELL=/bin/sh`, `TERM=arrost`.
+  - `set_env(key, val)`, `get_env(key)` helper methods.
+- **`fork` inheritance**: child `env_vars`/`env_count` copied from parent.
+- **Syscalls** (`crates/arrostd/src/lib.rs` + `kernel/src/proc/mod.rs`):
+  - `SYS_GETENV = 56`: `(key_ptr, key_len, buf_ptr, buf_cap) -> bytes or -errno`.
+  - `SYS_SETENV = 57`: `(key_ptr, key_len, val_ptr, val_len) -> 0 or -errno`.
+  - `SYS_UNSETENV = 58`: `(key_ptr, key_len) -> 0 or -errno`.
+  - All three gated on `caps::CORE`.
+- **`arrostd::runtime` helpers**: `getenv(key, buf) -> isize`, `setenv(key, val) -> isize`, `unsetenv(key) -> isize`.
+- **Shell integration** (`kernel/src/shell.rs`):
+  - `ShellState` carries its own env table (up to 32 entries, 256-byte values) seeded at init.
+  - `env` command prints all `KEY=value` pairs.
+  - `export VAR=value` sets or updates a variable; `export VAR` (no `=`) prints its current value.
+  - `$VAR` expansion applied to every command line before dispatch.
+- **GUI terminal integration** (`TerminalProcess` in `kernel/src/gfx/mod.rs`):
+  - Same `env_vars`/`env_count` arrays + `seed_default_env` / `get_env` / `set_env` methods.
+  - `env` and `export VAR=val` commands; `$VAR` expansion in run_terminal_command.
+- **Smoke test**: `cargo xtask smoke-env [--arch <x86_64|aarch64>]` — verifies `HOME=/home/user`, `TERM=arrost` defaults, and `export SMOKE_TEST=m26ok` roundtrip.
 
-#### Step 2: Syscalls
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`
-
-1. `SYS_GETENV(name_ptr, buf_ptr, buflen) -> bytes or -ENOENT`.
-2. `SYS_SETENV(name_ptr, value_ptr, overwrite) -> 0 or -errno`.
-3. `SYS_UNSETENV(name_ptr) -> 0 or -errno`.
-
-#### Step 3: Shell integration
-**Files to modify**: `kernel/src/shell.rs`
-
-1. `export VAR=value` sets in current process env.
-2. `env` command prints all variables.
-3. `echo $VAR` expands variables in shell.
-4. `$PATH` used for command resolution.
-
-#### Testing
-1. `export FOO=bar && echo $FOO` prints `bar`.
-2. `env` lists all environment variables.
-3. Forked child inherits parent's env.
+#### Not delivered (deferred)
+- `envp` vector passed to `execve` (execve currently clears and re-seeds the env from defaults).
+- `$PATH` used for command search resolution (PATH is stored but auto-resolution still uses `/bin` prefix directly).
+- `unset` alias for `unsetenv`.
 
 ---
 

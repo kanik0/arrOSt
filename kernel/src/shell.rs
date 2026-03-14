@@ -20,6 +20,10 @@ use core::str;
 
 const MAX_LINE_LEN: usize = 128;
 const SERIAL_CAPTURE_HELD_KEYS: usize = 8;
+// M26: shell-side environment variable storage.
+const SHELL_MAX_ENV_VARS: usize = 32;
+const SHELL_ENV_KEY_MAX: usize = 32;
+const SHELL_ENV_VAL_MAX: usize = 256;
 const SERIAL_CAPTURE_HOLD_TICKS_DEFAULT: u64 = 8;
 const SERIAL_CAPTURE_HOLD_TICKS_MOVE: u64 = 12;
 const SERIAL_CAPTURE_HOLD_TICKS_ACTION: u64 = 14;
@@ -236,6 +240,22 @@ impl HeldCaptureKey {
     }
 }
 
+// M26: per-entry storage for one shell environment variable.
+#[derive(Clone, Copy)]
+struct ShellEnvEntry {
+    key: [u8; SHELL_ENV_KEY_MAX],
+    key_len: usize,
+    val: [u8; SHELL_ENV_VAL_MAX],
+    val_len: usize,
+}
+
+const EMPTY_SHELL_ENV_ENTRY: ShellEnvEntry = ShellEnvEntry {
+    key: [0; SHELL_ENV_KEY_MAX],
+    key_len: 0,
+    val: [0; SHELL_ENV_VAL_MAX],
+    val_len: 0,
+};
+
 struct ShellState {
     line: [u8; MAX_LINE_LEN],
     len: usize,
@@ -246,6 +266,9 @@ struct ShellState {
     doom_capture: bool,
     serial_escape: SerialEscapeState,
     held_serial_capture_keys: [HeldCaptureKey; SERIAL_CAPTURE_HELD_KEYS],
+    // M26: shell environment variables.
+    env_vars: [Option<ShellEnvEntry>; SHELL_MAX_ENV_VARS],
+    env_count: usize,
 }
 
 impl ShellState {
@@ -262,6 +285,8 @@ impl ShellState {
             doom_capture: false,
             serial_escape: SerialEscapeState::new(),
             held_serial_capture_keys: [HeldCaptureKey::inactive(); SERIAL_CAPTURE_HELD_KEYS],
+            env_vars: [None; SHELL_MAX_ENV_VARS],
+            env_count: 0,
         }
     }
 
@@ -307,6 +332,92 @@ impl ShellState {
                 *slot = HeldCaptureKey::inactive();
             }
         }
+    }
+
+    // M26: look up an environment variable by name.
+    fn get_env(&self, key: &str) -> Option<&str> {
+        let key_bytes = key.as_bytes();
+        for slot in &self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                return core::str::from_utf8(&entry.val[..entry.val_len]).ok();
+            }
+        }
+        None
+    }
+
+    // M26: set (or insert) an environment variable. Returns false if key/val is too long or table full.
+    fn set_env(&mut self, key: &str, val: &str) -> bool {
+        let key_bytes = key.as_bytes();
+        let val_bytes = val.as_bytes();
+        if key_bytes.len() > SHELL_ENV_KEY_MAX || val_bytes.len() > SHELL_ENV_VAL_MAX {
+            return false;
+        }
+        for slot in &mut self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+                entry.val[val_bytes.len()..].fill(0);
+                entry.val_len = val_bytes.len();
+                return true;
+            }
+        }
+        if self.env_count >= SHELL_MAX_ENV_VARS {
+            return false;
+        }
+        let mut entry = EMPTY_SHELL_ENV_ENTRY;
+        entry.key[..key_bytes.len()].copy_from_slice(key_bytes);
+        entry.key_len = key_bytes.len();
+        entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+        entry.val_len = val_bytes.len();
+        self.env_vars[self.env_count] = Some(entry);
+        self.env_count += 1;
+        true
+    }
+
+    // M26: seed well-known default variables.
+    fn seed_default_env(&mut self) {
+        self.set_env("HOME", "/home/user");
+        self.set_env("PATH", "/bin");
+        self.set_env("USER", "user");
+        self.set_env("SHELL", "/bin/sh");
+        self.set_env("TERM", "arrost");
+    }
+
+    // M26: expand $VAR references in `input` into `out_buf`. Returns the expanded str.
+    fn expand_vars<'a>(&self, input: &'a str, out_buf: &'a mut [u8; MAX_LINE_LEN]) -> &'a str {
+        let mut out_len = 0usize;
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && out_len < MAX_LINE_LEN {
+            if bytes[i] == b'$' && i + 1 < bytes.len() {
+                let name_start = i + 1;
+                let mut name_end = name_start;
+                while name_end < bytes.len()
+                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+                {
+                    name_end += 1;
+                }
+                if name_end > name_start
+                    && let Ok(name) = core::str::from_utf8(&bytes[name_start..name_end])
+                {
+                    if let Some(val) = self.get_env(name) {
+                        for &b in val.as_bytes() {
+                            if out_len < MAX_LINE_LEN {
+                                out_buf[out_len] = b;
+                                out_len += 1;
+                            }
+                        }
+                    }
+                    i = name_end;
+                    continue;
+                }
+            }
+            out_buf[out_len] = bytes[i];
+            out_len += 1;
+            i += 1;
+        }
+        core::str::from_utf8(&out_buf[..out_len]).unwrap_or(input)
     }
 
     fn refresh_serial_capture_key(&mut self, byte: u8, now_ticks: u64) {
@@ -373,6 +484,7 @@ pub fn init() {
     // SAFETY: shell init happens on the main thread before interactive input starts.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
     shell.set_cwd(default_working_directory());
+    shell.seed_default_env(); // M26: seed default environment variables.
     load_command_history();
     serial::write_line(
         "Shell: line mode ready (commands: help, version, ticks, uptime, user, user apps, ring3, ring3 smoke, ring3 groundwork, ring3 run <init|doom>, ring3 ps, ring3 wait <pid|any|all>, spawn, wait, waitx, ps, kill, syscalls, terminal, pwd, cd, ls [-als] [<path>], cat, echo >, stat, chmod, mkdir, mv, link, symlink, disk, ui, fm, doom, mouse, net, ping, udp send, udp last, curl, netstat, ifconfig, route, arp, ss, nc, ip, sync, reload, watch on|off; /bin exec: /bin/ls [-als] [<path>]|/bin/ps|/bin/kill|/bin/cat|/bin/echo|/bin/fm|/bin/doom|/bin/terminal|/bin/link|/bin/symlink|/bin/netstat|/bin/ifconfig|/bin/route|/bin/arp|/bin/ss|/bin/nc|/bin/ip; ui subcmd: redraw|next|minimize; doom subcmd: status|play|run|stop|ui|key|keyup|capture|view|mouse|audio|reset|source|doctor)",
@@ -662,6 +774,14 @@ fn run_command(shell: &mut ShellState) {
         }
     };
     record_command_in_history(&input_owned);
+    // M26: expand $VAR references before dispatching.
+    let mut expanded_buf = [0u8; MAX_LINE_LEN];
+    let expanded = shell.expand_vars(input_owned.as_str(), &mut expanded_buf);
+    let input_owned = if expanded != input_owned.as_str() {
+        String::from(expanded)
+    } else {
+        input_owned
+    };
     if input_owned == "symlink" {
         serial::write_line("usage: symlink <target> <linkpath>");
         return;
@@ -707,6 +827,45 @@ fn run_command(shell: &mut ShellState) {
             }
             Ok(_) => serial::write_fmt(format_args!("cd: {} (not_a_directory)\n", path)),
             Err(err) => serial::write_fmt(format_args!("cd: {} ({})\n", path, err.as_str())),
+        }
+        return;
+    }
+
+    // M26: env command — list all shell environment variables.
+    if input == "env" {
+        for slot in &shell.env_vars[..shell.env_count] {
+            let Some(entry) = slot else { continue };
+            let key = core::str::from_utf8(&entry.key[..entry.key_len]).unwrap_or("?");
+            let val = core::str::from_utf8(&entry.val[..entry.val_len]).unwrap_or("?");
+            serial::write_fmt(format_args!("{}={}\n", key, val));
+        }
+        return;
+    }
+
+    // M26: export command — set or display a shell environment variable.
+    if input == "export" {
+        serial::write_line("usage: export VAR=value");
+        return;
+    }
+    if let Some(rest) = input.strip_prefix("export ") {
+        let rest = rest.trim();
+        if let Some(eq_pos) = rest.find('=') {
+            let key = rest[..eq_pos].trim();
+            let val = &rest[eq_pos + 1..];
+            if key.is_empty() {
+                serial::write_line("usage: export VAR=value");
+            } else {
+                shell.set_env(key, val);
+            }
+        } else if rest.is_empty() {
+            serial::write_line("usage: export VAR=value");
+        } else {
+            // export VAR (no value — display current value if set)
+            if let Some(val) = shell.get_env(rest) {
+                serial::write_fmt(format_args!("declare -x {}={}\n", rest, val));
+            } else {
+                serial::write_fmt(format_args!("export: {}: not set\n", rest));
+            }
         }
         return;
     }
