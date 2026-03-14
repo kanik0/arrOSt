@@ -360,6 +360,20 @@ pub(crate) struct EnvEntry {
     val_len: usize,
 }
 
+/// Minimal per-syscall snapshot passed to syscall handlers.
+/// Contains only the fields needed for user-pointer validation and path resolution.
+/// Keeping this small (≈ 450 bytes) prevents kernel stack overflow when handlers
+/// are called deeply from `dispatch_ring3_syscall_with_action`.
+#[derive(Clone, Copy)]
+pub(crate) struct Ring3SyscallCtx {
+    pub pid: u32,
+    pub user_range_count: usize,
+    pub user_ranges: [Option<ring3_groundwork::UserMemoryRange>; ring3_groundwork::MAX_USER_RANGES],
+    pub address_space: ring3_groundwork::AddressSpaceToken,
+    pub cwd: [u8; MAX_CWD_LEN],
+    pub cwd_len: usize,
+}
+
 const EMPTY_ENV_ENTRY: EnvEntry = EnvEntry {
     key: [0; MAX_ENV_KEY_LEN],
     key_len: 0,
@@ -505,6 +519,19 @@ pub struct Ring3WaitAllReport {
 }
 
 impl Ring3ProcessContext {
+    /// Return a minimal syscall context snapshot for use by syscall handlers.
+    /// Avoids copying the entire `Ring3ProcessContext` onto the kernel stack.
+    pub(crate) fn syscall_ctx(&self) -> Ring3SyscallCtx {
+        Ring3SyscallCtx {
+            pid: self.pid,
+            user_range_count: self.user_range_count,
+            user_ranges: self.user_ranges,
+            address_space: self.address_space,
+            cwd: self.cwd,
+            cwd_len: self.cwd_len,
+        }
+    }
+
     pub const fn new(pid: u32, name: &'static str, syscall_caps: u32) -> Self {
         let mut process = EMPTY_RING3_PROCESS_CONTEXT;
         process.pid = pid;
@@ -1729,12 +1756,12 @@ impl Scheduler {
             };
         }
 
-        let ctx = self.ring3_context.process;
+        let ctx = self.ring3_context.process.syscall_ctx();
         self.ring3_context.process.state = Ring3ProcessState::Running;
         let ctx_pid = ctx.pid;
-        let ctx_name = ctx.name;
+        let ctx_name = self.ring3_context.process.name;
         let required_caps = syscall_required_caps(number);
-        let ctx_caps = ctx.syscall_caps;
+        let ctx_caps = self.ring3_context.process.syscall_caps;
         if required_caps != 0 && !caps::allows(ctx_caps, required_caps) {
             self.stats.errors = self.stats.errors.saturating_add(1);
             log_syscall_cap_denied(ctx_pid, ctx_name, number, required_caps, ctx_caps);
@@ -2867,7 +2894,7 @@ impl Scheduler {
             recv_req_ptr,
             size_of::<UdpRecvReq>() as u64,
         );
-        let fd_smoke = match self.run_ring3_fd_groundwork_smoke(current) {
+        let fd_smoke = match self.run_ring3_fd_groundwork_smoke(current.syscall_ctx()) {
             Ok(result) => result,
             Err(error) => {
                 self.disarm_ring3_context();
@@ -2903,7 +2930,7 @@ impl Scheduler {
 
     fn run_ring3_fd_groundwork_smoke(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
     ) -> Result<Ring3FdSmokeResult, isize> {
         let readme_path = b"/README.TXT";
         let tmp_path = b"/tmp/FD_SMOKE.TXT";
@@ -3969,7 +3996,7 @@ impl Scheduler {
 
     fn syscall_open_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         flags: u64,
         path_len: u64,
@@ -4047,7 +4074,7 @@ impl Scheduler {
         self.fd_write_from(&mut task.fd_table, 1, bytes)
     }
 
-    fn syscall_write_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+    fn syscall_write_ring3(&mut self, process: Ring3SyscallCtx, ptr: u64, len: u64) -> isize {
         let Ok(len) = usize::try_from(len) else {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -4091,7 +4118,7 @@ impl Scheduler {
         self.fd_read_into(&mut task.fd_table, 0, out)
     }
 
-    fn syscall_read_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+    fn syscall_read_ring3(&mut self, process: Ring3SyscallCtx, ptr: u64, len: u64) -> isize {
         let Ok(len) = usize::try_from(len) else {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -4163,7 +4190,7 @@ impl Scheduler {
 
     fn syscall_fread_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -4276,7 +4303,7 @@ impl Scheduler {
 
     fn syscall_fwrite_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -4373,7 +4400,7 @@ impl Scheduler {
 
     fn syscall_fstat_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -4508,7 +4535,7 @@ impl Scheduler {
 
     fn syscall_connect_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         req_ptr: u64,
         req_len: u64,
     ) -> isize {
@@ -4542,7 +4569,7 @@ impl Scheduler {
 
     fn syscall_send_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_len: u64,
@@ -4587,7 +4614,7 @@ impl Scheduler {
 
     fn syscall_recv_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_cap: u64,
@@ -4663,7 +4690,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_ping_ring3(&mut self, _ctx: Ring3ProcessContext, ip_ptr: u64, ip_len: u64) -> isize {
+    fn syscall_ping_ring3(&mut self, _ctx: Ring3SyscallCtx, ip_ptr: u64, ip_len: u64) -> isize {
         if ip_len != 4 {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -4679,7 +4706,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_bind_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64, port: u64) -> isize {
+    fn syscall_bind_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64, port: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -4714,7 +4741,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_listen_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+    fn syscall_listen_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -4738,7 +4765,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_accept_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+    fn syscall_accept_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -5005,7 +5032,7 @@ impl Scheduler {
 
     fn syscall_sendto_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         req_ptr: u64,
         req_len: u64,
@@ -5073,7 +5100,7 @@ impl Scheduler {
 
     fn syscall_recvfrom_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         req_ptr: u64,
         req_len: u64,
@@ -5706,7 +5733,7 @@ impl Scheduler {
 
     /// Ring-3 pipe: allocate a new pipe and write `(read_fd, write_fd)` into
     /// the user-space `[u32; 2]` pointed to by `fds_ptr`.
-    fn syscall_pipe_ring3(&mut self, process: Ring3ProcessContext, fds_ptr: u64) -> isize {
+    fn syscall_pipe_ring3(&mut self, process: Ring3SyscallCtx, fds_ptr: u64) -> isize {
         if fds_ptr == 0 {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EFAULT;
@@ -5757,7 +5784,7 @@ impl Scheduler {
     /// Used by two-path syscalls (rename, link, symlink).
     fn copy_two_paths_from_ring3(
         &mut self,
-        process: &Ring3ProcessContext,
+        process: &Ring3SyscallCtx,
         buf_ptr: u64,
         src_len: usize,
         dst_len: usize,
@@ -5782,7 +5809,7 @@ impl Scheduler {
 
     fn syscall_mkdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         mode_arg: u64,
         path_len: u64,
@@ -5835,7 +5862,7 @@ impl Scheduler {
 
     fn syscall_rmdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -5886,7 +5913,7 @@ impl Scheduler {
 
     fn syscall_unlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -5937,7 +5964,7 @@ impl Scheduler {
 
     fn syscall_rename_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         old_len: u64,
         new_len: u64,
@@ -6000,7 +6027,7 @@ impl Scheduler {
 
     fn syscall_link_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         src_len: u64,
         dst_len: u64,
@@ -6063,7 +6090,7 @@ impl Scheduler {
 
     fn syscall_symlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         target_len: u64,
         link_len: u64,
@@ -6117,7 +6144,7 @@ impl Scheduler {
 
     fn syscall_readlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
         buf_ptr: u64,
@@ -6187,7 +6214,7 @@ impl Scheduler {
 
     fn syscall_getcwd_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         buf_cap: u64,
     ) -> isize {
@@ -6223,7 +6250,7 @@ impl Scheduler {
 
     fn syscall_chdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -6285,7 +6312,7 @@ impl Scheduler {
 
     fn syscall_getdents_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_cap: u64,
