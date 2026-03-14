@@ -1,4 +1,5 @@
 // kernel/src/console/vga_text.rs: VGA text-mode writer at 0xb8000.
+#![allow(dead_code)]
 const VGA_BUFFER_ADDR: usize = 0xb8000;
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;

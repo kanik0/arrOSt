@@ -13,17 +13,17 @@ use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
     AF_INET, DIRENT_HEADER_SIZE, Dirent, FILE_TYPE_CHAR, FILE_TYPE_DIRECTORY, FILE_TYPE_REGULAR,
-    FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, O_ACCMODE, O_CREAT,
+    FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, NSIG, O_ACCMODE, O_CREAT,
     O_RDONLY, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SEEK_CUR, SEEK_END, SEEK_SET,
-    SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET,
-    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DOOM_LAUNCH, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT,
-    SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
-    SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
-    SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV,
-    SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION,
-    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK,
-    SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app,
-    caps, errno,
+    SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_BRK,
+    SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DOOM_LAUNCH, SYS_DUP,
+    SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD,
+    SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK,
+    SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE,
+    SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
+    SYS_SEND, SYS_SENDTO, SYS_SETENV, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
+    SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK, SYS_UNSETENV, SYS_WAITPID, SYS_WRITE,
+    SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -347,6 +347,51 @@ pub struct Ring3SyscallDispatch {
 /// Maximum length of the per-process current working directory path.
 pub const MAX_CWD_LEN: usize = arrostd::abi::USERLAND_PATH_MAX;
 
+/// M26: per-process environment variable entry.
+const MAX_ENV_VARS: usize = 8;
+const MAX_ENV_KEY_LEN: usize = 32;
+const MAX_ENV_VAL_LEN: usize = 64;
+
+#[derive(Clone, Copy)]
+pub(crate) struct EnvEntry {
+    key: [u8; MAX_ENV_KEY_LEN],
+    key_len: usize,
+    val: [u8; MAX_ENV_VAL_LEN],
+    val_len: usize,
+}
+
+/// Minimal per-syscall snapshot passed to syscall handlers.
+/// Contains only the fields needed for user-pointer validation and path resolution.
+/// Keeping this small (≈ 450 bytes) prevents kernel stack overflow when handlers
+/// are called deeply from `dispatch_ring3_syscall_with_action`.
+#[derive(Clone, Copy)]
+pub(crate) struct Ring3SyscallCtx {
+    pub pid: u32,
+    pub user_range_count: usize,
+    pub user_ranges: [Option<ring3_groundwork::UserMemoryRange>; ring3_groundwork::MAX_USER_RANGES],
+    pub address_space: ring3_groundwork::AddressSpaceToken,
+    pub cwd: [u8; MAX_CWD_LEN],
+    pub cwd_len: usize,
+}
+
+const EMPTY_ENV_ENTRY: EnvEntry = EnvEntry {
+    key: [0; MAX_ENV_KEY_LEN],
+    key_len: 0,
+    val: [0; MAX_ENV_VAL_LEN],
+    val_len: 0,
+};
+
+/// M20: action installed for a specific signal number.
+#[derive(Clone, Copy)]
+pub(crate) enum SignalAction {
+    /// Default kernel action (terminate, ignore, stop, etc.).
+    Default,
+    /// Explicitly ignore the signal.
+    Ignore,
+    /// Redirect to user-space handler at this address.
+    Handler(u64),
+}
+
 #[derive(Clone, Copy)]
 pub struct Ring3ProcessContext {
     pub pid: u32,
@@ -368,6 +413,17 @@ pub struct Ring3ProcessContext {
     /// Current working directory (UTF-8, no trailing slash except for root).
     pub cwd: [u8; MAX_CWD_LEN],
     pub cwd_len: usize,
+    /// M20: bitmask of pending (undelivered) signals.
+    pub pending_signals: u64,
+    /// M20: bitmask of blocked (masked) signals.
+    pub signal_mask: u64,
+    /// M20: per-signal action table (indices 0..NSIG).
+    pub signal_handlers: [SignalAction; 32],
+    /// M20: trap frame saved before signal delivery; restored by sigreturn.
+    pub signal_saved_frame: Option<Ring3TrapFrame>,
+    /// M26: environment variable table.
+    pub env_vars: [Option<EnvEntry>; MAX_ENV_VARS],
+    pub env_count: usize,
 }
 
 const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
@@ -388,6 +444,12 @@ const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
         brk_end: 0,
         cwd: [0u8; MAX_CWD_LEN],
         cwd_len: 1,
+        pending_signals: 0,
+        signal_mask: 0,
+        signal_handlers: [SignalAction::Default; 32],
+        signal_saved_frame: None,
+        env_vars: [None; MAX_ENV_VARS],
+        env_count: 0,
     };
     ctx.cwd[0] = b'/';
     ctx
@@ -457,6 +519,19 @@ pub struct Ring3WaitAllReport {
 }
 
 impl Ring3ProcessContext {
+    /// Return a minimal syscall context snapshot for use by syscall handlers.
+    /// Avoids copying the entire `Ring3ProcessContext` onto the kernel stack.
+    pub(crate) fn syscall_ctx(&self) -> Ring3SyscallCtx {
+        Ring3SyscallCtx {
+            pid: self.pid,
+            user_range_count: self.user_range_count,
+            user_ranges: self.user_ranges,
+            address_space: self.address_space,
+            cwd: self.cwd,
+            cwd_len: self.cwd_len,
+        }
+    }
+
     pub const fn new(pid: u32, name: &'static str, syscall_caps: u32) -> Self {
         let mut process = EMPTY_RING3_PROCESS_CONTEXT;
         process.pid = pid;
@@ -506,6 +581,58 @@ impl Ring3ProcessContext {
             trap_frame: self.trap_frame,
             kernel_stack_top: self.kernel_stack_top,
         }
+    }
+
+    /// M26: Seed the default environment variables for a new ring-3 process.
+    pub fn seed_default_env(&mut self) {
+        self.env_count = 0;
+        self.env_vars = [None; MAX_ENV_VARS];
+        self.set_env("HOME", "/home/user");
+        self.set_env("PATH", "/bin");
+        self.set_env("USER", "user");
+        self.set_env("SHELL", "/bin/sh");
+        self.set_env("TERM", "arrost");
+    }
+
+    /// M26: Set an environment variable (insert or update).
+    pub fn set_env(&mut self, key: &str, val: &str) {
+        if self.env_count >= MAX_ENV_VARS {
+            return;
+        }
+        let key_bytes = key.as_bytes();
+        let val_bytes = val.as_bytes();
+        if key_bytes.len() > MAX_ENV_KEY_LEN || val_bytes.len() > MAX_ENV_VAL_LEN {
+            return;
+        }
+        // Check if key already exists.
+        for slot in &mut self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+                entry.val_len = val_bytes.len();
+                return;
+            }
+        }
+        let mut entry = EMPTY_ENV_ENTRY;
+        entry.key[..key_bytes.len()].copy_from_slice(key_bytes);
+        entry.key_len = key_bytes.len();
+        entry.val[..val_bytes.len()].copy_from_slice(val_bytes);
+        entry.val_len = val_bytes.len();
+        self.env_vars[self.env_count] = Some(entry);
+        self.env_count += 1;
+    }
+
+    /// M26: Look up an environment variable value.
+    #[allow(dead_code)]
+    pub fn get_env<'a>(&'a self, key: &str) -> Option<&'a str> {
+        let key_bytes = key.as_bytes();
+        for slot in &self.env_vars[..self.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                return core::str::from_utf8(&entry.val[..entry.val_len]).ok();
+            }
+        }
+        None
     }
 }
 
@@ -1525,7 +1652,7 @@ impl Scheduler {
             }
             SYS_KILL => {
                 self.stats.kill = self.stats.kill.saturating_add(1);
-                // arg0 = pid, arg1 = signal; only SIGKILL(9) supported
+                // For cooperative tasks: only SIGKILL delivers an immediate termination.
                 if arg1 == u64::from(SIGKILL) {
                     self.kill_process(arg0 as u32)
                 } else {
@@ -1534,7 +1661,7 @@ impl Scheduler {
             }
             // M15 Phase A3: memory ops — stubs
             SYS_MMAP | SYS_MUNMAP | SYS_MPROTECT | SYS_BRK => errno::ENOSYS,
-            // M15 Phase A2: signals — stubs
+            // M20: signal stubs for cooperative tasks
             SYS_SIGACTION | SYS_SIGRETURN => errno::ENOSYS,
             // M15 Phase A4: pipe IPC
             SYS_PIPE => {
@@ -1629,12 +1756,12 @@ impl Scheduler {
             };
         }
 
-        let ctx = self.ring3_context.process;
+        let ctx = self.ring3_context.process.syscall_ctx();
         self.ring3_context.process.state = Ring3ProcessState::Running;
         let ctx_pid = ctx.pid;
-        let ctx_name = ctx.name;
+        let ctx_name = self.ring3_context.process.name;
         let required_caps = syscall_required_caps(number);
-        let ctx_caps = ctx.syscall_caps;
+        let ctx_caps = self.ring3_context.process.syscall_caps;
         if required_caps != 0 && !caps::allows(ctx_caps, required_caps) {
             self.stats.errors = self.stats.errors.saturating_add(1);
             log_syscall_cap_denied(ctx_pid, ctx_name, number, required_caps, ctx_caps);
@@ -1834,14 +1961,16 @@ impl Scheduler {
             }
             SYS_KILL => {
                 self.stats.kill = self.stats.kill.saturating_add(1);
-                // arg0=pid, arg1=signal; only SIGKILL(9) supported
-                if arg1 == u64::from(SIGKILL) {
-                    self.kill_process(arg0 as u32)
-                } else {
-                    errno::ENOSYS
-                }
+                self.syscall_kill_ring3(arg0 as u32, arg1 as u32)
             }
-            SYS_SIGACTION | SYS_SIGRETURN => errno::ENOSYS,
+            SYS_SIGACTION => {
+                // arg0 = signum, arg1 = handler_fn (0=default, 1=ignore, else user addr)
+                self.syscall_sigaction_ring3(arg0 as u32, arg1)
+            }
+            SYS_SIGRETURN => self.syscall_sigreturn_ring3(),
+            SYS_GETENV => self.syscall_getenv_ring3(arg0, arg1, arg2, arg3),
+            SYS_SETENV => self.syscall_setenv_ring3(arg0, arg1, arg2),
+            SYS_UNSETENV => self.syscall_unsetenv_ring3(arg0, arg1),
             // M13: real mmap / brk; munmap / mprotect remain ENOSYS
             SYS_MMAP => {
                 // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
@@ -2122,6 +2251,292 @@ impl Scheduler {
         0
     }
 
+    // ── M20: Signal syscalls ─────────────────────────────────────────────────────
+
+    fn syscall_kill_ring3(&mut self, target_pid: u32, signum: u32) -> isize {
+        if target_pid == 0 {
+            return errno::EINVAL;
+        }
+        // SIGKILL cannot be blocked — terminate immediately.
+        if signum == SIGKILL {
+            return self.kill_process(target_pid);
+        }
+        // Validate signal number.
+        if signum == 0 || signum >= NSIG {
+            return errno::EINVAL;
+        }
+        // Find the target ring-3 task and set its pending signal bit.
+        let found = self.ring3_tasks.iter_mut().flatten().any(|task| {
+            if task.pid == target_pid {
+                task.process.pending_signals |= 1u64 << signum;
+                true
+            } else {
+                false
+            }
+        });
+        // If the target is the currently-active process, update the live context too.
+        if self.ring3_context.process.pid == target_pid {
+            self.ring3_context.process.pending_signals |= 1u64 << signum;
+        }
+        if found { 0 } else { errno::ESRCH }
+    }
+
+    fn syscall_sigaction_ring3(&mut self, signum: u32, handler_fn: u64) -> isize {
+        const SIG_DFL: u64 = arrostd::runtime::SIG_DFL;
+        const SIG_IGN: u64 = arrostd::runtime::SIG_IGN;
+        // SIGKILL and SIGSTOP cannot be caught or ignored.
+        if signum == SIGKILL || signum == SIGSTOP {
+            return errno::EINVAL;
+        }
+        if signum == 0 || signum >= NSIG {
+            return errno::EINVAL;
+        }
+        let action = if handler_fn == SIG_DFL {
+            SignalAction::Default
+        } else if handler_fn == SIG_IGN {
+            SignalAction::Ignore
+        } else {
+            SignalAction::Handler(handler_fn)
+        };
+        self.ring3_context.process.signal_handlers[signum as usize] = action;
+        // Flush to the task record.
+        if let Some(slot) = self.ring3_active_slot
+            && let Some(task) = self.ring3_tasks[slot].as_mut()
+        {
+            task.process.signal_handlers[signum as usize] = action;
+        }
+        0
+    }
+
+    fn syscall_sigreturn_ring3(&mut self) -> isize {
+        let Some(saved) = self.ring3_context.process.signal_saved_frame.take() else {
+            // No saved frame — silently ignore (process called sigreturn spuriously).
+            return 0;
+        };
+        // Restore the pre-signal trap frame.
+        self.ring3_context.process.trap_frame = saved;
+        // Flush to the task record.
+        if let Some(slot) = self.ring3_active_slot
+            && let Some(task) = self.ring3_tasks[slot].as_mut()
+        {
+            task.process.trap_frame = saved;
+            task.process.signal_saved_frame = None;
+        }
+        0
+    }
+
+    /// Check for any deliverable pending signal on the active ring-3 process and,
+    /// if found, redirect execution to the registered handler.
+    fn deliver_pending_signal_if_any(&mut self) {
+        let process = &mut self.ring3_context.process;
+        // No pending signals or all masked.
+        let deliverable = process.pending_signals & !process.signal_mask;
+        if deliverable == 0 {
+            return;
+        }
+        // Already handling a signal (saved frame in use) — don't nest.
+        if process.signal_saved_frame.is_some() {
+            return;
+        }
+        // Find the lowest-numbered deliverable signal.
+        let signum = deliverable.trailing_zeros();
+        // Clear the pending bit.
+        process.pending_signals &= !(1u64 << signum);
+
+        // Apply default action if no custom handler.
+        let action = process.signal_handlers[signum as usize];
+        match action {
+            SignalAction::Ignore => {}
+            SignalAction::Default => {
+                // Default actions per POSIX:
+                // SIGCHLD, SIGCONT → ignore; SIGSTOP → stop (sleep); others → terminate.
+                match signum {
+                    s if s == SIGCHLD || s == SIGCONT => {}
+                    s if s == SIGSTOP => {
+                        process.state = Ring3ProcessState::Sleeping;
+                    }
+                    _ => {
+                        process.state = Ring3ProcessState::Exited;
+                        if let Some(slot) = self.ring3_active_slot
+                            && let Some(task) = self.ring3_tasks[slot].as_mut()
+                        {
+                            task.state = Ring3TaskState::Exited {
+                                code: KILL_EXIT_CODE,
+                            };
+                            task.process.state = Ring3ProcessState::Exited;
+                        }
+                    }
+                }
+            }
+            SignalAction::Handler(handler_fn) => {
+                // Save current trap frame so sigreturn can restore it.
+                let saved = process.trap_frame;
+                process.signal_saved_frame = Some(saved);
+                // Redirect execution to the handler; signum is passed via ret0
+                // (rax on x86_64, x0 on aarch64 — the accumulator register).
+                process.trap_frame =
+                    Ring3TrapFrame::new_with_ret(handler_fn, saved.sp, u64::from(signum));
+            }
+        }
+    }
+
+    // ── M26: Environment variable syscalls ───────────────────────────────────────
+
+    fn syscall_getenv_ring3(
+        &mut self,
+        key_ptr: u64,
+        key_len: u64,
+        buf_ptr: u64,
+        buf_cap: u64,
+    ) -> isize {
+        if key_ptr == 0 || key_len == 0 || key_len > MAX_ENV_KEY_LEN as u64 {
+            return errno::EINVAL;
+        }
+        let key_len = key_len as usize;
+        let mut key_buf = [0u8; MAX_ENV_KEY_LEN];
+        let process = self.ring3_context.process;
+        if let Err(e) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            key_ptr,
+            &mut key_buf[..key_len],
+        ) {
+            return self.map_ring3_copy_error(e);
+        }
+        let key = match core::str::from_utf8(&key_buf[..key_len]) {
+            Ok(s) => s,
+            Err(_) => return errno::EINVAL,
+        };
+        for slot in &process.env_vars[..process.env_count] {
+            let Some(entry) = slot else { continue };
+            let entry_key = match core::str::from_utf8(&entry.key[..entry.key_len]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if entry_key == key {
+                let val_len = entry.val_len;
+                let cap = buf_cap as usize;
+                if buf_ptr == 0 || cap == 0 {
+                    return val_len as isize;
+                }
+                let to_copy = val_len.min(cap);
+                if let Err(e) = ring3_groundwork::copy_to_user_bytes(
+                    &process.user_ranges,
+                    process.user_range_count,
+                    process.address_space,
+                    buf_ptr,
+                    &entry.val[..to_copy],
+                ) {
+                    return self.map_ring3_copy_error(e);
+                }
+                return to_copy as isize;
+            }
+        }
+        errno::ENOENT
+    }
+
+    fn syscall_setenv_ring3(&mut self, buf_ptr: u64, key_len: u64, val_len: u64) -> isize {
+        let key_len = key_len as usize;
+        let val_len = val_len as usize;
+        if key_len == 0 || key_len > MAX_ENV_KEY_LEN || val_len > MAX_ENV_VAL_LEN {
+            return errno::EINVAL;
+        }
+        let total = key_len + val_len;
+        if total > MAX_ENV_KEY_LEN + MAX_ENV_VAL_LEN {
+            return errno::EINVAL;
+        }
+        let mut buf = [0u8; MAX_ENV_KEY_LEN + MAX_ENV_VAL_LEN];
+        let process = self.ring3_context.process;
+        if let Err(e) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            buf_ptr,
+            &mut buf[..total],
+        ) {
+            return self.map_ring3_copy_error(e);
+        }
+        let key_bytes = &buf[..key_len];
+        let val_bytes = &buf[key_len..total];
+        let process = &mut self.ring3_context.process;
+        // Try to update an existing entry first.
+        for slot in &mut process.env_vars[..process.env_count] {
+            let Some(entry) = slot else { continue };
+            if entry.key[..entry.key_len] == *key_bytes {
+                entry.val[..val_len].copy_from_slice(val_bytes);
+                entry.val_len = val_len;
+                self.flush_env_to_active_task();
+                return 0;
+            }
+        }
+        // Add new entry.
+        if process.env_count >= MAX_ENV_VARS {
+            return errno::ENOSPC;
+        }
+        let mut entry = EMPTY_ENV_ENTRY;
+        entry.key[..key_len].copy_from_slice(key_bytes);
+        entry.key_len = key_len;
+        entry.val[..val_len].copy_from_slice(val_bytes);
+        entry.val_len = val_len;
+        let idx = process.env_count;
+        process.env_vars[idx] = Some(entry);
+        process.env_count += 1;
+        self.flush_env_to_active_task();
+        0
+    }
+
+    fn syscall_unsetenv_ring3(&mut self, key_ptr: u64, key_len: u64) -> isize {
+        if key_ptr == 0 || key_len == 0 || key_len > MAX_ENV_KEY_LEN as u64 {
+            return errno::EINVAL;
+        }
+        let key_len = key_len as usize;
+        let mut key_buf = [0u8; MAX_ENV_KEY_LEN];
+        let process = self.ring3_context.process;
+        if let Err(e) = ring3_groundwork::copy_from_user_bytes(
+            &process.user_ranges,
+            process.user_range_count,
+            process.address_space,
+            key_ptr,
+            &mut key_buf[..key_len],
+        ) {
+            return self.map_ring3_copy_error(e);
+        }
+        let key_bytes = &key_buf[..key_len];
+        let process = &mut self.ring3_context.process;
+        let count = process.env_count;
+        for i in 0..count {
+            let matches = if let Some(entry) = &process.env_vars[i] {
+                entry.key[..entry.key_len] == *key_bytes
+            } else {
+                false
+            };
+            if matches {
+                // Compact: move last entry into this slot.
+                if i + 1 < count {
+                    process.env_vars[i] = process.env_vars[count - 1];
+                } else {
+                    process.env_vars[i] = None;
+                }
+                process.env_vars[count - 1] = None;
+                process.env_count -= 1;
+                self.flush_env_to_active_task();
+                return 0;
+            }
+        }
+        errno::ENOENT
+    }
+
+    /// Flush the active context's env_vars back to the task record.
+    fn flush_env_to_active_task(&mut self) {
+        if let Some(slot) = self.ring3_active_slot
+            && let Some(task) = self.ring3_tasks[slot].as_mut()
+        {
+            task.process.env_vars = self.ring3_context.process.env_vars;
+            task.process.env_count = self.ring3_context.process.env_count;
+        }
+    }
+
     /// SYS_FORK: create a child process with CoW-shared address space.
     ///
     /// Returns the child PID to the parent; the child receives 0 via its trap frame.
@@ -2175,6 +2590,14 @@ impl Scheduler {
         child_task.process.cwd = self.ring3_context.process.cwd;
         child_task.process.cwd_len = self.ring3_context.process.cwd_len;
         child_task.process.brk_end = self.ring3_context.process.brk_end;
+        // M20: inherit signal handlers and mask; clear pending signals and saved frame.
+        child_task.process.signal_handlers = self.ring3_context.process.signal_handlers;
+        child_task.process.signal_mask = self.ring3_context.process.signal_mask;
+        child_task.process.pending_signals = 0;
+        child_task.process.signal_saved_frame = None;
+        // M26: inherit environment variables.
+        child_task.process.env_vars = self.ring3_context.process.env_vars;
+        child_task.process.env_count = self.ring3_context.process.env_count;
         // Copy parent VMA list; mark writable VMAs as CoW in child.
         child_task.process.vma_list = self.ring3_context.process.vma_list;
         child_task.process.vma_count = self.ring3_context.process.vma_count;
@@ -2471,7 +2894,7 @@ impl Scheduler {
             recv_req_ptr,
             size_of::<UdpRecvReq>() as u64,
         );
-        let fd_smoke = match self.run_ring3_fd_groundwork_smoke(current) {
+        let fd_smoke = match self.run_ring3_fd_groundwork_smoke(current.syscall_ctx()) {
             Ok(result) => result,
             Err(error) => {
                 self.disarm_ring3_context();
@@ -2507,7 +2930,7 @@ impl Scheduler {
 
     fn run_ring3_fd_groundwork_smoke(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
     ) -> Result<Ring3FdSmokeResult, isize> {
         let readme_path = b"/README.TXT";
         let tmp_path = b"/tmp/FD_SMOKE.TXT";
@@ -2684,7 +3107,9 @@ impl Scheduler {
         let Some(pid) = self.take_next_pid() else {
             return Err(errno::ENODEV);
         };
-        let context = Ring3ProcessContext::new(pid, contract.worker_name, contract.syscall_caps);
+        let mut context =
+            Ring3ProcessContext::new(pid, contract.worker_name, contract.syscall_caps);
+        context.seed_default_env();
         let image = ring3_groundwork::load_native_process_image(elf).map_err(|error| {
             serial::write_fmt(format_args!("ring3 run: ELF load failed: {error}\n"));
             errno::EINVAL
@@ -2752,6 +3177,7 @@ impl Scheduler {
         task.process.pid = pid;
         task.process.name = worker_name;
         task.process.syscall_caps = syscall_caps;
+        task.process.seed_default_env();
         if let Some(tty) = tty {
             task.process.fd_table.set_tty_stdio(tty);
         }
@@ -2804,6 +3230,8 @@ impl Scheduler {
                 task.state = Ring3TaskState::Running;
                 self.ring3_context.active = true;
                 self.ring3_context.process = task.process;
+                // M20: deliver any pending signal before launching.
+                self.deliver_pending_signal_if_any();
                 let launch = self.ring3_context.process.launch_context();
                 // Publish the active PID so the timer ISR can preempt without holding the lock.
                 RING3_ACTIVE_PID.store(launch.pid, Ordering::Release);
@@ -3568,7 +3996,7 @@ impl Scheduler {
 
     fn syscall_open_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         flags: u64,
         path_len: u64,
@@ -3646,7 +4074,7 @@ impl Scheduler {
         self.fd_write_from(&mut task.fd_table, 1, bytes)
     }
 
-    fn syscall_write_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+    fn syscall_write_ring3(&mut self, process: Ring3SyscallCtx, ptr: u64, len: u64) -> isize {
         let Ok(len) = usize::try_from(len) else {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -3690,7 +4118,7 @@ impl Scheduler {
         self.fd_read_into(&mut task.fd_table, 0, out)
     }
 
-    fn syscall_read_ring3(&mut self, process: Ring3ProcessContext, ptr: u64, len: u64) -> isize {
+    fn syscall_read_ring3(&mut self, process: Ring3SyscallCtx, ptr: u64, len: u64) -> isize {
         let Ok(len) = usize::try_from(len) else {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -3762,7 +4190,7 @@ impl Scheduler {
 
     fn syscall_fread_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -3875,7 +4303,7 @@ impl Scheduler {
 
     fn syscall_fwrite_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -3972,7 +4400,7 @@ impl Scheduler {
 
     fn syscall_fstat_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         ptr: u64,
         len: u64,
@@ -4107,7 +4535,7 @@ impl Scheduler {
 
     fn syscall_connect_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         req_ptr: u64,
         req_len: u64,
     ) -> isize {
@@ -4141,7 +4569,7 @@ impl Scheduler {
 
     fn syscall_send_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_len: u64,
@@ -4186,7 +4614,7 @@ impl Scheduler {
 
     fn syscall_recv_ring3(
         &mut self,
-        _ctx: Ring3ProcessContext,
+        _ctx: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_cap: u64,
@@ -4262,7 +4690,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_ping_ring3(&mut self, _ctx: Ring3ProcessContext, ip_ptr: u64, ip_len: u64) -> isize {
+    fn syscall_ping_ring3(&mut self, _ctx: Ring3SyscallCtx, ip_ptr: u64, ip_len: u64) -> isize {
         if ip_len != 4 {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EINVAL;
@@ -4278,7 +4706,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_bind_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64, port: u64) -> isize {
+    fn syscall_bind_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64, port: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -4313,7 +4741,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_listen_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+    fn syscall_listen_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -4337,7 +4765,7 @@ impl Scheduler {
         }
     }
 
-    fn syscall_accept_ring3(&mut self, _ctx: Ring3ProcessContext, fd: u64) -> isize {
+    fn syscall_accept_ring3(&mut self, _ctx: Ring3SyscallCtx, fd: u64) -> isize {
         let Ok(fd32) = u32::try_from(fd) else {
             return errno::EBADF;
         };
@@ -4604,7 +5032,7 @@ impl Scheduler {
 
     fn syscall_sendto_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         req_ptr: u64,
         req_len: u64,
@@ -4672,7 +5100,7 @@ impl Scheduler {
 
     fn syscall_recvfrom_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         req_ptr: u64,
         req_len: u64,
@@ -5305,7 +5733,7 @@ impl Scheduler {
 
     /// Ring-3 pipe: allocate a new pipe and write `(read_fd, write_fd)` into
     /// the user-space `[u32; 2]` pointed to by `fds_ptr`.
-    fn syscall_pipe_ring3(&mut self, process: Ring3ProcessContext, fds_ptr: u64) -> isize {
+    fn syscall_pipe_ring3(&mut self, process: Ring3SyscallCtx, fds_ptr: u64) -> isize {
         if fds_ptr == 0 {
             self.stats.errors = self.stats.errors.saturating_add(1);
             return errno::EFAULT;
@@ -5356,7 +5784,7 @@ impl Scheduler {
     /// Used by two-path syscalls (rename, link, symlink).
     fn copy_two_paths_from_ring3(
         &mut self,
-        process: &Ring3ProcessContext,
+        process: &Ring3SyscallCtx,
         buf_ptr: u64,
         src_len: usize,
         dst_len: usize,
@@ -5381,7 +5809,7 @@ impl Scheduler {
 
     fn syscall_mkdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         mode_arg: u64,
         path_len: u64,
@@ -5434,7 +5862,7 @@ impl Scheduler {
 
     fn syscall_rmdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -5485,7 +5913,7 @@ impl Scheduler {
 
     fn syscall_unlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -5536,7 +5964,7 @@ impl Scheduler {
 
     fn syscall_rename_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         old_len: u64,
         new_len: u64,
@@ -5599,7 +6027,7 @@ impl Scheduler {
 
     fn syscall_link_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         src_len: u64,
         dst_len: u64,
@@ -5662,7 +6090,7 @@ impl Scheduler {
 
     fn syscall_symlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         target_len: u64,
         link_len: u64,
@@ -5716,7 +6144,7 @@ impl Scheduler {
 
     fn syscall_readlink_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
         buf_ptr: u64,
@@ -5786,7 +6214,7 @@ impl Scheduler {
 
     fn syscall_getcwd_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         buf_ptr: u64,
         buf_cap: u64,
     ) -> isize {
@@ -5822,7 +6250,7 @@ impl Scheduler {
 
     fn syscall_chdir_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         path_ptr: u64,
         path_len: u64,
     ) -> isize {
@@ -5884,7 +6312,7 @@ impl Scheduler {
 
     fn syscall_getdents_ring3(
         &mut self,
-        process: Ring3ProcessContext,
+        process: Ring3SyscallCtx,
         fd: u64,
         buf_ptr: u64,
         buf_cap: u64,
@@ -6158,6 +6586,8 @@ fn syscall_required_caps(number: u64) -> u32 {
         SYS_GETPPID | SYS_GETUID | SYS_GETGID | SYS_KILL | SYS_SIGACTION | SYS_SIGRETURN => {
             caps::PROC
         }
+        // M26: environment variable ops
+        SYS_GETENV | SYS_SETENV | SYS_UNSETENV => caps::CORE,
         SYS_TIME_MS => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
         | SYS_LISTEN | SYS_ACCEPT | SYS_PING => caps::NET,

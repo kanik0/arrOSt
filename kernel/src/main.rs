@@ -9,6 +9,7 @@ extern crate alloc;
 // kernel/src/main.rs: kernel entry point and early-boot flow.
 mod arch;
 mod audio;
+mod console;
 mod doom;
 mod doom_bridge;
 mod fs;

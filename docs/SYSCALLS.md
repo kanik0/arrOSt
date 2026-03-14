@@ -4,7 +4,7 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 
 ## ABI revision
 
-- Current revision: `5`
+- Current revision: `6`
 - Shared constants live in `crates/arrostd/src/lib.rs`
 
 ## Syscall numbers
@@ -66,12 +66,12 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | 37 | `getgid` | `() -> gid` | Group ID (stub: 0) |
 | 38 | `kill` | `(pid, sig) -> 0 or -errno` | Send signal to process |
 
-### Signal stubs (39-40)
+### Signals (39-40)
 
-| Number | Name | Notes |
-|--------|------|-------|
-| 39 | `sigaction` | Returns `ENOSYS` (not yet implemented) |
-| 40 | `sigreturn` | Returns `ENOSYS` (not yet implemented) |
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 39 | `sigaction` | `(signum, handler_fn) -> 0 or -errno` | Install signal handler; `handler_fn=0` → SIG_DFL, `handler_fn=1` → SIG_IGN. SIGKILL/SIGSTOP return EINVAL. |
+| 40 | `sigreturn` | `() -> 0` | Restore pre-signal trap frame from `signal_saved_frame`; must be called explicitly by signal handler. |
 
 ### Memory (41-44)
 
@@ -81,6 +81,16 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | 42 | `munmap` | `(addr, len) -> 0 or -errno` — Unmap virtual range; splits/removes VMAs, unmaps pages, TLB flush. |
 | 43 | `mprotect` | `(addr, len, prot) -> 0 or -errno` — Change VMA permission bits (WRITE/EXEC); updates PTEs for mapped pages. |
 | 44 | `brk` | Query (`brk(0)`) returns current break. Extend grows heap VMA (demand-paged). Shrink unmaps reclaimed pages. |
+
+### Environment variables (56-58)
+
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 56 | `getenv` | `(key_ptr, key_len, buf_ptr, buf_cap) -> bytes or -errno` | Read process env var into buffer; returns value length. |
+| 57 | `setenv` | `(key_ptr, key_len, val_ptr, val_len) -> 0 or -errno` | Set or update process env var. |
+| 58 | `unsetenv` | `(key_ptr, key_len) -> 0 or -errno` | Remove process env var. |
+
+All three require `caps::CORE`. Maximum key length: 32 bytes; maximum value length: 128 bytes; maximum env entries per process: 16.
 
 ### Pipe IPC (45-46)
 
@@ -206,6 +216,8 @@ On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to pr
 On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, arguments in `x0..x5`, return value in `x0`.
 `execve` (M22, SYS_EXECVE=54) is now implemented: user-space processes can replace their image via VFS path. Kernel-mediated spawn-from-path remains the active shell dispatch path.
 `fork` (M13), anonymous `mmap`, `munmap`, `mprotect`, and `brk` are fully implemented (M13/M21). File-backed `mmap` and `MAP_SHARED` remain `ENOSYS`.
+`sigaction` (M20, SYS_SIGACTION=39) and `sigreturn` (M20, SYS_SIGRETURN=40) are fully implemented for ring-3 processes. Cooperative tasks still return `ENOSYS`.
+`getenv`/`setenv`/`unsetenv` (M26, SYS_GETENV=56 / SYS_SETENV=57 / SYS_UNSETENV=58) are fully implemented for ring-3 processes. Shell-level `env`/`export` commands and `$VAR` expansion are available on the serial and GUI terminal.
 
 ## Userland shim
 

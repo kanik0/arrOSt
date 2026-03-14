@@ -79,6 +79,12 @@ pub mod syscall {
     pub const SYS_EXECVE: u64 = 54;
     /// M31: launch/control the kernel doom engine from ring-3.
     pub const SYS_DOOM_LAUNCH: u64 = 55;
+    /// M26: get a process environment variable by name.
+    pub const SYS_GETENV: u64 = 56;
+    /// M26: set a process environment variable.
+    pub const SYS_SETENV: u64 = 57;
+    /// M26: unset a process environment variable.
+    pub const SYS_UNSETENV: u64 = 58;
 
     /// `SYS_DOOM_LAUNCH` subcommand codes.
     pub const DOOM_CMD_PLAY: u64 = 0;
@@ -140,10 +146,21 @@ pub mod syscall {
         pub buf_cap: u64,
     }
 
+    pub const SIGHUP: u32 = 1;
+    pub const SIGINT: u32 = 2;
+    pub const SIGQUIT: u32 = 3;
+    pub const SIGILL: u32 = 4;
+    pub const SIGSEGV: u32 = 11;
     pub const SIGKILL: u32 = 9;
-    pub const SIGTERM: u32 = 15;
     pub const SIGUSR1: u32 = 10;
     pub const SIGUSR2: u32 = 12;
+    pub const SIGTERM: u32 = 15;
+    pub const SIGCHLD: u32 = 17;
+    pub const SIGCONT: u32 = 18;
+    pub const SIGSTOP: u32 = 19;
+
+    /// Maximum valid signal number (exclusive).
+    pub const NSIG: u32 = 32;
 
     pub const O_RDONLY: u32 = 0;
     pub const O_WRONLY: u32 = 1;
@@ -295,6 +312,9 @@ pub mod syscall {
             SYS_PING => "ping",
             SYS_EXECVE => "execve",
             SYS_DOOM_LAUNCH => "doom_launch",
+            SYS_GETENV => "getenv",
+            SYS_SETENV => "setenv",
+            SYS_UNSETENV => "unsetenv",
             SYS_MKDIR => "mkdir",
             SYS_RMDIR => "rmdir",
             SYS_UNLINK => "unlink",
@@ -467,10 +487,10 @@ pub mod syscall {
 pub mod runtime {
     use crate::syscall::{
         FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_DOOM_LAUNCH, SYS_EXECVE, SYS_EXIT,
-        SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID,
-        SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
-        SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SYMLINK,
-        SYS_UNLINK, SYS_WRITE,
+        SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV,
+        SYS_GETGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
+        SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
+        SYS_SETENV, SYS_SIGACTION, SYS_SIGRETURN, SYS_SYMLINK, SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -1013,6 +1033,109 @@ pub mod runtime {
     /// (non-negative) or negative errno (`EAGAIN` = no connection within timeout).
     pub fn accept(fd: u32) -> isize {
         syscall3(crate::syscall::SYS_ACCEPT, fd as u64, 0u64, 0u64)
+    }
+
+    // ── M20: Signal Infrastructure ──────────────────────────────────────────────
+
+    /// Register a signal handler for `signum`.
+    ///
+    /// `handler_fn` is the address of the user-space handler function.
+    /// The handler receives the signal number in the accumulator register:
+    /// - **aarch64**: x0 (first argument, standard calling convention).
+    /// - **x86_64**: rax (use `signal_signum()` to read it).
+    ///
+    /// The handler **must** call `sigreturn()` (or `arrostd::runtime::sigreturn()`)
+    /// before returning; the kernel does not use an sa_restorer mechanism.
+    ///
+    /// Returns 0 on success or negative errno.
+    pub fn sigaction(signum: u32, handler_fn: u64) -> isize {
+        syscall2(SYS_SIGACTION, signum as u64, handler_fn)
+    }
+
+    /// Signal-ignore action: pass this as `handler_fn` to `sigaction` to ignore a signal.
+    pub const SIG_IGN: u64 = 1;
+    /// Signal-default action: pass this as `handler_fn` to `sigaction` to restore default.
+    pub const SIG_DFL: u64 = 0;
+
+    /// Return from a signal handler, restoring the pre-signal execution context.
+    ///
+    /// This **must** be called at the end of every signal handler (either directly
+    /// or via `sigreturn()`).  It does not return.
+    pub fn sigreturn() -> ! {
+        let _ = syscall0(SYS_SIGRETURN);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Read the signal number delivered to the currently-executing signal handler.
+    ///
+    /// The kernel places `signum` in the accumulator register when it redirects
+    /// execution to the handler:
+    /// - **aarch64**: x0 (first argument) — works transparently for `fn handler(signum: u32)`.
+    /// - **x86_64**: rax — must be read explicitly via this helper.
+    ///
+    /// Safe to call only inside a signal handler.
+    pub fn signal_signum() -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let v: u32;
+            // SAFETY: called inside a signal handler where rax contains signum.
+            unsafe {
+                core::arch::asm!("mov {:e}, eax", out(reg) v, options(nostack, nomem, preserves_flags))
+            }
+            v
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let v: u32;
+            // SAFETY: called inside a signal handler where x0 contains signum.
+            unsafe {
+                core::arch::asm!("mov {:w}, w0", out(reg) v, options(nostack, nomem, preserves_flags))
+            }
+            v
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            0
+        }
+    }
+
+    // ── M26: Environment Variables ───────────────────────────────────────────────
+
+    /// Look up the environment variable `key`.
+    /// Writes the value into `buf` and returns the number of bytes written, or negative errno.
+    /// Returns `ENOENT` if the variable is not set.
+    pub fn getenv(key: &str, buf: &mut [u8]) -> isize {
+        syscall4(
+            SYS_GETENV,
+            key.as_ptr() as u64,
+            key.len() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+
+    /// Set the environment variable `key` to `val`.
+    /// Returns 0 on success or negative errno.
+    pub fn setenv(key: &str, val: &str) -> isize {
+        let klen = key.len() as u64;
+        let vlen = val.len() as u64;
+        // Pack key and val in a single stack buffer.
+        let mut buf = [0u8; 320];
+        let total = key.len() + val.len();
+        if total > buf.len() {
+            return crate::syscall::errno::EINVAL;
+        }
+        buf[..key.len()].copy_from_slice(key.as_bytes());
+        buf[key.len()..total].copy_from_slice(val.as_bytes());
+        syscall4(SYS_SETENV, buf.as_ptr() as u64, klen, vlen, 0)
+    }
+
+    /// Unset the environment variable `key`.
+    /// Returns 0 on success or negative errno (ENOENT if not set).
+    pub fn unsetenv(key: &str) -> isize {
+        syscall2(SYS_UNSETENV, key.as_ptr() as u64, key.len() as u64)
     }
 }
 

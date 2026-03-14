@@ -139,10 +139,10 @@ Useful runtime commands:
 ## Known limitations
 
 - File-backed `mmap` and `MAP_SHARED` are not yet implemented (return `ENOSYS`).
-- Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction` and `sigreturn` return `ENOSYS`.
+- Signal infrastructure (M20) is implemented for ring-3 processes: `sigaction`/`sigreturn`, `pending_signals` bitmask, POSIX default actions, fork inheritance. Cooperative tasks still return `ENOSYS`. Signal masking (`sigprocmask`) is deferred.
 - No `/dev` filesystem or device nodes.
-- No ANSI/VT100 terminal escape sequence support.
-- No environment variables or process inheritance beyond fd tables.
+- ANSI/VT100 CSI escape sequences (M25) are parsed and rendered in the GUI terminal with per-cell 16-color output. Serial pass-through and bold/underline rendering are deferred.
+- Environment variables (M26): per-process env arrays with `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `env`/`export`/`$VAR` expansion. `envp` passed to `execve` is deferred.
 - Single-core only; no SMP support.
 - No real-time clock or wall-clock timestamps.
 - No block/buffer cache; all disk I/O is synchronous and uncached.
@@ -166,13 +166,13 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M17 | Full-data journaling | Complete |
 | M18 | Hardware abstraction layer | Complete |
 | M19 | Production TCP/IP + utilities | Complete |
-| M20 | Signal infrastructure | Planned |
+| M20 | Signal infrastructure | Complete |
 | M21 | Full mmap / VMA layer | Complete |
-| M22 | execve syscall | Planned |
+| M22 | execve syscall | Complete |
 | M23 | /dev filesystem | Planned |
 | M24 | Shell pipes + process groups | Planned |
-| M25 | ANSI terminal emulation | Planned |
-| M26 | Environment variables | Planned |
+| M25 | ANSI terminal emulation | Complete |
+| M26 | Environment variables | Complete |
 | M27 | SMP / multi-core | Planned |
 | M28 | RTC + wall-clock time | Planned |
 | M29 | Block cache | Planned |
