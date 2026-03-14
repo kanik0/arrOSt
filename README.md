@@ -111,7 +111,7 @@ Current syscall surface (52 syscalls):
 - directory/path: `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `getcwd`, `chdir`, `getdents`
 - process identity: `getppid`, `getuid`, `getgid`, `kill`
 - ipc: `pipe`, `pipe2`
-- stubs (return `ENOSYS`): `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, `brk`
+- stubs (return `ENOSYS`): `sigaction`, `sigreturn`
 
 Useful runtime commands:
 
@@ -139,7 +139,7 @@ Useful runtime commands:
 ## Known limitations
 
 - There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
-- `munmap`, `mprotect`, full VMA shrink, and `/proc/<pid>/maps` are not yet implemented (tracked in M21).
+- File-backed `mmap` and `MAP_SHARED` are not yet implemented (returns `ENOSYS`).
 - Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
 - No `/dev` filesystem or device nodes.
 - No ANSI/VT100 terminal escape sequence support.
@@ -168,7 +168,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M18 | Hardware abstraction layer | Complete |
 | M19 | Production TCP/IP + utilities | Complete |
 | M20 | Signal infrastructure | Planned |
-| M21 | Full mmap / VMA layer | Planned |
+| M21 | Full mmap / VMA layer | Complete |
 | M22 | execve syscall | Planned |
 | M23 | /dev filesystem | Planned |
 | M24 | Shell pipes + process groups | Planned |

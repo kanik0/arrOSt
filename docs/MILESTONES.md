@@ -20,7 +20,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M18** | Hardware Abstraction Layer | **Complete** |
 | **M19** | Production TCP/IP + Unix Utilities | **Complete** |
 | **M20** | Signal Infrastructure | Not started |
-| **M21** | Full mmap / VMA Layer | Not started |
+| **M21** | Full mmap / VMA Layer | **Complete** |
 | **M22** | execve Syscall | **Complete** |
 | **M23** | /dev Filesystem + Device Nodes | Not started |
 | **M24** | Shell Pipes + Process Groups | Not started |
@@ -249,47 +249,39 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ### M21: Full mmap / VMA Layer
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Replace `mmap`/`munmap`/`mprotect`/`brk` stubs with a real VMA-backed memory manager.
 
 **Dependencies**: M13 (VMA tracking, demand paging).
 
-#### Step 1: Implement `sys_mmap`
-**Files to modify**: `kernel/src/proc/mod.rs`, `kernel/src/mem/vma.rs`
+#### Delivered
 
-1. `sys_mmap(addr_hint, length, prot, flags, fd, offset) -> u64`:
-   - `MAP_ANONYMOUS | MAP_PRIVATE`: allocate VMA range in user address space, demand-paged (zero-fill on fault).
-   - `MAP_ANONYMOUS | MAP_SHARED`: allocate shared VMA (for future IPC).
-   - File-backed mapping (fd != -1): create VMA backed by file data (read from VFS on fault).
-   - Return start address or `-ENOMEM`.
-2. Address allocation: simple bump allocator in user virtual range, or first-fit over VMA gaps.
-3. Alignment: page-aligned (4 KiB).
+- **`sys_munmap` (SYS_MUNMAP=42)**: Unmaps a virtual address range `[addr, addr+len)`.
+  - Rebuilds the VMA list removing or splitting overlapping entries (supports full unmap, head trim, tail trim, and hole punch).
+  - Calls `unmap_user_page_for_token` for each demand-paged physical page in the range, clearing the PTE and performing TLB flush (`invlpg` on x86_64, `tlbi vaae1is` on aarch64).
+  - Drops the `Arc<UserPageHolder>` for each unmapped page, freeing physical memory when exclusively owned.
+- **`sys_mprotect` (SYS_MPROTECT=43)**: Changes permission bits on a virtual address range.
+  - Updates `VmaFlags` (READ/WRITE/EXEC/COW bits) for all overlapping VMAs.
+  - Calls `update_page_perms_for_token` for each already-mapped page in the range; updates WRITABLE and NO_EXECUTE (x86_64) or AP and UXN (aarch64) bits in the PTE.
+  - Clearing COW when making a range writable avoids stale CoW obligations.
+- **`sys_brk` shrink**: `brk(new_addr)` where `new_addr < current_break` now unmaps the reclaimed heap pages via `syscall_munmap_ring3` and updates `brk_end`.
+- **`/proc/<pid>/maps`**: New synthetic file exposing the VMA list in Linux-compatible format.
+  - `cat /proc/<pid>/maps` outputs one line per VMA: `start-end rwxp 00000000 00:00 0`.
+  - Also accessible as `/proc/self/maps`.
+  - Backed by `proc::vma_snapshot_for_pid` which snapshots VMA state from either the active context or the task table.
+- **New `ring3_groundwork` helpers** (both architectures):
+  - `unmap_user_page_for_token(token, vaddr)` — clear PTE + TLB flush.
+  - `update_page_perms_for_token(token, vaddr, writable, executable)` — atomic write+exec PTE update + TLB flush.
+- **`arrostd::runtime` helpers**:
+  - `munmap(addr, len) -> isize`
+  - `mprotect(addr, len, prot) -> isize`
 
-#### Step 2: Implement `sys_munmap`
-1. Find VMA(s) overlapping `[addr, addr+length)`.
-2. Unmap pages from process page table; `frame_ref_dec` for each.
-3. Remove or split VMA entries.
+#### Not delivered (deferred)
 
-#### Step 3: Implement `sys_mprotect`
-1. Find VMA for address range.
-2. Update VMA flags and PTE permissions (read-only, no-exec, etc.).
-3. Flush TLB.
-
-#### Step 4: Implement `sys_brk`
-1. Track program break per process.
-2. `brk(0)` returns current break.
-3. `brk(new_addr)` expands or contracts the heap VMA; demand-paged.
-
-#### Step 5: Wire `/proc/<pid>/maps`
-**Files to modify**: `kernel/src/fs/procfs.rs`
-
-1. For each VMA in process, output one line: `start-end perms offset dev inode pathname`.
-2. Expose via `cat /proc/<pid>/maps`.
-
-#### Testing
-1. Ring-3 test app allocates 64 KiB via `mmap`, writes pattern, reads back, `munmap`.
-2. `brk` test: expand heap, write, verify.
-3. `mprotect` test: mark page read-only, write -> `SIGSEGV` (requires M20).
+- File-backed `mmap` (fd != -1): returns `ENOSYS`. Requires VFS page-cache integration.
+- `MAP_SHARED` anonymous mappings (for IPC): returns `ENOSYS`.
+- VMA split when `mprotect` or `munmap` covers a strict sub-range with different permissions (only whole-VMA granularity for mprotect; munmap does split correctly).
+- `/proc/<pid>/maps` pathname column: always empty (no backing-file tracking).
 
 ---
 
@@ -815,7 +807,7 @@ cargo xtask smoke-doom --arch x86_64   # still passes
 | Priority | Milestone | Rationale |
 |----------|-----------|-----------|
 | 1 | **M20**: Signal Infrastructure | Required for proper process management |
-| 2 | **M21**: Full mmap / VMA | Needed by many programs |
+| 2 | **M21**: Full mmap / VMA | **Complete** — `munmap`, `mprotect`, `brk` shrink, `/proc/<pid>/maps` |
 | 3 | **M22**: execve Syscall | True Unix exec model |
 | 4 | **M23**: /dev Filesystem | Standard Unix device access |
 | 5 | **M24**: Shell Pipes + Process Groups | Core shell usability |

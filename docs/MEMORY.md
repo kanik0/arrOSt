@@ -49,6 +49,8 @@ Heap allocator:
 - No advanced allocator strategy (fragmentation-aware allocator is not implemented yet).
 - No swap.
 - Demand paging and copy-on-write are implemented for ring-3 anonymous VMAs (M13); file-backed VMAs are not yet supported.
+- `munmap` and `mprotect` are implemented (M21): PTEs are cleared/updated and TLB flushed on both architectures. Physical pages are freed when the `Arc<UserPageHolder>` strong count drops to zero.
+- `/proc/<pid>/maps` exposes the VMA list in Linux-compatible format (M21).
 
 ## Relevant files
 

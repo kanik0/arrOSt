@@ -1938,6 +1938,212 @@ pub(crate) fn set_page_writable_for_token(
     }
 }
 
+/// Clear the PTE for `page_vaddr` in `token`'s address space and perform a TLB flush.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn unmap_user_page_for_token(token: AddressSpaceToken, page_vaddr: u64) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let Some(root_virt) = mem::phys_to_virt(token.root_table) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let p4 = &mut *(root_virt as *mut PageTable);
+        let p4e = &mut p4[page_table_index(page_base, 39)];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p3v) = mem::phys_to_virt(p4e.addr().as_u64()) else {
+            return;
+        };
+        let p3 = &mut *(p3v as *mut PageTable);
+        let p3e = &mut p3[page_table_index(page_base, 30)];
+        if !p3e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p2v) = mem::phys_to_virt(p3e.addr().as_u64()) else {
+            return;
+        };
+        let p2 = &mut *(p2v as *mut PageTable);
+        let p2e = &mut p2[page_table_index(page_base, 21)];
+        if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p1v) = mem::phys_to_virt(p2e.addr().as_u64()) else {
+            return;
+        };
+        let p1 = &mut *(p1v as *mut PageTable);
+        let p1e = &mut p1[page_table_index(page_base, 12)];
+        if !p1e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        p1e.set_unused();
+        core::arch::asm!("invlpg [{addr}]", addr = in(reg) page_base, options(nostack, preserves_flags));
+    }
+}
+
+/// Clear the PTE for `page_vaddr` in `token`'s address space and perform a TLB flush.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn unmap_user_page_for_token(token: AddressSpaceToken, page_vaddr: u64) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let table_phys = token.root_table & AARCH64_TABLE_ADDR_MASK;
+    let Some(l1v) = mem::phys_to_virt(table_phys) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let l1 = &mut *(l1v as *mut Aarch64PageTable);
+        let l1e = l1.entries[aarch64_table_index(page_base, 1)];
+        if (l1e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l2v) = mem::phys_to_virt(l1e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l2 = &mut *(l2v as *mut Aarch64PageTable);
+        let l2e = l2.entries[aarch64_table_index(page_base, 2)];
+        if (l2e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l3v) = mem::phys_to_virt(l2e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l3 = &mut *(l3v as *mut Aarch64PageTable);
+        let entry = &mut l3.entries[aarch64_table_index(page_base, 3)];
+        if (*entry & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        *entry = 0;
+        let tlbi_val = page_base >> 12;
+        asm!(
+            "dsb ish",
+            "tlbi vaae1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) tlbi_val,
+            options(nostack)
+        );
+    }
+}
+
+/// Update write and execute permission bits on the PTE for `page_vaddr` in `token`'s address space.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn update_page_perms_for_token(
+    token: AddressSpaceToken,
+    page_vaddr: u64,
+    writable: bool,
+    executable: bool,
+) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let Some(root_virt) = mem::phys_to_virt(token.root_table) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let p4 = &mut *(root_virt as *mut PageTable);
+        let p4e = &mut p4[page_table_index(page_base, 39)];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p3v) = mem::phys_to_virt(p4e.addr().as_u64()) else {
+            return;
+        };
+        let p3 = &mut *(p3v as *mut PageTable);
+        let p3e = &mut p3[page_table_index(page_base, 30)];
+        if !p3e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p2v) = mem::phys_to_virt(p3e.addr().as_u64()) else {
+            return;
+        };
+        let p2 = &mut *(p2v as *mut PageTable);
+        let p2e = &mut p2[page_table_index(page_base, 21)];
+        if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let Some(p1v) = mem::phys_to_virt(p2e.addr().as_u64()) else {
+            return;
+        };
+        let p1 = &mut *(p1v as *mut PageTable);
+        let p1e = &mut p1[page_table_index(page_base, 12)];
+        if !p1e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let phys = p1e.addr();
+        let mut flags = p1e.flags();
+        if writable {
+            flags |= PageTableFlags::WRITABLE;
+        } else {
+            flags &= !PageTableFlags::WRITABLE;
+        }
+        if executable {
+            flags &= !PageTableFlags::NO_EXECUTE;
+        } else {
+            flags |= PageTableFlags::NO_EXECUTE;
+        }
+        p1e.set_addr(phys, flags);
+        core::arch::asm!("invlpg [{addr}]", addr = in(reg) page_base, options(nostack, preserves_flags));
+    }
+}
+
+/// Update write and execute permission bits on the PTE for `page_vaddr` in `token`'s address space.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn update_page_perms_for_token(
+    token: AddressSpaceToken,
+    page_vaddr: u64,
+    writable: bool,
+    executable: bool,
+) {
+    let page_base = page_vaddr & !(USER_PAGE_BYTES as u64 - 1);
+    let table_phys = token.root_table & AARCH64_TABLE_ADDR_MASK;
+    let Some(l1v) = mem::phys_to_virt(table_phys) else {
+        return;
+    };
+    // SAFETY: page-table pointers come from the kernel-mapped, process-owned hierarchy.
+    unsafe {
+        let l1 = &mut *(l1v as *mut Aarch64PageTable);
+        let l1e = l1.entries[aarch64_table_index(page_base, 1)];
+        if (l1e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l2v) = mem::phys_to_virt(l1e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l2 = &mut *(l2v as *mut Aarch64PageTable);
+        let l2e = l2.entries[aarch64_table_index(page_base, 2)];
+        if (l2e & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let Some(l3v) = mem::phys_to_virt(l2e & AARCH64_TABLE_ADDR_MASK) else {
+            return;
+        };
+        let l3 = &mut *(l3v as *mut Aarch64PageTable);
+        let entry = &mut l3.entries[aarch64_table_index(page_base, 3)];
+        if (*entry & AARCH64_TABLE_VALID) == 0 {
+            return;
+        }
+        let new_ap = if writable {
+            AARCH64_TABLE_AP_EL1_RW_EL0_RW
+        } else {
+            AARCH64_TABLE_AP_EL1_RO_EL0_RO
+        };
+        *entry = (*entry & !AARCH64_TABLE_AP_MASK) | new_ap;
+        if executable {
+            *entry &= !AARCH64_TABLE_UXN;
+        } else {
+            *entry |= AARCH64_TABLE_UXN;
+        }
+        let tlbi_val = page_base >> 12;
+        asm!(
+            "dsb ish",
+            "tlbi vaae1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) tlbi_val,
+            options(nostack)
+        );
+    }
+}
+
 /// Create a fork child image: new address space with all parent pages shared (CoW).
 ///
 /// All writable pages in the parent are marked read-only in both parent and child PTEs.

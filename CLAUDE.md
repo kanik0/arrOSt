@@ -271,6 +271,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M31 | Doom as first-class executable | `SYS_DOOM_LAUNCH=55`; `/bin/doom` ring-3 ELF; `/usr/share/doom/doom1.wad` VFS seeding; shell dispatch via `try_launch_shell_vfs_user_bin`; `-C code-model=large` fix in `build_userland_package` |
 | M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; comb-filter reverb |
 | M31D | Doom authentic music (OPL2) | OPL2 emulator implemented, GENMIDI loading, MUS player — **audio plays but sounds incorrect (quasi-monotone); root cause not resolved** |
+| M21 | Full mmap / VMA layer | `munmap` (VMA split/remove + PTE clear + TLB flush + physical page free); `mprotect` (VMA flag update + PTE permission update); `brk` shrink; `/proc/<pid>/maps`; `arrostd::runtime::{munmap,mprotect}` |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -279,7 +280,6 @@ Non saltare mai questi step, anche se sembra inutile.
 | # | Milestone | Goal |
 |---|-----------|------|
 | M20 | Signal infrastructure | `sigaction`/`sigreturn`, signal delivery, default actions, masking |
-| M21 | Full mmap / VMA | Add `munmap`/`mprotect`, file-backed mappings, VMA shrink, `/proc/<pid>/maps` |
 | M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
 | M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
 | M25 | ANSI terminal | VT100 escape sequences, 16-color palette, cursor control |

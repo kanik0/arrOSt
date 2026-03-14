@@ -30,6 +30,9 @@ fn pid_cmdline_ino(pid: u32) -> InodeNum {
 fn pid_stat_ino(pid: u32) -> InodeNum {
     0x4000u32.saturating_add(pid)
 }
+fn pid_maps_ino(pid: u32) -> InodeNum {
+    0x5000u32.saturating_add(pid)
+}
 
 const PROC_MODE_DIR: u16 = 0o555;
 const PROC_MODE_FILE: u16 = 0o444;
@@ -71,6 +74,9 @@ pub enum ProcOpenFile {
     PidStat {
         pid: u32,
     },
+    PidMaps {
+        pid: u32,
+    },
 }
 
 pub struct ProcFs;
@@ -86,6 +92,10 @@ impl ProcFs {
             "self" => Ok(Self::dir_stat(PROC_SELF_INO)),
             "net" => Ok(Self::dir_stat(PROC_NET_DIR_INO)),
             "self/pid" | "mounts" | "uptime" | "ps" => {
+                let file = self.open_file(local_path, ctx)?;
+                self.stat_file(file, ctx.root_backend)
+            }
+            "self/maps" => {
                 let file = self.open_file(local_path, ctx)?;
                 self.stat_file(file, ctx.root_backend)
             }
@@ -117,6 +127,7 @@ impl ProcFs {
             "/status" | "status" => Ok(Self::file_stat(pid_status_ino(pid))),
             "/cmdline" | "cmdline" => Ok(Self::file_stat(pid_cmdline_ino(pid))),
             "/stat" | "stat" => Ok(Self::file_stat(pid_stat_ino(pid))),
+            "/maps" | "maps" => Ok(Self::file_stat(pid_maps_ino(pid))),
             _ => Err(FsError::NotFound),
         }
     }
@@ -151,7 +162,10 @@ impl ProcFs {
                     return self.readdir_pid(pid, out);
                 }
                 if ctx.current_pid.is_some()
-                    && matches!(local_path, "self/status" | "self/cmdline" | "self/stat")
+                    && matches!(
+                        local_path,
+                        "self/status" | "self/cmdline" | "self/stat" | "self/maps"
+                    )
                 {
                     return Err(FsError::NotADirectory);
                 }
@@ -225,6 +239,7 @@ impl ProcFs {
                 (pid_status_ino(pid), FileType::Regular, "status"),
                 (pid_cmdline_ino(pid), FileType::Regular, "cmdline"),
                 (pid_stat_ino(pid), FileType::Regular, "stat"),
+                (pid_maps_ino(pid), FileType::Regular, "maps"),
             ],
         )
     }
@@ -236,6 +251,9 @@ impl ProcFs {
     ) -> Result<ProcOpenFile, FsError> {
         match local_path {
             "self/pid" => Ok(ProcOpenFile::SelfPid {
+                pid: self.effective_pid(ctx)?,
+            }),
+            "self/maps" => Ok(ProcOpenFile::PidMaps {
                 pid: self.effective_pid(ctx)?,
             }),
             "mounts" => Ok(ProcOpenFile::Mounts),
@@ -286,6 +304,7 @@ impl ProcFs {
                         "status" => Ok(ProcOpenFile::PidStatus { pid }),
                         "cmdline" => Ok(ProcOpenFile::PidCmdline { pid }),
                         "stat" => Ok(ProcOpenFile::PidStat { pid }),
+                        "maps" => Ok(ProcOpenFile::PidMaps { pid }),
                         _ => Err(FsError::NotFound),
                     };
                 }
@@ -312,6 +331,7 @@ impl ProcFs {
             ProcOpenFile::PidStatus { pid } => (pid_status_ino(pid), 0),
             ProcOpenFile::PidCmdline { pid } => (pid_cmdline_ino(pid), 0),
             ProcOpenFile::PidStat { pid } => (pid_stat_ino(pid), 0),
+            ProcOpenFile::PidMaps { pid } => (pid_maps_ino(pid), 0),
         };
         Ok(Stat {
             ino,

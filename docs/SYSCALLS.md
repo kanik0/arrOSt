@@ -78,9 +78,9 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | Number | Name | Notes |
 |--------|------|-------|
 | 41 | `mmap` | `MAP_ANONYMOUS \| MAP_PRIVATE`: demand-paged anonymous VMA. Returns start address. File-backed and `MAP_SHARED` return `ENOSYS`. |
-| 42 | `munmap` | Returns `ENOSYS` (tracked in M21) |
-| 43 | `mprotect` | Returns `ENOSYS` (tracked in M21) |
-| 44 | `brk` | Query (`brk(0)`) returns current break. Extend grows heap VMA (demand-paged). Shrink returns current break unchanged. |
+| 42 | `munmap` | `(addr, len) -> 0 or -errno` — Unmap virtual range; splits/removes VMAs, unmaps pages, TLB flush. |
+| 43 | `mprotect` | `(addr, len, prot) -> 0 or -errno` — Change VMA permission bits (WRITE/EXEC); updates PTEs for mapped pages. |
+| 44 | `brk` | Query (`brk(0)`) returns current break. Extend grows heap VMA (demand-paged). Shrink unmaps reclaimed pages. |
 
 ### Pipe IPC (45-46)
 
@@ -205,7 +205,7 @@ On `x86_64`, interrupt bring-up now includes a user-callable `int 0x80` gate (DP
 On `aarch64`, lower-EL sync vectors now include EL0 `SVC` groundwork wired to process-layer ring-3 syscall dispatch.
 On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: syscall number in `x8`, arguments in `x0..x5`, return value in `x0`.
 `execve` (M22, SYS_EXECVE=54) is now implemented: user-space processes can replace their image via VFS path. Kernel-mediated spawn-from-path remains the active shell dispatch path.
-`fork` (M13), anonymous `mmap`, and `brk` are fully implemented: they are no longer stubs. `munmap`, `mprotect`, and file-backed `mmap` remain `ENOSYS` (tracked in M21).
+`fork` (M13), anonymous `mmap`, `munmap`, `mprotect`, and `brk` are fully implemented (M13/M21). File-backed `mmap` and `MAP_SHARED` remain `ENOSYS`.
 
 ## Userland shim
 
