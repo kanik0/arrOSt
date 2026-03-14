@@ -138,16 +138,15 @@ Useful runtime commands:
 
 ## Known limitations
 
-- There is no `execve` syscall yet; `/bin/*` already runs through a kernel-mediated VFS-backed spawn path, while `ring3 run <init|doom>` remains an embedded smoke/debug path.
-- File-backed `mmap` and `MAP_SHARED` are not yet implemented (returns `ENOSYS`).
-- Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction`, `sigreturn`, `mmap`, `munmap`, `mprotect`, and `brk` return `ENOSYS`.
+- File-backed `mmap` and `MAP_SHARED` are not yet implemented (return `ENOSYS`).
+- Signal infrastructure (delivery, frames, masking) is not yet implemented; `sigaction` and `sigreturn` return `ENOSYS`.
 - No `/dev` filesystem or device nodes.
 - No ANSI/VT100 terminal escape sequence support.
 - No environment variables or process inheritance beyond fd tables.
 - Single-core only; no SMP support.
 - No real-time clock or wall-clock timestamps.
 - No block/buffer cache; all disk I/O is synchronous and uncached.
-- `procfs` does not yet expose `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
+- `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
 - TCP retransmission queue (RTO, Karn's algorithm) is not implemented; packet delivery in QEMU's slirp is reliable so this is not observable.
 - Device abstraction (M18 HAL) provides trait wrappers and a device registry; existing subsystem consumers still call virtio driver globals directly rather than going through `&dyn BlockDevice` / `&dyn NetDevice`.
