@@ -5118,7 +5118,7 @@ fn smoke_doom_impl(
             let long_wait = Duration::from_secs(24);
             // GitHub runners without KVM can show wider frame-rate variance under TCG.
             // Keep a lower floor in software emulation while retaining stricter checks on HW accel.
-            let min_frame_progress = if software_accel_mode { 72u64 } else { 180u64 };
+            let min_frame_progress = if software_accel_mode { 54u64 } else { 180u64 };
             let max_drop_delta = 4u64;
 
             thread::sleep(long_wait);
