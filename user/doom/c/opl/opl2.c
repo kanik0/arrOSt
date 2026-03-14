@@ -98,6 +98,26 @@ static void init_sin_table(int16_t *tbl)
 }
 
 /* ------------------------------------------------------------------ */
+/* TL (total level) dB-correct amplitude mapping                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * OPL2 TL: each step = -0.75 dB.  TL=0 → full, TL=63 → -47.25 dB.
+ * Approximate with piecewise-linear: every 8 TL steps = ~6 dB = halving.
+ * This is MUCH better than a straight linear mapping, which makes
+ * FM modulation depth far too high at moderate TL values.
+ */
+static int32_t tl_to_amplitude(uint8_t tl)
+{
+    if (tl >= 63u) return 0;
+    uint32_t octave = (uint32_t)tl / 8u;
+    uint32_t frac   = (uint32_t)tl % 8u;
+    int32_t hi = 32767 >> octave;
+    int32_t lo = 32767 >> (octave + 1u);
+    return hi - (int32_t)(((uint32_t)(hi - lo) * frac) / 8u);
+}
+
+/* ------------------------------------------------------------------ */
 /* Waveform output                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -111,9 +131,11 @@ static int32_t op_waveform(const opl2_chip_t *chip,
                             int32_t  mod_in,
                             uint8_t  ws)
 {
-    /* Add modulation to phase: max swing ±256 table indices.
-     * mod_in is Q15 (±32767); scale to ±256 → shift by 7. */
-    uint32_t idx = ((phase_fp >> PHASE_FRAC) + (uint32_t)(mod_in >> 7)) & 1023u;
+    /* Add modulation to phase.
+     * mod_in is Q15 (±32767); scale to ±1024 → shift by 5.
+     * This gives up to ±2π radians of FM phase deviation at full
+     * modulator output, matching real OPL2 modulation depth. */
+    uint32_t idx = ((phase_fp >> PHASE_FRAC) + (uint32_t)(mod_in >> 5)) & 1023u;
 
     int32_t s;
     switch (ws & 3u) {
@@ -151,8 +173,8 @@ static int32_t op_waveform(const opl2_chip_t *chip,
  * Rate 0  = never (0).
  *
  * The `base` parameter controls overall speed:
- *   - Attack uses base=15  (AR=8 → ~17ms, AR=4 → ~280ms)
- *   - Decay/Release uses base=4 (DR=1 → ~0.7s, DR=8 → ~5ms)
+ *   - Attack uses base=8  (AR=8 → ~36ms, AR=4 → ~600ms)
+ *   - Decay/Release uses base=1 (DR=1 → ~0.7s, DR=8 → ~1ms)
  * Real OPL2 attack is inherently faster than decay/release;
  * splitting the base approximates this asymmetry.
  */
@@ -182,9 +204,9 @@ static int32_t rate_to_step(uint8_t rate, uint32_t sample_rate, uint32_t base)
 /* Compute all envelope step sizes for one operator after a parameter change. */
 static void op_recompute_envelope(opl2_op_t *op, uint32_t sample_rate)
 {
-    op->atk_step = rate_to_step(op->ar, sample_rate, 15u);
-    op->dec_step = rate_to_step(op->dr, sample_rate, 4u);
-    op->rel_step = rate_to_step(op->rr, sample_rate, 4u);
+    op->atk_step = rate_to_step(op->ar, sample_rate, 8u);
+    op->dec_step = rate_to_step(op->dr, sample_rate, 1u);
+    op->rel_step = rate_to_step(op->rr, sample_rate, 1u);
     /* Sustain level: sl 0 = full volume, sl 15 = silence */
     op->sus_level = (int32_t)((15u - (uint32_t)op->sl) * 32767u / 15u);
 }
@@ -455,9 +477,8 @@ static int32_t ch_synthesise_sample(opl2_chip_t *chip, int ch)
     int32_t mod_raw = op_waveform(chip, mod->phase_fp, fb_in, mod->ws);
     mod->phase_fp  += mod->phase_step;
 
-    /* Apply total-level and envelope attenuation.
-     * TL 0 = max level, TL 63 = -47 dB; we use a simple linear mapping. */
-    int32_t tl_scale = (int32_t)(63u - mod->tl) * 32767 / 63;
+    /* Apply total-level (dB-correct) and envelope attenuation. */
+    int32_t tl_scale = tl_to_amplitude(mod->tl);
     int32_t mod_out  = (mod_raw * mod_env / 32767) * tl_scale / 32767;
     mod->last_out    = mod_out;
 
@@ -476,7 +497,7 @@ static int32_t ch_synthesise_sample(opl2_chip_t *chip, int ch)
     int32_t car_raw = op_waveform(chip, car->phase_fp, car_in, car->ws);
     car->phase_fp  += car->phase_step;
 
-    int32_t car_tl  = (int32_t)(63u - car->tl) * 32767 / 63;
+    int32_t car_tl  = tl_to_amplitude(car->tl);
     int32_t car_out = (car_raw * car_env / 32767) * car_tl / 32767;
 
     if (c->con == 1u) {
