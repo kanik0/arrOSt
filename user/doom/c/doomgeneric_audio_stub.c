@@ -424,26 +424,61 @@ static void genmidi_init(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * Find a free OPL2 channel, or steal the oldest one.
+ * Find a free OPL2 channel, or steal the best candidate.
+ * Priority: 1) free voice, 2) envelope-idle voice (fully decayed),
+ *           3) releasing voice (oldest), 4) oldest active voice.
  * Returns channel index 0-8.
  */
 static int opl_alloc_voice(void)
 {
-    int oldest_ch  = 0;
-    uint32_t oldest_age = g_opl_voices[0].age;
     int i;
 
+    /* 1) Prefer completely free voices */
     for (i = 0; i < (int)ARR_OPL_VOICES; ++i) {
         if (!g_opl_voices[i].in_use) {
             return i;
         }
-        if (g_opl_voices[i].age < oldest_age) {
-            oldest_age = g_opl_voices[i].age;
-            oldest_ch  = i;
+    }
+
+    /* 2) Prefer voices whose OPL2 carrier envelope has fully decayed */
+    if (g_opl != NULL) {
+        for (i = 0; i < (int)ARR_OPL_VOICES; ++i) {
+            uint8_t car_env = g_opl->ops[g_car_slot[i]].env_state;
+            if (car_env == OPL2_ENV_IDLE) {
+                return i;
+            }
         }
     }
-    /* Steal oldest */
-    return oldest_ch;
+
+    /* 3) Prefer voices in release phase (oldest first) */
+    {
+        int best = -1;
+        uint32_t best_age = 0xFFFFFFFFu;
+        if (g_opl != NULL) {
+            for (i = 0; i < (int)ARR_OPL_VOICES; ++i) {
+                uint8_t car_env = g_opl->ops[g_car_slot[i]].env_state;
+                if (car_env == OPL2_ENV_RELEASE &&
+                    g_opl_voices[i].age < best_age) {
+                    best_age = g_opl_voices[i].age;
+                    best = i;
+                }
+            }
+        }
+        if (best >= 0) return best;
+    }
+
+    /* 4) Steal oldest active voice */
+    {
+        int oldest_ch = 0;
+        uint32_t oldest_age = g_opl_voices[0].age;
+        for (i = 1; i < (int)ARR_OPL_VOICES; ++i) {
+            if (g_opl_voices[i].age < oldest_age) {
+                oldest_age = g_opl_voices[i].age;
+                oldest_ch  = i;
+            }
+        }
+        return oldest_ch;
+    }
 }
 
 /* Find the OPL2 channel playing mus_ch + note, or -1. */
@@ -473,6 +508,21 @@ static void opl_note_on(uint8_t mus_ch, uint8_t note, uint8_t velocity)
         return;
     }
 
+    /* Release any duplicate (same mus_ch + note) to prevent voice leaks.
+     * Without this, re-triggering the same note allocates a new voice
+     * while the old one stays in_use forever — eventually all 9 voices
+     * become zombies and only voice-stealing works ("mono nota" bug). */
+    {
+        int dup = opl_find_voice(mus_ch, note);
+        if (dup >= 0) {
+            /* Key off preserving frequency for clean release */
+            uint8_t cur_b0 = g_opl->regs[0xB0u + (uint8_t)dup];
+            opl2_write_reg(g_opl, 0xB0u + (uint8_t)dup,
+                           (uint8_t)(cur_b0 & ~0x20u));
+            g_opl_voices[dup].in_use = 0u;
+        }
+    }
+
     uint8_t program = (mus_ch == 15u) ? 128u          /* percussion */
                                       : g_mus_channels[mus_ch].program;
     if (program > 127u && mus_ch != 15u) {
@@ -489,8 +539,12 @@ static void opl_note_on(uint8_t mus_ch, uint8_t note, uint8_t velocity)
 
     int opl_ch = opl_alloc_voice();
 
-    /* Key off any current occupant */
-    opl2_write_reg(g_opl, 0xB0u + (uint8_t)opl_ch, 0x00u);
+    /* Key off any current occupant (preserve frequency for clean release) */
+    {
+        uint8_t cur_b0 = g_opl->regs[0xB0u + (uint8_t)opl_ch];
+        opl2_write_reg(g_opl, 0xB0u + (uint8_t)opl_ch,
+                       (uint8_t)(cur_b0 & ~0x20u));
+    }
 
     g_opl_voices[opl_ch].in_use = 1u;
     g_opl_voices[opl_ch].mus_ch = mus_ch;
@@ -540,8 +594,15 @@ static void opl_note_off(uint8_t mus_ch, uint8_t note)
     if (opl_ch < 0) {
         return;
     }
-    opl2_write_reg(g_opl, 0xB0u + (uint8_t)opl_ch, 0x00u);
-    g_opl_voices[opl_ch].in_use = 0u;
+    /* Preserve block/f_num when keying off — only clear bit 5 (key_on).
+     * Writing 0x00 was destroying the frequency, making the release phase
+     * play at ~3 Hz instead of the note's pitch. */
+    uint8_t cur_b0 = g_opl->regs[0xB0u + (uint8_t)opl_ch];
+    opl2_write_reg(g_opl, 0xB0u + (uint8_t)opl_ch,
+                   (uint8_t)(cur_b0 & ~0x20u));
+    /* Keep in_use=1 so the voice isn't immediately reused while its
+     * release tail plays.  The allocator will prefer idle/releasing
+     * voices when it needs to steal. */
 }
 
 static void opl_all_notes_off(void)
@@ -672,7 +733,9 @@ static void music_handle_event(uint8_t descriptor)
             int i;
             for (i = 0; i < (int)ARR_OPL_VOICES; ++i) {
                 if (g_opl_voices[i].in_use && g_opl_voices[i].mus_ch == mus_ch) {
-                    opl2_write_reg(g_opl, 0xB0u + (uint8_t)i, 0x00u);
+                    uint8_t cur = g_opl->regs[0xB0u + (uint8_t)i];
+                    opl2_write_reg(g_opl, 0xB0u + (uint8_t)i,
+                                   (uint8_t)(cur & ~0x20u));
                     g_opl_voices[i].in_use = 0u;
                 }
             }
