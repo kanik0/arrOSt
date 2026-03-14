@@ -59,7 +59,7 @@
 #define GENMIDI_HEADER      "#OPL_II#"
 #define GENMIDI_HEADER_LEN  8u
 #define GENMIDI_NUM_INSTRS  175u
-#define GENMIDI_INSTR_BYTES 32u   /* stride between instruments in the lump */
+#define GENMIDI_INSTR_BYTES 68u   /* stride: 4-byte hdr + 2×32-byte voices (14 op data + 18 OPL3 padding) */
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -308,10 +308,11 @@ static void genmidi_load_patch(opl2_chip_t *chip,
     uint8_t car_off = g_hw_slot_off[g_car_slot[opl_ch]];
 
     /*
-     * GENMIDI voice 0 layout (offsets from start of 32-byte instrument entry):
+     * GENMIDI voice 0 layout (offsets from start of 68-byte instrument entry):
      *   [0-1]  flags (LE uint16)
      *   [2]    fine_tuning
      *   [3]    fixed_note
+     *   Voice 0 (32 bytes starting at [4]):
      *   [4]  mod tremolo_vibrato → reg 0x20
      *   [5]  mod attack_decay    → reg 0x60
      *   [6]  mod sustain_release → reg 0x80
@@ -326,7 +327,8 @@ static void genmidi_load_patch(opl2_chip_t *chip,
      *   [15] car output_level    → bits 5-0 of reg 0x40
      *   [16] feedback_connection → reg 0xC0
      *   [17] base_note_offset    (signed)
-     *   [18-31] voice[1] (OPL3, ignored)
+     *   [18-35] OPL3 extras / padding (ignored)
+     *   Voice 1 (32 bytes starting at [36]): ignored for OPL2
      */
     const uint8_t *mod = patch + 4u;   /* mod[0..5] */
     const uint8_t *car = patch + 10u;  /* car[0..5] */
@@ -385,7 +387,7 @@ static void genmidi_load_patch(opl2_chip_t *chip,
 
 /*
  * Find the GENMIDI patch for instrument `program` (0-based, 0-174).
- * Returns pointer to the 36-byte entry, or NULL if lump absent.
+ * Returns pointer to the 68-byte entry, or NULL if lump absent.
  */
 static const uint8_t *genmidi_patch(uint8_t program)
 {
