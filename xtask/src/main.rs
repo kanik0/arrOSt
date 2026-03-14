@@ -4663,7 +4663,7 @@ fn smoke_doom_impl(
         if ready {
             wait_for_log(
                 &log,
-                "doom: capture enabled (press ESC to exit)",
+                "doom: capture enabled (F12: release keys | ESC: in-game menu)",
                 Duration::from_secs(8),
                 "doom auto-capture enabled",
             )?;
@@ -4672,7 +4672,7 @@ fn smoke_doom_impl(
             send_serial_command(stdin, "\u{1b}ui next\n")?;
             wait_for_log(
                 &log,
-                "doom: capture disabled",
+                "doom: keys released (serial ESC)",
                 Duration::from_secs(8),
                 "doom auto-capture escape",
             )?;
@@ -4715,7 +4715,7 @@ fn smoke_doom_impl(
         send_serial_command(stdin, "doom capture on\n")?;
         wait_for_log(
             &log,
-            "doom: capture enabled (press ESC to exit)",
+            "doom: capture enabled (F12: release keys | ESC: in-game menu)",
             Duration::from_secs(8),
             "doom capture on",
         )?;
@@ -4726,7 +4726,7 @@ fn smoke_doom_impl(
         send_serial_command(stdin, "\u{1b}ui next\n")?;
         wait_for_log(
             &log,
-            "doom: capture disabled",
+            "doom: keys released (serial ESC)",
             Duration::from_secs(8),
             "doom capture escape",
         )?;

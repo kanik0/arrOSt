@@ -20,7 +20,7 @@ use x86_64::{PhysAddr, VirtAddr};
 const PAGE_SIZE: usize = Size4KiB::SIZE as usize;
 const MIN_ALLOC_PHYS_ADDR: u64 = 0x10_0000;
 const HEAP_GUARD_BYTES: usize = PAGE_SIZE;
-const HEAP_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_SIZE_BYTES: usize = 48 * 1024 * 1024;
 const HEAP_GUARD_LOW_START: u64 = 0x_4444_4444_0000;
 const HEAP_START: u64 = HEAP_GUARD_LOW_START + HEAP_GUARD_BYTES as u64;
 const HEAP_GUARD_HIGH_START: u64 = HEAP_START + HEAP_SIZE_BYTES as u64;

@@ -12,7 +12,7 @@ use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const PAGE_SIZE: usize = 4096;
-const HEAP_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_SIZE_BYTES: usize = 48 * 1024 * 1024;
 const AARCH64_TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const AARCH64_TABLE_VALID: u64 = 1 << 0;
 const AARCH64_TABLE_TABLE_OR_PAGE: u64 = 1 << 1;
