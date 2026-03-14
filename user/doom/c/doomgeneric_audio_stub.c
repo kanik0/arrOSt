@@ -59,7 +59,7 @@
 #define GENMIDI_HEADER      "#OPL_II#"
 #define GENMIDI_HEADER_LEN  8u
 #define GENMIDI_NUM_INSTRS  175u
-#define GENMIDI_INSTR_BYTES 68u   /* stride: 4-byte hdr + 2×32-byte voices (14 op data + 18 OPL3 padding) */
+#define GENMIDI_INSTR_BYTES 36u   /* stride: 2(flags)+1(fine)+1(fixed)+2×16(voice) — names are a separate block at end */
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -263,11 +263,16 @@ static void init_note_data(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * GENMIDI lump layout (per instrument, 68 bytes) — chocolate-doom/DMX format:
- *   [0-1]  flags (LE uint16)
+ * GENMIDI lump layout — chocolate-doom/DMX format:
+ *   Header: 8 bytes "#OPL_II#"
+ *   175 × 36-byte instrument records (contiguous)
+ *   175 × 32-byte instrument names  (contiguous, after all records)
+ *
+ * Per instrument record (36 bytes):
+ *   [0-1]  flags (LE uint16): bit0=fixed_note, bit1=double_voice
  *   [2]    fine_tuning
  *   [3]    fixed_note (used if bit 0 of flags is set)
- *   Voice 0 (32 bytes starting at [4]):
+ *   Voice 0 (16 bytes at [4..19]):
  *     Modulator (6 bytes at [4..9]):
  *       [4]  tv  (MULT/KSR/EG/VIB/AM) → reg 0x20
  *       [5]  ad  (AR<<4 | DR)          → reg 0x60
@@ -275,7 +280,7 @@ static void init_note_data(void)
  *       [7]  ws  (waveform)             → reg 0xE0
  *       [8]  ksl (bits 7-6 of 0x40)
  *       [9]  tl  (bits 5-0 of 0x40)
- *     [10]   feedback_connection → reg 0xC0  ← feedback is BETWEEN mod and car
+ *     [10]   feedback_connection → reg 0xC0
  *     Carrier (6 bytes at [11..16]):
  *       [11] tv                          → reg 0x20
  *       [12] ad  (AR<<4 | DR)            → reg 0x60
@@ -285,8 +290,7 @@ static void init_note_data(void)
  *       [16] tl  (bits 5-0 of 0x40, velocity-scaled)
  *     [17]   unused
  *     [18-19] base_note_offset (signed LE int16)
- *     [20-35] OPL3 extras (ignored)
- *   Voice 1 (32 bytes at [36..67]): ignored for OPL2 single-voice mode
+ *   Voice 1 (16 bytes at [20..35]): ignored for OPL2 single-voice mode
  */
 
 /*
@@ -493,8 +497,14 @@ static void opl_note_on(uint8_t mus_ch, uint8_t note, uint8_t velocity)
     if (g_opl_voice_age == 0u) g_opl_voice_age = 1u;
 
     if (patch != NULL) {
+        /* flags bit 0: use fixed_note (patch[3]) instead of MIDI note */
+        uint8_t use_note = note;
+        uint16_t flags = (uint16_t)patch[0] | ((uint16_t)patch[1] << 8u);
+        if (flags & 1u) {
+            use_note = patch[3];
+        }
         genmidi_load_patch(g_opl, opl_ch, patch,
-                           note,
+                           use_note,
                            velocity,
                            g_mus_channels[mus_ch].volume,
                            g_music_volume);
