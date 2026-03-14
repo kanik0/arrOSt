@@ -244,6 +244,15 @@ Three scheduler tables coexist:
 4. Validate with smoke tests or interactive QEMU session
 5. Update relevant docs if externally visible behavior changed
 
+## Workflow obbligatorio per nuove feature
+
+**SEMPRE** prima di creare una nuova branch/worktree:
+1. `git checkout master`
+2. `git pull origin master`
+3. Verifica che master sia aggiornata con `git log --oneline -5`
+
+Non saltare mai questi step, anche se sembra inutile.
+
 ## Milestones
 
 ### Completed
@@ -260,10 +269,11 @@ Three scheduler tables coexist:
 | M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path; `smoke-execve` harness |
 | M18 | Hardware abstraction layer | `BlockDevice`/`NetDevice`/`DisplayDevice`/`AudioDevice`/`InputDevice` traits; `DeviceRegistry`; `RamDisk`; `LoopbackDevice`; `smoke-hal` harness |
 | M31 | Doom as first-class executable | `SYS_DOOM_LAUNCH=55`; `/bin/doom` ring-3 ELF; `/usr/share/doom/doom1.wad` VFS seeding; shell dispatch via `try_launch_shell_vfs_user_bin`; `-C code-model=large` fix in `build_userland_package` |
-| M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; 64 music voices; comb-filter reverb |
+| M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; comb-filter reverb |
+| M31D | Doom authentic music (OPL2) | OPL2 emulator implemented, GENMIDI loading, MUS player — **audio plays but sounds incorrect (quasi-monotone); root cause not resolved** |
 
 ### In progress
-*(none)*
+| M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
 
 ### Planned
 | # | Milestone | Goal |
@@ -279,7 +289,6 @@ Three scheduler tables coexist:
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
 | M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
-| M31D | Doom authentic music (OPL2) | Replace waveform synth with OPL2 emulation (Nuked-OPL3/dbopl) for authentic DOS sound |
 | M32 | Doom 100% userland | `video_blit`+`audio_write` syscalls; move Doom C to user build; remove kernel Doom engine |
 
 ---

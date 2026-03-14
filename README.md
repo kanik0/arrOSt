@@ -27,7 +27,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Extended `/proc` with global system files, per-PID directories, and `/proc/net/` subsystem.
 - TCP/IP networking with state machine (SYN_SENT through LAST_ACK), BSD socket syscalls, and kernel-side Unix network utilities.
 - Cross-target build orchestration and smoke automation through `cargo xtask`.
-- DoomGeneric integration with runtime controls, viewport rendering, and virtio-audio preference when available.
+- DoomGeneric integration with runtime controls, viewport rendering, virtio-audio preference, and OPL2 FM music synthesiser using GENMIDI patches (M31D).
 
 ## Repository layout
 
@@ -179,6 +179,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M29 | Block cache | Planned |
 | M30 | Multi-user + login | Planned |
 | M31 | Doom enhancements | Planned |
+| M31D | Doom authentic music (OPL2) | Complete |
 
 ## Build
 

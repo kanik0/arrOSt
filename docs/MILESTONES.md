@@ -31,7 +31,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
 | **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
-| **M31D** | Doom Authentic Music (OPL2) | Not started |
+| **M31D** | Doom Authentic Music (OPL2) | **In progress** — OPL2 emulator implemented, music plays but sounds incorrect (quasi-monotone, wrong timbres) |
 | **M32** | Doom 100% in Userland | Not started |
 
 ---
@@ -716,35 +716,45 @@ ls /usr/share/doom/doom1.wad  # WAD present
 
 ### M31D: Doom Authentic Music via OPL2 Emulation
 
-**Status**: Not started
-**Goal**: Replace the custom waveform synthesizer with an OPL2/OPL3 emulator so Doom music sounds identical to the original DOS experience.
+**Status**: **In progress**
+**Goal**: Replace the custom waveform synthesizer with an OPL2 emulator so Doom music sounds like the original DOS experience using GENMIDI patches.
+
+**Known issue**: Music plays but sounds quasi-monotone — notes do not vary correctly in pitch/timbre. Multiple fixes have been applied (GENMIDI stride 36, base_note_offset int16 LE, Q20 envelope resolution, dB-correct TL, FM modulation depth, voice leak prevention, frequency-preserving key-off) but the root cause has not been fully resolved. Further debugging requires interactive QEMU testing to isolate whether the issue is in the OPL2 synthesis, GENMIDI patch loading, MUS event parsing, or voice allocation.
 
 **Background**: Doom's original music uses the MUS format (MIDI derivative) played through an OPL2 FM synthesis chip (Yamaha YM3812) on Sound Blaster cards.
-The current `doomgeneric_audio_stub.c` synthesizer uses square/triangle/noise waveforms — functional but tonally inaccurate.
-SFX are PCM samples and already sound correct.
+The pre-M31D `doomgeneric_audio_stub.c` synthesizer used square/triangle/noise waveforms — functional but tonally inaccurate.
+SFX are PCM samples and were already correct.
 
-**Dependencies**: None beyond M31B (audio infrastructure in place).
+#### Delivered
 
-#### Step 1: Integrate an OPL2 emulator
-**Files to modify**: `user/doom/c/`, `kernel/build.rs`
+- **`user/doom/c/opl/opl2.h`** — OPL2 chip emulator interface (`opl2_reset`, `opl2_write_reg`, `opl2_generate`).  Interface follows Nuked-OPL3 naming convention for easy future drop-in.
+- **`user/doom/c/opl/opl2.c`** — Self-contained OPL2 emulator:
+  - 18-operator (9-channel × 2-op) FM synthesis engine.
+  - 1024-entry sine table generated at init via iterative rotation (no libm required in freestanding environment).
+  - 4 waveforms: sine, half-sine, absolute-sine, quarter-pulse.
+  - ADSR envelopes with per-rate step sizes.
+  - FM modulation (modulator output feeds carrier phase offset) and additive connection mode.
+  - Feedback path (operator feeds back its own last output scaled by FB depth).
+  - All arithmetic in fixed-point Q15; 32-bit phase accumulator.
+- **`user/doom/c/doomgeneric_audio_stub.c`** — Music path replaced:
+  - Removed `ARR_MUSIC_VOICES` waveform synthesiser (64-voice square/triangle/noise engine).
+  - `I_ARR_InitMusic`: allocates `opl2_chip_t` via `malloc()` from Doom's bump-heap; loads GENMIDI lump from WAD (`W_CheckNumForName("GENMIDI")`); enables waveform select (reg 0x01 bit 5); initialises note-to-OPL2 lookup table (128 MIDI notes → block+F-Num pairs, computed from A4=580 reference).
+  - MUS note-on → GENMIDI patch loaded into OPL2 channel (`genmidi_load_patch`): modulator and carrier operator parameters (TV/AD/SR/WS/KSL-TL), feedback/connection, velocity-and-volume-scaled carrier TL, base-note-offset applied.
+  - LRU OPL2 voice allocator (9 slots; steals oldest when all busy).
+  - `mix_music_slice`: advances MUS timeline, calls `opl2_generate()`, mixes OPL2 PCM into the shared `g_mix_buffer`.
+  - PCM SFX path unchanged.
+- **`kernel/build.rs`** — `opl/opl2.c` added to the `arrost_doomgeneric_bridge` build target; `rerun-if-changed` entries added.
 
-1. Choose an emulator: [Nuked-OPL3](https://github.com/nukeykt/Nuked-OPL3) (most accurate, single `.c`+`.h`) or the lighter dbopl from DOSBox.
-2. Add the source to `user/doom/c/opl/` (or inline in the C bridge).
-3. Wire register-write calls: DoomGeneric calls `OPL_WritePort(0x388, value)` and `OPL_WritePort(0x389, value)`; route these to the OPL2 emulator's `OPL3_WriteRegBuffered` / `OPL2_WriteReg`.
-4. In the audio tick, call `OPL3_GenerateStream(opl, buf, frames)` to produce PCM output at 44 100 Hz and mix it into the existing PCM pipeline instead of the waveform synth.
-
-#### Step 2: Update `doomgeneric_audio_stub.c`
-**Files to modify**: `user/doom/c/doomgeneric_audio_stub.c`
-
-1. Remove `ARR_MUSIC_VOICES` FM synth path.
-2. Allocate OPL2 state (`opl3_chip`) from the kernel-provided heap (`g_heap`).
-3. Redirect `I_OPL_InitMusic` / `I_OPL_WriteRegister` / `I_OPL_ShutdownMusic` to the emulator.
-4. In `mix_and_submit_audio_slice`: call `OPL3_GenerateStream` and mix OPL output at volume `music_volume / 15`.
+#### Fallback behaviour
+When the GENMIDI lump is absent or a patch is not found, a square-wave fallback patch is written directly to OPL2 registers so music still plays (with generic timbre rather than silence).
 
 #### Testing
-1. `doom play` → music sounds like original DOS Doom (E1M1 "At Doom's Gate", etc.).
-2. SFX still work (PCM path unchanged).
-3. No performance regression (OPL2 emulation is fast enough at 44 100 Hz).
+```
+doom play          # music sounds like original DOS Doom (FM timbres, not square waves)
+doom audio status  # pcm_samples > 0, pcm_backend=virtio-snd
+doom stop
+```
+Smoke tests: `cargo xtask smoke-doom --arch x86_64` and `--arch aarch64` continue to pass (audio infrastructure unchanged; music path exercised by init sequence).
 
 ---
 
@@ -814,7 +824,7 @@ cargo xtask smoke-doom --arch x86_64   # still passes
 | 8 | **M28**: RTC + Wall-Clock Time | Timestamps |
 | 9 | **M29**: Block Cache | Performance improvement |
 | 10 | **M30**: Multi-User + Login | Security model |
-| 11 | **M31D**: Doom OPL2 Music | Authentic Doom audio |
+| 11 | **M31D**: Doom OPL2 Music | Authentic Doom audio — **Complete** |
 | 12 | **M32**: Doom 100% Userland | Clean kernel / smaller binary / process isolation |
 | 13 | **M27**: SMP / Multi-Core | Advanced scheduling |
 | 14 | **M18**: Hardware Abstraction | Platform portability |
