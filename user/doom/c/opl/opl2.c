@@ -290,9 +290,11 @@ void opl2_write_reg(opl2_chip_t *chip, uint8_t addr, uint8_t val)
     uint8_t off  = addr & 0x0Fu;
 
     /* --- Operator parameter registers -------------------------------- */
-    if (base >= 0x20u && base <= 0xA0u) {
-        /* The operator banks span 0x20-0x35, 0x40-0x55, 0x60-0x75,
-         * 0x80-0x95, 0xE0-0xF5.  Each covers offsets 0x00..0x15. */
+    /* Banks: 0x20-0x35, 0x40-0x55, 0x60-0x75, 0x80-0x95, 0xE0-0xF5.
+     * Note: 0xA0-0xB8 and 0xC0-0xC8 are channel registers handled below;
+     *       0xE0 must be included here explicitly (0xE0 > 0x80). */
+    if ((base >= 0x20u && base <= 0x80u) || base == 0xE0u) {
+        /* Each bank covers offsets 0x00..0x15. */
         uint8_t bank_off = addr & 0x1Fu;  /* offset within 32-byte bank */
         int slot = reg_off_to_slot(bank_off);
         if (slot < 0) {
