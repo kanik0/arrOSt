@@ -259,6 +259,8 @@ Three scheduler tables coexist:
 | M19 | TCP/IP + utilities | Ethernet/ARP/IPv4/ICMP/UDP/TCP stack; `ping` (-c, RTT, hostname), `traceroute`, `host`, `dig`, `curl`; Ctrl+C; high-res RDTSC/CNTVCT RTT |
 | M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path; `smoke-execve` harness |
 | M18 | Hardware abstraction layer | `BlockDevice`/`NetDevice`/`DisplayDevice`/`AudioDevice`/`InputDevice` traits; `DeviceRegistry`; `RamDisk`; `LoopbackDevice`; `smoke-hal` harness |
+| M31 | Doom as first-class executable | `SYS_DOOM_LAUNCH=55`; `/bin/doom` ring-3 ELF; `/usr/share/doom/doom1.wad` VFS seeding; shell dispatch via `try_launch_shell_vfs_user_bin`; `-C code-model=large` fix in `build_userland_package` |
+| M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; 64 music voices; comb-filter reverb |
 
 ### In progress
 *(none)*
@@ -276,7 +278,9 @@ Three scheduler tables coexist:
 | M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
-| M31 | Doom enhancements | Audio mixing, savegames, fullscreen, network multiplayer groundwork |
+| M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
+| M31D | Doom authentic music (OPL2) | Replace waveform synth with OPL2 emulation (Nuked-OPL3/dbopl) for authentic DOS sound |
+| M32 | Doom 100% userland | `video_blit`+`audio_write` syscalls; move Doom C to user build; remove kernel Doom engine |
 
 ---
 

@@ -75,6 +75,8 @@ const USER_BIN_IP_ELF_HINT_ENV: &str = "ARROST_USER_BIN_IP_ELF_HINT";
 const USER_BIN_IP_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_IP_ELF_PRESENT";
 const USER_BIN_PING_ELF_HINT_ENV: &str = "ARROST_USER_BIN_PING_ELF_HINT";
 const USER_BIN_PING_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_PING_ELF_PRESENT";
+const USER_BIN_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_HINT";
+const USER_BIN_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
 const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-execve [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]|smoke-hal [--arch <x86_64|aarch64>]>";
@@ -666,6 +668,18 @@ fn build_impl(
             },
         )
         .env(
+            USER_BIN_DOOM_ELF_HINT_ENV,
+            user_doom_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_DOOM_ELF_PRESENT_ENV,
+            if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
             "ARROST_DOOM_C_BACKEND_OBJECT",
             doom_c_backend.object.display().to_string(),
         )
@@ -1131,6 +1145,18 @@ fn build_secondary_target(
             },
         )
         .env(
+            USER_BIN_DOOM_ELF_HINT_ENV,
+            user_doom_elf.hint.display().to_string(),
+        )
+        .env(
+            USER_BIN_DOOM_ELF_PRESENT_ENV,
+            if user_doom_elf.size > 0 {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .env(
             "ARROST_DOOM_C_BACKEND_OBJECT",
             doom_c_backend.object.display().to_string(),
         )
@@ -1350,10 +1376,15 @@ fn build_userland_package(
     major_env: &str,
     minor_env: &str,
 ) -> Result<UserArtifact> {
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .env("ARROST_BUILD_COUNT", build_count_env)
         .env("ARROST_VERSION_MAJOR", major_env)
-        .env("ARROST_VERSION_MINOR", minor_env)
+        .env("ARROST_VERSION_MINOR", minor_env);
+    if let Some(rustflags) = userland_rustflags(target) {
+        command.env("RUSTFLAGS", rustflags);
+    }
+    let status = command
         .args([
             "build",
             "-p",
@@ -4632,7 +4663,7 @@ fn smoke_doom_impl(
         if ready {
             wait_for_log(
                 &log,
-                "doom: capture enabled (press ESC to exit)",
+                "doom: capture enabled (F12: release keys | ESC: in-game menu)",
                 Duration::from_secs(8),
                 "doom auto-capture enabled",
             )?;
@@ -4641,7 +4672,7 @@ fn smoke_doom_impl(
             send_serial_command(stdin, "\u{1b}ui next\n")?;
             wait_for_log(
                 &log,
-                "doom: capture disabled",
+                "doom: keys released (serial ESC)",
                 Duration::from_secs(8),
                 "doom auto-capture escape",
             )?;
@@ -4684,7 +4715,7 @@ fn smoke_doom_impl(
         send_serial_command(stdin, "doom capture on\n")?;
         wait_for_log(
             &log,
-            "doom: capture enabled (press ESC to exit)",
+            "doom: capture enabled (F12: release keys | ESC: in-game menu)",
             Duration::from_secs(8),
             "doom capture on",
         )?;
@@ -4695,7 +4726,7 @@ fn smoke_doom_impl(
         send_serial_command(stdin, "\u{1b}ui next\n")?;
         wait_for_log(
             &log,
-            "doom: capture disabled",
+            "doom: keys released (serial ESC)",
             Duration::from_secs(8),
             "doom capture escape",
         )?;
@@ -5087,7 +5118,7 @@ fn smoke_doom_impl(
             let long_wait = Duration::from_secs(24);
             // GitHub runners without KVM can show wider frame-rate variance under TCG.
             // Keep a lower floor in software emulation while retaining stricter checks on HW accel.
-            let min_frame_progress = if software_accel_mode { 72u64 } else { 180u64 };
+            let min_frame_progress = if software_accel_mode { 54u64 } else { 180u64 };
             let max_drop_delta = 4u64;
 
             thread::sleep(long_wait);

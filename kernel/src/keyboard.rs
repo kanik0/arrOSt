@@ -8,6 +8,13 @@ const EVENT_CODE_ARROW_UP: u16 = 0x0100;
 const EVENT_CODE_ARROW_DOWN: u16 = 0x0101;
 const EVENT_CODE_ARROW_LEFT: u16 = 0x0102;
 const EVENT_CODE_ARROW_RIGHT: u16 = 0x0103;
+const EVENT_CODE_F1: u16 = 0x0104;
+const EVENT_CODE_F3: u16 = 0x0105;
+const EVENT_CODE_F5: u16 = 0x0106;
+const EVENT_CODE_F7: u16 = 0x0107;
+const EVENT_CODE_F12: u16 = 0x0108;
+const EVENT_CODE_LEFT_CTRL: u16 = 0x0109;
+const EVENT_CODE_LEFT_ALT: u16 = 0x010A;
 const EVENT_CODE_MASK: u16 = 0x7fff;
 const EVENT_PRESSED_MASK: u16 = 0x8000;
 
@@ -18,6 +25,13 @@ pub enum KeyCode {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    F1,
+    F3,
+    F5,
+    F7,
+    F12,
+    LeftCtrl,
+    LeftAlt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +64,7 @@ static EVENT_QUEUE_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
 static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
 static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
@@ -63,6 +78,7 @@ pub fn init() {
 
     SHIFT_PRESSED.store(false, Ordering::Relaxed);
     CTRL_PRESSED.store(false, Ordering::Relaxed);
+    ALT_PRESSED.store(false, Ordering::Relaxed);
     EXTENDED_PREFIX.store(false, Ordering::Relaxed);
 }
 
@@ -84,6 +100,19 @@ pub fn handle_scancode(scancode: u8) {
         // Left Ctrl (0x1D); Right Ctrl is extended 0x1D — both handled here.
         0x1D => {
             CTRL_PRESSED.store(pressed, Ordering::Relaxed);
+            push_key_event(KeyEvent {
+                code: KeyCode::LeftCtrl,
+                pressed,
+            });
+            return;
+        }
+        // Left Alt (0x38); Right Alt is extended 0x38 — both handled here.
+        0x38 => {
+            ALT_PRESSED.store(pressed, Ordering::Relaxed);
+            push_key_event(KeyEvent {
+                code: KeyCode::LeftAlt,
+                pressed,
+            });
             return;
         }
         _ => {}
@@ -204,6 +233,13 @@ fn encode_key_event(event: KeyEvent) -> u16 {
         KeyCode::ArrowDown => EVENT_CODE_ARROW_DOWN,
         KeyCode::ArrowLeft => EVENT_CODE_ARROW_LEFT,
         KeyCode::ArrowRight => EVENT_CODE_ARROW_RIGHT,
+        KeyCode::F1 => EVENT_CODE_F1,
+        KeyCode::F3 => EVENT_CODE_F3,
+        KeyCode::F5 => EVENT_CODE_F5,
+        KeyCode::F7 => EVENT_CODE_F7,
+        KeyCode::F12 => EVENT_CODE_F12,
+        KeyCode::LeftCtrl => EVENT_CODE_LEFT_CTRL,
+        KeyCode::LeftAlt => EVENT_CODE_LEFT_ALT,
     };
     if event.pressed {
         code | EVENT_PRESSED_MASK
@@ -219,6 +255,13 @@ fn decode_key_event(encoded: u16) -> Option<KeyEvent> {
         EVENT_CODE_ARROW_DOWN => KeyCode::ArrowDown,
         EVENT_CODE_ARROW_LEFT => KeyCode::ArrowLeft,
         EVENT_CODE_ARROW_RIGHT => KeyCode::ArrowRight,
+        EVENT_CODE_F1 => KeyCode::F1,
+        EVENT_CODE_F3 => KeyCode::F3,
+        EVENT_CODE_F5 => KeyCode::F5,
+        EVENT_CODE_F7 => KeyCode::F7,
+        EVENT_CODE_F12 => KeyCode::F12,
+        EVENT_CODE_LEFT_CTRL => KeyCode::LeftCtrl,
+        EVENT_CODE_LEFT_ALT => KeyCode::LeftAlt,
         value if value <= u16::from(u8::MAX) => KeyCode::Byte(value as u8),
         _ => return None,
     };
@@ -239,6 +282,15 @@ fn map_set1_scancode_event(scancode: u8, extended: bool) -> Option<KeyCode> {
 
     if scancode == 0x01 {
         return Some(KeyCode::Byte(0x1b));
+    }
+    // Function keys (PS/2 Set-1 scancodes, non-extended).
+    match scancode {
+        0x3B => return Some(KeyCode::F1),
+        0x3D => return Some(KeyCode::F3),
+        0x3F => return Some(KeyCode::F5),
+        0x41 => return Some(KeyCode::F7),
+        0x58 => return Some(KeyCode::F12),
+        _ => {}
     }
     map_set1_scancode(scancode, false).map(KeyCode::Byte)
 }

@@ -25,7 +25,10 @@
 #define ARR_AUDIO_MAX_DELTA_MS 80u
 #define ARR_AUDIO_MAX_CREDIT_FRAMES (ARR_AUDIO_SLICE_FRAMES * 6u)
 #define ARR_MUSIC_CHANNELS 16u
-#define ARR_MUSIC_VOICES 32u
+#define ARR_MUSIC_VOICES 64u
+#define ARR_REVERB_DELAY_FRAMES 1323u   /* ~30 ms at 44100 Hz */
+#define ARR_REVERB_MIX_NUM 3
+#define ARR_REVERB_MIX_DEN 10
 #define ARR_MUSIC_TICKS_PER_SEC 140u
 #define ARR_MUSIC_EVENT_RELEASEKEY 0x00u
 #define ARR_MUSIC_EVENT_PRESSKEY 0x10u
@@ -127,6 +130,9 @@ static uint32_t g_music_tick_phase = 0u;
 static uint32_t g_music_voice_age = 1u;
 static arr_music_channel_t g_music_channels[ARR_MUSIC_CHANNELS];
 static arr_music_voice_t g_music_voices[ARR_MUSIC_VOICES];
+static int16_t g_reverb_buf_l[ARR_REVERB_DELAY_FRAMES];
+static int16_t g_reverb_buf_r[ARR_REVERB_DELAY_FRAMES];
+static uint32_t g_reverb_head = 0u;
 
 static snddevice_t g_sound_devices[] = {
     SNDDEVICE_NONE,
@@ -985,6 +991,22 @@ static int mix_and_submit_audio_slice(void) {
         mixed_left = soft_clip_sample(mixed_left);
         mixed_right = soft_clip_sample(mixed_right);
 
+        /* Comb-filter reverb: mix in delayed signal then store current output. */
+        {
+            int32_t rev_l = (int32_t)g_reverb_buf_l[g_reverb_head];
+            int32_t rev_r = (int32_t)g_reverb_buf_r[g_reverb_head];
+            int32_t out_l = mixed_left + (rev_l * ARR_REVERB_MIX_NUM) / ARR_REVERB_MIX_DEN;
+            int32_t out_r = mixed_right + (rev_r * ARR_REVERB_MIX_NUM) / ARR_REVERB_MIX_DEN;
+            /* Clamp before storing into delay line. */
+            if (out_l > 32767) { out_l = 32767; } else if (out_l < -32768) { out_l = -32768; }
+            if (out_r > 32767) { out_r = 32767; } else if (out_r < -32768) { out_r = -32768; }
+            g_reverb_buf_l[g_reverb_head] = (int16_t)out_l;
+            g_reverb_buf_r[g_reverb_head] = (int16_t)out_r;
+            g_reverb_head = (g_reverb_head + 1u) % ARR_REVERB_DELAY_FRAMES;
+            mixed_left = out_l;
+            mixed_right = out_r;
+        }
+
         if (mixed_left > 32767) {
             mixed_left = 32767;
         } else if (mixed_left < -32768) {
@@ -1021,6 +1043,9 @@ static boolean I_ARR_InitSound(boolean use_sfx_prefix) {
     g_audio_last_update_ms = arr_dg_get_realtime_ms();
     g_audio_credit_frames = 0u;
     g_limiter_gain_q15 = 32767u;
+    memset(g_reverb_buf_l, 0, sizeof(g_reverb_buf_l));
+    memset(g_reverb_buf_r, 0, sizeof(g_reverb_buf_r));
+    g_reverb_head = 0u;
     for (channel = 0; channel < ARR_AUDIO_CHANNELS; ++channel) {
         memset(&g_channels[channel], 0, sizeof(g_channels[channel]));
     }

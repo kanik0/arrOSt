@@ -39,6 +39,34 @@ unsafe impl Sync for BridgeCell {}
 
 static BRIDGE_STATE: BridgeCell = BridgeCell(UnsafeCell::new(BridgeState::new()));
 
+// ---------------------------------------------------------------------------
+// Doom C heap — allocated from the kernel heap at first use, then reused.
+// Keeping it here (instead of as a BSS static in the C file) avoids the
+// large BSS segment that collided with the bootloader's GDT frame.
+// ---------------------------------------------------------------------------
+
+/// 16 MiB is comfortably above doom1.wad peak zone usage (~8–10 MiB).
+const DOOM_HEAP_BYTES: usize = 16 * 1024 * 1024;
+
+struct DoomHeapCell(UnsafeCell<Option<alloc::boxed::Box<[u8]>>>);
+// SAFETY: single-threaded kernel; only accessed inside `create_engine`.
+unsafe impl Sync for DoomHeapCell {}
+
+static DOOM_HEAP: DoomHeapCell = DoomHeapCell(UnsafeCell::new(None));
+
+/// Lazily allocates the Doom C heap (once) and resets the bump pointer.
+/// Called at the top of `create_engine()` before every `doomgeneric_Create`.
+fn init_doom_heap() {
+    // SAFETY: single-threaded; no concurrent access possible.
+    let heap_ref = unsafe { &mut *DOOM_HEAP.0.get() };
+    if heap_ref.is_none() {
+        *heap_ref = Some(alloc::vec![0u8; DOOM_HEAP_BYTES].into_boxed_slice());
+    }
+    let buf = heap_ref.as_mut().expect("doom heap just initialised");
+    // SAFETY: `buf` lives for the kernel lifetime; C side treats it as a bump arena.
+    unsafe { arr_dg_heap_init(buf.as_mut_ptr(), buf.len()) };
+}
+
 #[derive(Clone, Copy)]
 pub struct BridgeStats {
     pub frames: u64,
@@ -259,6 +287,8 @@ pub fn consume_audio_samples(samples: u32) {
 }
 
 pub fn create_engine() {
+    // Provide (or reset) the C heap before DoomGeneric initialises.
+    init_doom_heap();
     reset();
     // SAFETY: C bridge wraps `doomgeneric_Create` and initializes its static state.
     unsafe { arr_doomgeneric_create() };
@@ -517,6 +547,11 @@ pub extern "C" fn arr_dg_wad_len() -> usize {
     wad_embed::ARROST_DOOM_WAD_BYTES.len()
 }
 
+/// Returns the embedded WAD bytes (empty if doom was built without a WAD file).
+pub fn wad_bytes() -> &'static [u8] {
+    wad_embed::ARROST_DOOM_WAD_BYTES
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn arr_dg_log(bytes: *const u8, len: usize) {
     if bytes.is_null() || len == 0 {
@@ -579,12 +614,22 @@ fn with_bridge_mut<R>(f: impl FnOnce(&mut BridgeState) -> R) -> R {
     unsafe { f(&mut *BRIDGE_STATE.0.get()) }
 }
 
+// arr_dg_heap_init, arr_doomgeneric_create/tick/frame_counter:
+// When the DoomGeneric bridge C objects are linked in, import the real symbols.
+// When they are absent (clippy / non-doom builds), provide no-op stubs so the
+// kernel still compiles and links.
 #[cfg(arrost_doomgeneric_bridge)]
 unsafe extern "C" {
+    // Defined in user/doom/c/freestanding_libc.c — sets up the C bump-allocator heap.
+    fn arr_dg_heap_init(ptr: *mut u8, cap: usize);
     fn arr_doomgeneric_create();
     fn arr_doomgeneric_tick();
     fn arr_doomgeneric_frame_counter() -> u32;
 }
+
+#[cfg(not(arrost_doomgeneric_bridge))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arr_dg_heap_init(_ptr: *mut u8, _cap: usize) {}
 
 #[cfg(not(arrost_doomgeneric_bridge))]
 #[unsafe(no_mangle)]

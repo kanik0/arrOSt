@@ -205,14 +205,16 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     // the 128 KiB stack (observed RSP = stack bottom = stack_top − 131072).
     // → removed the redundant copies (syscall_fork_ring3 / syscall_mmap_ring3 no longer take
     //   a Ring3ProcessContext parameter), then settled on 160 KiB (GDT at ~0x1FA000, 24 KiB
-    //   below the kernel ELF at 0x200000, safe margin ~24 KiB).
+    //   below the old kernel ELF base of 0x200000; kernel now loads at 0x1000000).
     //
     // Safety constraint: the bootloader's LegacyFrameAllocator is a simple sequential
-    // allocator starting at 0x100000.  The kernel ELF is loaded at fixed physical 0x200000.
-    // Empirically: GDT address ≈ 0x1D2000 + stack_size.  Kernel starts at 0x200000, so
-    // the hard ceiling is stack_size < 0x2E000 (= 184 KiB).  160 KiB keeps the GDT at
-    // ~0x1FA000, providing ~24 KiB of margin.  192 KiB was tried but placed the GDT at
-    // 0x202000 (inside the kernel segment), causing PageAlreadyMapped at boot.
+    // allocator starting at 0x100000.  The kernel ELF is loaded at fixed physical 0x1000000
+    // (16 MiB; changed from 2 MiB to prevent GDT collisions under audio/virtio configs).
+    // Empirically: GDT address ≈ 0x1D2000 + stack_size + OVMF_overhead.  Under some QEMU
+    // configurations (e.g. virtio-snd / WAV audio output) OVMF claims more low memory, pushing
+    // the GDT as high as ~0x280000 — well inside the old 0x200000 kernel segment.
+    // With the kernel now at 16 MiB the entire 0x100000–0xFFFFFF range is free for the
+    // bootloader allocator and stack, eliminating the PageAlreadyMapped risk.
     config.kernel_stack_size = 160 * 1024;
     config
 };

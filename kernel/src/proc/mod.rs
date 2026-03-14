@@ -16,8 +16,8 @@ use arrostd::syscall::{
     FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, O_ACCMODE, O_CREAT,
     O_RDONLY, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SEEK_CUR, SEEK_END, SEEK_SET,
     SIGKILL, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET,
-    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK,
-    SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
+    SYS_CHDIR, SYS_CLOSE, SYS_CONNECT, SYS_DOOM_LAUNCH, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT,
+    SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETGID, SYS_GETPID,
     SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
     SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV,
     SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SIGACTION,
@@ -1853,6 +1853,11 @@ impl Scheduler {
                 self.stats.pipe = self.stats.pipe.saturating_add(1);
                 // arg0 = fds_ptr, arg1 = flags (only 0 supported)
                 self.syscall_pipe_ring3(ctx, arg0)
+            }
+            // M31: doom engine launch/control from ring-3
+            SYS_DOOM_LAUNCH => {
+                // arg0 = cmd (DOOM_CMD_PLAY/RUN/STOP/STATUS)
+                self.syscall_doom_launch_ring3(arg0)
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
@@ -4052,6 +4057,40 @@ impl Scheduler {
         }
     }
 
+    /// SYS_DOOM_LAUNCH (M31): launch or control the kernel doom engine from ring-3.
+    ///
+    /// `cmd` maps to the doom operation:
+    ///   0 (DOOM_CMD_PLAY)   – start play mode (same as `doom play` shell command)
+    ///   1 (DOOM_CMD_RUN)    – start run mode  (same as `doom run`)
+    ///   2 (DOOM_CMD_STOP)   – stop doom       (same as `doom stop`)
+    ///   3 (DOOM_CMD_STATUS) – print status to serial
+    ///
+    /// Returns 0 on success, `-EINVAL` for unknown cmd, `-ENOSYS` if doom is unavailable.
+    fn syscall_doom_launch_ring3(&mut self, cmd: u64) -> isize {
+        use arrostd::syscall::{DOOM_CMD_PLAY, DOOM_CMD_RUN, DOOM_CMD_STATUS, DOOM_CMD_STOP};
+        match cmd {
+            DOOM_CMD_PLAY => {
+                use crate::doom::PlayStart;
+                match crate::doom::play(crate::time::ticks()) {
+                    PlayStart::DoomGeneric | PlayStart::Fallback | PlayStart::AlreadyRunning => 0,
+                }
+            }
+            DOOM_CMD_RUN => {
+                let _ = crate::doom::start(crate::time::ticks());
+                0
+            }
+            DOOM_CMD_STOP => {
+                let _ = crate::doom::stop(crate::time::ticks());
+                0
+            }
+            DOOM_CMD_STATUS => {
+                crate::doom::log_status();
+                0
+            }
+            _ => errno::EINVAL,
+        }
+    }
+
     fn syscall_ping_ring3(&mut self, _ctx: Ring3ProcessContext, ip_ptr: u64, ip_len: u64) -> isize {
         if ip_len != 4 {
             self.stats.errors = self.stats.errors.saturating_add(1);
@@ -5909,6 +5948,8 @@ fn syscall_required_caps(number: u64) -> u32 {
         SYS_PIPE | SYS_PIPE2 => caps::CORE,
         // M22: execve
         SYS_EXECVE => caps::CORE,
+        // M31: doom launch
+        SYS_DOOM_LAUNCH => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
         // M15 Phase A2: process identity and control
         SYS_GETPPID | SYS_GETUID | SYS_GETGID | SYS_KILL | SYS_SIGACTION | SYS_SIGRETURN => {

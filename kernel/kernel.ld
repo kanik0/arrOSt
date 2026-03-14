@@ -2,7 +2,7 @@ ENTRY(_start);
 
 SECTIONS
 {
-  . = 2M;
+  . = 16M;
 
   .bootloader-config : ALIGN(4K) { KEEP(*(.bootloader-config)) }
   .text : ALIGN(4K) { *(.text .text.*) }
