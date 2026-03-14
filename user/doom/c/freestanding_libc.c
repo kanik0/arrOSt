@@ -16,7 +16,7 @@
 
 int errno = 0;
 
-#define ARROST_LIBC_HEAP_SIZE (24u * 1024u * 1024u)
+#define ARROST_LIBC_HEAP_SIZE (16u * 1024u * 1024u)
 #define ARROST_FILE_POOL_SIZE 8u
 #define ARROST_PRINTF_BUF_SIZE 1024u
 #define ARROST_CFG_CAPACITY (32u * 1024u)
