@@ -59,7 +59,7 @@
 #define GENMIDI_HEADER      "#OPL_II#"
 #define GENMIDI_HEADER_LEN  8u
 #define GENMIDI_NUM_INSTRS  175u
-#define GENMIDI_INSTR_BYTES 36u   /* stride between instruments in the lump */
+#define GENMIDI_INSTR_BYTES 32u   /* stride between instruments in the lump */
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -307,30 +307,44 @@ static void genmidi_load_patch(opl2_chip_t *chip,
     uint8_t mod_off = g_hw_slot_off[g_mod_slot[opl_ch]];
     uint8_t car_off = g_hw_slot_off[g_car_slot[opl_ch]];
 
-    /* patch layout (voice 0):
-     *   [4]  mod tv    [5]  mod ksl_tl   [6]  mod ad   [7]  mod sr   [8]  mod ws
-     *   [9]  car tv    [10] car ksl_tl   [11] car ad   [12] car sr   [13] car ws
-     *   [14] feedback/con
-     *   [15] base_note_offset (signed)
+    /*
+     * GENMIDI voice 0 layout (offsets from start of 32-byte instrument entry):
+     *   [0-1]  flags (LE uint16)
+     *   [2]    fine_tuning
+     *   [3]    fixed_note
+     *   [4]  mod tremolo_vibrato → reg 0x20
+     *   [5]  mod attack_decay    → reg 0x60
+     *   [6]  mod sustain_release → reg 0x80
+     *   [7]  mod wave_select     → reg 0xE0
+     *   [8]  mod scale (KSL)     → bits 7-6 of reg 0x40
+     *   [9]  mod output_level    → bits 5-0 of reg 0x40
+     *   [10] car tremolo_vibrato → reg 0x20
+     *   [11] car attack_decay    → reg 0x60
+     *   [12] car sustain_release → reg 0x80
+     *   [13] car wave_select     → reg 0xE0
+     *   [14] car scale (KSL)     → bits 7-6 of reg 0x40
+     *   [15] car output_level    → bits 5-0 of reg 0x40
+     *   [16] feedback_connection → reg 0xC0
+     *   [17] base_note_offset    (signed)
+     *   [18-31] voice[1] (OPL3, ignored)
      */
-    const uint8_t *mod = patch + 4u;
-    const uint8_t *car = patch + 9u;
+    const uint8_t *mod = patch + 4u;   /* mod[0..5] */
+    const uint8_t *car = patch + 10u;  /* car[0..5] */
 
     /* Key off first */
     opl2_write_reg(chip, 0xB0u + (uint8_t)opl_ch, 0x00u);
 
-    /* Modulator */
-    opl2_write_reg(chip, 0x20u + mod_off, mod[0]);  /* tv */
-    opl2_write_reg(chip, 0x40u + mod_off, mod[1]);  /* ksl_tl */
-    opl2_write_reg(chip, 0x60u + mod_off, mod[2]);  /* ad */
-    opl2_write_reg(chip, 0x80u + mod_off, mod[3]);  /* sr */
-    opl2_write_reg(chip, 0xE0u + mod_off, mod[4]);  /* ws */
+    /* Modulator: 6-byte op; KSL and TL are separate bytes combined into 0x40 */
+    opl2_write_reg(chip, 0x20u + mod_off, mod[0]);  /* tremolo_vibrato */
+    opl2_write_reg(chip, 0x60u + mod_off, mod[1]);  /* attack_decay */
+    opl2_write_reg(chip, 0x80u + mod_off, mod[2]);  /* sustain_release */
+    opl2_write_reg(chip, 0xE0u + mod_off, mod[3]);  /* wave_select */
+    opl2_write_reg(chip, 0x40u + mod_off,           /* KSL | TL */
+                   (uint8_t)((mod[4] & 0xC0u) | (mod[5] & 0x3Fu)));
 
-    /* Carrier – scale total level by velocity and volume */
-    uint8_t car_ksl_tl = car[1];
-    uint8_t base_tl    = car_ksl_tl & 0x3Fu;  /* lower 6 bits */
-    /* Effective attenuation: add reduction from velocity & volume */
-    /* Higher TL = quieter; lower velocity/volume → more attenuation */
+    /* Carrier – scale total level (car[5]) by velocity and channel/music volume.
+     * Higher TL = quieter; lower velocity/volume adds attenuation. */
+    uint8_t base_tl = car[5] & 0x3Fu;
     uint32_t vel_att = (velocity > 0u)
         ? (uint32_t)(127u - clamp_int((int)velocity, 0, 127)) * 63u / 127u
         : 63u;
@@ -342,19 +356,19 @@ static void genmidi_load_patch(opl2_chip_t *chip,
         : 16u;
     uint32_t new_tl = (uint32_t)base_tl + vel_att / 4u + vol_att / 4u + mvol_att / 4u;
     if (new_tl > 63u) new_tl = 63u;
-    car_ksl_tl = (car_ksl_tl & 0xC0u) | (uint8_t)new_tl;
+    uint8_t car_ksl_tl = (uint8_t)((car[4] & 0xC0u) | (uint8_t)new_tl);
 
-    opl2_write_reg(chip, 0x20u + car_off, car[0]);
-    opl2_write_reg(chip, 0x40u + car_off, car_ksl_tl);
-    opl2_write_reg(chip, 0x60u + car_off, car[2]);
-    opl2_write_reg(chip, 0x80u + car_off, car[3]);
-    opl2_write_reg(chip, 0xE0u + car_off, car[4]);
+    opl2_write_reg(chip, 0x20u + car_off, car[0]);     /* tremolo_vibrato */
+    opl2_write_reg(chip, 0x60u + car_off, car[1]);     /* attack_decay */
+    opl2_write_reg(chip, 0x80u + car_off, car[2]);     /* sustain_release */
+    opl2_write_reg(chip, 0xE0u + car_off, car[3]);     /* wave_select */
+    opl2_write_reg(chip, 0x40u + car_off, car_ksl_tl); /* KSL | TL (velocity-scaled) */
 
     /* Feedback / connection */
-    opl2_write_reg(chip, 0xC0u + (uint8_t)opl_ch, patch[14]);
+    opl2_write_reg(chip, 0xC0u + (uint8_t)opl_ch, patch[16]);
 
     /* Base note offset (signed) */
-    int8_t off = (int8_t)patch[15];
+    int8_t off = (int8_t)patch[17];
     int adjusted_note = (int)note + (int)off;
     if (adjusted_note < 0)   adjusted_note = 0;
     if (adjusted_note > 127) adjusted_note = 127;
