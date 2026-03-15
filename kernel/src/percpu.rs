@@ -99,17 +99,23 @@ pub fn ap_stack_top(cpu_id: u32) -> u64 {
 pub fn current_cpu() -> &'static PerCpu {
     #[cfg(target_arch = "x86_64")]
     {
-        let ptr: u64;
-        // SAFETY: GS base was set to point at a valid PerCpu struct during init.
+        // Read GS base from IA32_GS_BASE MSR (0xC0000101).
+        // This is universally supported on x86_64, unlike RDGSBASE which requires FSGSBASE.
+        let low: u32;
+        let high: u32;
+        // SAFETY: reading IA32_GS_BASE MSR is safe; it was set during percpu init.
         unsafe {
             core::arch::asm!(
-                "rdgsbase {0}",
-                out(reg) ptr,
+                "rdmsr",
+                in("ecx") 0xC000_0101u32,
+                out("eax") low,
+                out("edx") high,
                 options(nomem, nostack, preserves_flags),
             );
         }
+        let ptr = (u64::from(high) << 32) | u64::from(low);
         if ptr == 0 {
-            // Fallback before GS is set up (early boot).
+            // Fallback before GS base is set up (early boot).
             return &CPU_DATA[0];
         }
         // SAFETY: GS base points to a valid &'static PerCpu.
@@ -179,19 +185,16 @@ fn set_percpu_base(cpu: &PerCpu) {
     #[cfg(target_arch = "x86_64")]
     {
         // Write IA32_GS_BASE MSR (0xC0000101).
-        // On x86_64 we also need to enable FSGSBASE instructions first via CR4.
+        // Using WRMSR is universally supported on x86_64, unlike WRGSBASE which
+        // requires FSGSBASE (CR4 bit 16) and may not be available on all QEMU CPU models.
+        let low = addr as u32;
+        let high = (addr >> 32) as u32;
         unsafe {
-            // Enable FSGSBASE instructions (CR4 bit 16) if supported.
-            // QEMU supports this on most CPU models.
-            let mut cr4: u64;
-            core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
-            cr4 |= 1 << 16; // CR4.FSGSBASE
-            core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
-
-            // Now use WRGSBASE to set GS base.
             core::arch::asm!(
-                "wrgsbase {0}",
-                in(reg) addr,
+                "wrmsr",
+                in("ecx") 0xC000_0101u32,
+                in("eax") low,
+                in("edx") high,
                 options(nomem, nostack, preserves_flags),
             );
         }
