@@ -54,6 +54,8 @@ cargo xtask smoke-dev --arch x86_64       # M23 /dev filesystem smoke
 cargo xtask smoke-dev --arch aarch64
 cargo xtask smoke-pipes --arch x86_64     # M24 shell pipes smoke
 cargo xtask smoke-pipes --arch aarch64
+cargo xtask smoke-smp --arch x86_64       # M27 SMP multi-core smoke
+cargo xtask smoke-smp --arch aarch64
 ```
 
 ### Environment Variables
@@ -290,6 +292,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M26 | Environment variables | Per-process env arrays (no heap); `SYS_GETENV=56`/`SYS_SETENV=57`/`SYS_UNSETENV=58`; shell `env`/`export`/`$VAR` expansion; GUI terminal env integration; ABI rev 6 |
 | M23 | /dev filesystem | Synthetic devfs mounted at `/dev`; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`); `FileType::CharDevice`/`BlockDevice`; xorshift32 PRNG; `smoke-dev` harness |
 | M24 | Shell pipes + process groups | `cmd1 \| cmd2` pipeline syntax (up to 4 stages); `SYS_SETPGID=59`/`SYS_GETPGID=60`; per-process pgid; `FdRedirect`-based pipe spawning; Ctrl+C kills pipeline; `smoke-pipes` harness |
+| M27 | SMP / multi-core (Phase A) | Per-CPU data via GS/TPIDR_EL1; x86_64 LAPIC + INIT-SIPI-SIPI trampoline; aarch64 PSCI CPU_ON; AP idle loop; `cpus` shell command; `smoke-smp` harness |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -299,7 +302,7 @@ Non saltare mai questi step, anche se sembra inutile.
 |---|-----------|------|
 | M23 | /dev filesystem | **Complete** — see Completed table |
 | M24 | Shell pipes + process groups | **Complete** — see Completed table |
-| M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
+| M27 | SMP / multi-core | **Phase A complete** — AP bootstrap, per-CPU state, idle loop; Phase B: SMP-aware ring-3 scheduling |
 | M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |

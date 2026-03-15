@@ -432,47 +432,37 @@ cargo xtask smoke-dev --arch aarch64
 
 ### M27: SMP / Multi-Core Support
 
-**Status**: Not started
+**Status**: Phase A complete (AP bootstrap + idle)
 **Goal**: Boot and schedule across multiple CPU cores.
 
 **Dependencies**: M14 (preemption, done), M13 (per-process page tables).
 
-This is a major milestone requiring careful ordering.
+#### Phase A (complete)
 
-#### Step 1: AP (Application Processor) bootstrap
-**Files to modify**: `kernel/src/arch/x86_64/mod.rs`, `kernel/src/arch/aarch64/mod.rs`
+1. **Per-CPU data** (`kernel/src/percpu.rs`): `PerCpu` struct with `cpu_id`, `is_bsp`, `online` flag. Accessed via `GS` base (`rdgsbase`/`wrgsbase`) on x86_64 and `TPIDR_EL1` on aarch64. Global `CPU_DATA[MAX_CPUS]` array, `AP_STACKS` for per-AP kernel stacks (64 KiB each). `current_cpu()`, `online_count()`, `is_bsp()` accessors.
+2. **x86_64 LAPIC driver** (`kernel/src/arch/x86_64/lapic.rs`): BSP LAPIC init from `IA32_APIC_BASE` MSR, SVR enable, IPI support (`send_init`, `send_sipi`), EOI, TSC-based delay.
+3. **x86_64 AP bootstrap** (`kernel/src/arch/x86_64/ap_boot.rs`): Hand-crafted 256-byte machine-code trampoline at physical 0x8000 (16-bit → 32-bit → 64-bit). INIT-SIPI-SIPI sequence per AP. Data block at page offset 0xF00 with CR3, entry fn, stack, CPU ID, GDT pointer. Rust entry: percpu init, LAPIC init, ACK signal, idle loop.
+4. **aarch64 AP bootstrap** (`kernel/src/arch/aarch64/ap_boot.rs`): PSCI `CPU_ON` (HVC #0, function ID 0xC4000003). Naked entry: mask exceptions, enable FP/SIMD, load stack from shared `AtomicU64`, jump to Rust entry. Rust entry: percpu init, GIC CPU interface init, ACK signal, idle loop.
+5. **AP run loop**: APs enter `ap_run_loop()` which polls timer ticks and idles. `resume_current_loop()` dispatches to BSP `run_loop()` or AP `ap_run_loop()` based on `is_bsp()`.
+6. **Shell `cpus` command**: shows online CPU count and per-CPU id/role.
+7. **`smoke-smp` harness**: boots with `QEMU_SMP=2`, verifies 1 AP online, `cpus` command output.
 
-1. **x86_64**: Send INIT-SIPI-SIPI sequence to wake APs. Each AP executes a 16-bit trampoline, enters long mode, and arrives in a Rust entry point.
-2. **aarch64**: Use PSCI `CPU_ON` to wake secondary cores. Each core enters at a designated entry point.
-3. BSP (boot CPU) sets up per-CPU data structures before waking APs.
+#### Phase B (planned)
 
-#### Step 2: Per-CPU state
-**Files to create**: `kernel/src/arch/percpu.rs`
-**Files to modify**: `kernel/src/proc/mod.rs`
+1. Per-CPU GDT/TSS for ring-3 transitions on APs.
+2. Per-CPU KPTI scratch (currently global atomics referenced by trampoline `sym`).
+3. SMP-aware ring-3 scheduler: APs pull ring-3 processes from global run queue.
+4. Lock audit for VFS, network stack, process table.
 
-1. Per-CPU struct: `{ cpu_id, current_pid, kernel_stack, idle_task, local_timer_count }`.
-2. x86_64: access via `GS` segment (set `KERNEL_GS_BASE` MSR per core).
-3. aarch64: access via `TPIDR_EL1` register per core.
+#### Relevant files
 
-#### Step 3: Scheduler adaptation
-**Files to modify**: `kernel/src/proc/mod.rs`
-
-1. Global run queue with spin-lock protection.
-2. Each CPU pulls from the global queue.
-3. Load balancing: simple work-stealing or periodic rebalance.
-4. Pin kernel init tasks to BSP.
-
-#### Step 4: Lock audit
-All global mutable state must be protected:
-- Heap allocator: already has lock.
-- Filesystem: add lock to VFS operations.
-- Network stack: add lock to connection table.
-- Process table: add lock to ring-3 process array.
-
-#### Testing
-1. Boot with `QEMU_SMP=2`, verify both CPUs active in serial log.
-2. Run two ring-3 processes; verify both run concurrently on different CPUs.
-3. All existing smoke tests pass with SMP=1 and SMP=2.
+- `kernel/src/percpu.rs`
+- `kernel/src/arch/x86_64/lapic.rs`
+- `kernel/src/arch/x86_64/ap_boot.rs`
+- `kernel/src/arch/aarch64/ap_boot.rs`
+- `kernel/src/arch/aarch64/interrupts.rs` (`init_gic_cpu_interface`)
+- `kernel/src/main.rs` (`ap_run_loop`, `resume_current_loop`, `smp_ap_count_from_env`)
+- `xtask/src/main.rs` (`smoke_smp`)
 
 ---
 

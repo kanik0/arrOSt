@@ -1547,7 +1547,7 @@ fn run_command(shell: &mut ShellState) {
     match input {
         "help" => {
             serial::write_line(
-                "help: help | version | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [-als] [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | netstat | ifconfig | route | arp | ss | nc <host> <port> | ip [addr|link|route] | sync | reload | watch on | watch off | /bin/ls [-als] [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath> | /bin/netstat | /bin/ifconfig | /bin/route | /bin/arp | /bin/ss | /bin/nc <host> <port> | /bin/ip [addr|link|route]",
+                "help: help | version | cpus | ticks | uptime | user | user apps | ring3 | ring3 smoke | ring3 groundwork | ring3 run <init|doom> | ring3 ps | ring3 wait <pid|any|all> | spawn <init|doom> | wait <pid|any|all> | waitx <pid|any|all> | ps | kill <pid|self> | syscalls | terminal | pwd | cd <dir> | ls [-als] [<path>] | cat <file> | echo <text> > <file> | stat <path> | chmod <mode> <path> | mkdir <dir> | mv <src> <dst> | link <src> <dst> | symlink <target> <linkpath> | disk | ui | ui redraw | ui next | ui minimize | fm | fm list [<path>] | fm cd <dir> | fm open <file> | fm copy <src> <dst> | fm delete <file> | doom | doom status | doom source | doom doctor | doom play | doom run | doom stop | doom ui | doom key <dir> | doom keyup <dir> | doom capture [on|off] | doom view <bilinear|nearest> | doom mouse | doom mouse y <on|off> | doom mouse turn <1..64> | doom mouse move <1..64> | doom audio <on|off|virtio|status|test> | doom reset | mouse | net | ping <ip> | udp send <ip> <port> <text> | udp last | curl <ip> <port> <text> | curl udp://<ip>:<port>/<payload> | curl http://<host|ip>[:port]/<path> | netstat | ifconfig | route | arp | ss | nc <host> <port> | ip [addr|link|route] | sync | reload | watch on | watch off | /bin/ls [-als] [<path>] | /bin/ps | /bin/kill <pid|self> | /bin/cat <file> | /bin/echo <text> > <file> | /bin/fm [list|cd|open|copy|delete] | /bin/doom [status|play|run|stop] | /bin/terminal | /bin/link <src> <dst> | /bin/symlink <target> <linkpath> | /bin/netstat | /bin/ifconfig | /bin/route | /bin/arp | /bin/ss | /bin/nc <host> <port> | /bin/ip [addr|link|route]",
             );
         }
         "version" => {
@@ -1555,6 +1555,21 @@ fn run_command(shell: &mut ShellState) {
                 "version: {}.{}.{}\n",
                 VERSION_MAJOR, VERSION_MINOR, VERSION_BUILD
             ));
+        }
+        "cpus" => {
+            let online = crate::percpu::online_count();
+            serial::write_fmt(format_args!("cpus: {} online\n", online));
+            for i in 0..crate::percpu::MAX_CPUS as u32 {
+                if let Some(cpu) = crate::percpu::cpu_data(i) {
+                    if cpu.online.load(core::sync::atomic::Ordering::Acquire) {
+                        serial::write_fmt(format_args!(
+                            "  cpu{}: {} online\n",
+                            i,
+                            if cpu.is_bsp { "bsp" } else { "ap" }
+                        ));
+                    }
+                }
+            }
         }
         "ticks" => {
             serial::write_fmt(format_args!("ticks: {}\n", time::ticks()));

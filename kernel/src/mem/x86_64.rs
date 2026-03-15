@@ -29,6 +29,11 @@ const HEAP_GUARD_HIGH_START: u64 = HEAP_START + HEAP_SIZE_BYTES as u64;
 static GLOBAL_ALLOCATOR: Locked<BumpAllocator> = Locked::new(BumpAllocator::new());
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Return the physical memory offset used by the bootloader's identity mapping.
+pub fn physical_memory_offset() -> u64 {
+    PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Copy)]
 pub struct MemoryStats {
     pub region_count: usize,

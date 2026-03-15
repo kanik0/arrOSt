@@ -32,6 +32,10 @@ It also serves the active ring-3 runtime path (`int 0x80`) used by the multiproc
 - Keyboard IRQ handler
 - Mouse IRQ handler
 
+### LAPIC (M27)
+
+The BSP initializes its Local APIC (`arch::x86_64::lapic::init()`) after memory init. The LAPIC is used for IPI-based AP bootstrap (INIT-SIPI-SIPI). The PIT remains the BSP timer source; the LAPIC timer is masked.
+
 ### Initialization flow
 
 `arch::x86_64::interrupts::init()` performs:
