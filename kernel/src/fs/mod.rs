@@ -1068,14 +1068,20 @@ impl FsState {
             ResolvedPath::Inode(node) => {
                 let stat = self.inode_stat(node)?;
                 require_inode_permission(identity, &stat, 0o4)?;
-                match node.mount {
+                let mut count = match node.mount {
                     MountKind::Root => match self.backend {
                         FsBackend::RamFs => list_inode_dir(&self.ramfs, node.ino, out),
                         FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, node.ino, out),
                     },
                     MountKind::Tmp => list_inode_dir(&self.tmpfs, node.ino, out),
                     MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
+                }?;
+                // Inject synthetic entries for non-root mount points when
+                // listing the root directory (they have no real inodes).
+                if node.mount == MountKind::Root && node.ino == ROOT_INO {
+                    count = inject_mount_point_entries(out, count);
                 }
+                Ok(count)
             }
             ResolvedPath::Proc(canonical) => {
                 let resolved = resolve_mount(&canonical);
@@ -1591,14 +1597,18 @@ impl FsState {
                 let identity = proc::fs_identity(current_pid);
                 require_inode_permission(identity, &stat, 0o4)?;
                 // list_inode_dir verifies the inode is a directory.
-                match mount {
+                let mut count = match mount {
                     MountKind::Root => match self.backend {
                         FsBackend::RamFs => list_inode_dir(&self.ramfs, ino, out),
                         FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, ino, out),
                     },
                     MountKind::Tmp => list_inode_dir(&self.tmpfs, ino, out),
                     MountKind::Proc | MountKind::Dev => Err(FsError::NotADirectory),
+                }?;
+                if mount == MountKind::Root && ino == ROOT_INO {
+                    count = inject_mount_point_entries(out, count);
                 }
+                Ok(count)
             }
             OpenFile::Proc(_) => Err(FsError::NotADirectory),
             OpenFile::ProcDir {
@@ -2399,6 +2409,32 @@ fn list_inode_dir(
         }
     }
     Ok(written)
+}
+
+/// Inject synthetic directory entries for non-root mount points (/dev, /proc, /tmp)
+/// into the root directory listing so they appear in `ls /`.
+fn inject_mount_point_entries(out: &mut [VfsDirEntry], mut count: usize) -> usize {
+    const MOUNT_NAMES: [&str; 3] = ["dev", "proc", "tmp"];
+    for name in &MOUNT_NAMES {
+        if count >= out.len() {
+            break;
+        }
+        // Skip if already present (e.g. a real directory exists).
+        let already = out[..count].iter().any(|e| e.name_str() == *name);
+        if already {
+            continue;
+        }
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len().min(MAX_VNAME_LEN);
+        let mut entry = VfsDirEntry::empty();
+        entry.ino = 0; // synthetic
+        entry.file_type = FileType::Directory;
+        entry.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+        entry.name_len = name_len as u8;
+        out[count] = entry;
+        count += 1;
+    }
+    count
 }
 
 fn resolve_backend_mount_path(
