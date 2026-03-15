@@ -1,6 +1,8 @@
 // kernel/src/arch/x86_64/mod.rs: x86_64-specific boot/runtime support.
+pub mod ap_boot;
 pub mod gdt;
 pub mod interrupts;
+pub mod lapic;
 pub mod pic;
 pub mod pit;
 pub mod port;

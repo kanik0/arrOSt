@@ -20,6 +20,7 @@ mod keyboard;
 mod mem;
 mod mouse;
 mod net;
+mod percpu;
 mod proc;
 mod serial;
 mod shell;
@@ -431,6 +432,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         DOOM_WAD_PRESENT
     ));
 
+    // Initialize per-CPU state for BSP (must happen after mem init, before AP boot).
+    percpu::init_bsp();
+
+    // Initialize LAPIC (needed for IPI-based AP bootstrap).
+    arch::x86_64::lapic::init();
+
     shell::init();
     let proc_report = proc::init();
     serial::write_fmt(format_args!(
@@ -439,6 +446,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         proc_report.init_pid,
         proc_report.shell_pid,
         proc_report.scripted_input_bytes
+    ));
+
+    // Boot APs (secondary CPUs). Try all possible APs; those that don't
+    // exist in the QEMU topology will simply time out.
+    let smp_ap_count = smp_ap_count_from_env();
+    let booted = arch::x86_64::ap_boot::boot_aps(smp_ap_count);
+    serial::write_fmt(format_args!(
+        "SMP: {} APs online (bsp=0, total_cpus={})\n",
+        booted,
+        booted + 1
     ));
 
     arch::x86_64::ring3::capture_kernel_resume_rsp();
@@ -763,6 +780,9 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         DOOM_WAD_PRESENT
     ));
 
+    // Initialize per-CPU state for BSP (must happen after mem init, before AP boot).
+    percpu::init_bsp();
+
     shell::init();
     let proc_report = proc::init();
     serial::write_fmt(format_args!(
@@ -772,6 +792,17 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         proc_report.shell_pid,
         proc_report.scripted_input_bytes
     ));
+
+    // Boot APs (secondary CPUs). Try all possible APs; those that don't
+    // exist in the QEMU topology will simply time out.
+    let smp_ap_count = smp_ap_count_from_env();
+    let booted = arch::aarch64::ap_boot::boot_aps(smp_ap_count);
+    serial::write_fmt(format_args!(
+        "SMP: {} APs online (bsp=0, total_cpus={})\n",
+        booted,
+        booted + 1
+    ));
+
     let runtime_irq_ready = irq.pic_master_mask != 0;
     let runtime_irq_enable = runtime_irq_ready;
     arch::aarch64::set_irq_timer_active(runtime_irq_enable);
@@ -1121,7 +1152,34 @@ fn run_loop() -> ! {
 }
 
 pub fn resume_main_loop() -> ! {
-    run_loop()
+    resume_current_loop()
+}
+
+/// Resume into the correct loop for the current CPU.
+/// BSP runs the full subsystem loop; APs idle.
+pub fn resume_current_loop() -> ! {
+    if percpu::is_bsp() {
+        run_loop()
+    } else {
+        ap_run_loop()
+    }
+}
+
+/// AP idle loop. APs currently poll timer ticks and idle.
+/// Phase B will add ring-3 process scheduling here.
+pub fn ap_run_loop() -> ! {
+    loop {
+        for _ in 0..arch::poll_timer_ticks() {
+            let _ = time::on_timer_tick();
+        }
+        arch::idle();
+    }
+}
+
+/// Determine the number of APs to try booting.
+/// Always tries MAX_APS; CPUs that don't exist in the QEMU topology will timeout.
+fn smp_ap_count_from_env() -> u32 {
+    (percpu::MAX_CPUS - 1) as u32
 }
 
 fn halt_loop() -> ! {

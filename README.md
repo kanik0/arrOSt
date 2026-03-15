@@ -143,7 +143,7 @@ Useful runtime commands:
 - No `/dev` filesystem or device nodes.
 - ANSI/VT100 CSI escape sequences (M25) are parsed and rendered in the GUI terminal with per-cell 16-color output. Serial pass-through and bold/underline rendering are deferred.
 - Environment variables (M26): per-process env arrays with `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `env`/`export`/`$VAR` expansion. `envp` passed to `execve` is deferred.
-- Single-core only; no SMP support.
+- SMP Phase A (M27): APs boot and idle; ring-3 scheduling on APs is deferred to Phase B.
 - No real-time clock or wall-clock timestamps.
 - No block/buffer cache; all disk I/O is synchronous and uncached.
 - `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
@@ -173,7 +173,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M24 | Shell pipes + process groups | Complete |
 | M25 | ANSI terminal emulation | Complete |
 | M26 | Environment variables | Complete |
-| M27 | SMP / multi-core | Planned |
+| M27 | SMP / multi-core | Phase A complete |
 | M28 | RTC + wall-clock time | Planned |
 | M29 | Block cache | Planned |
 | M30 | Multi-user + login | Planned |

@@ -352,6 +352,16 @@ fn init_timer_irq_path(counts_per_tick: u64) -> bool {
     true
 }
 
+/// Initialize the GIC CPU interface for a secondary CPU (AP).
+/// Enables IRQ delivery on this CPU via the per-CPU GICC interface.
+pub fn init_gic_cpu_interface() {
+    // SAFETY: MMIO writes to GICC registers for this CPU's interface.
+    unsafe {
+        mmio_write_u32(GICC_BASE + GICC_PMR, 0xff);
+        mmio_write_u32(GICC_BASE + GICC_CTLR, 0x1);
+    }
+}
+
 pub fn enable_runtime_irqs() {
     // SAFETY: IRQ vectors/GIC/timer are configured during `init`; this only unmasks IRQs.
     unsafe {

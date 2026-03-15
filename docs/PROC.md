@@ -1,6 +1,6 @@
 # Process and Scheduler Model
 
-ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 multiprocess preemptive runtime (round-robin with timer-driven hard preemption and syscall-timeslice preemption).
+ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 multiprocess preemptive runtime (round-robin with timer-driven hard preemption and syscall-timeslice preemption). SMP Phase A (M27) boots secondary CPUs which idle; ring-3 scheduling on APs is deferred to Phase B.
 
 ## Current model
 

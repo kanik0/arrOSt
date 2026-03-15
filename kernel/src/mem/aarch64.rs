@@ -11,6 +11,11 @@ use core::hint::spin_loop;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+/// aarch64 uses identity mapping (no offset); return 0.
+pub fn physical_memory_offset() -> u64 {
+    0
+}
+
 const PAGE_SIZE: usize = 4096;
 const HEAP_SIZE_BYTES: usize = 32 * 1024 * 1024;
 const AARCH64_TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;

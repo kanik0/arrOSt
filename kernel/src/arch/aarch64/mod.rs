@@ -3,6 +3,7 @@ use crate::time;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod ap_boot;
 pub mod framebuffer;
 pub mod interrupts;
 pub mod port;
