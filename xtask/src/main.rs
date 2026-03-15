@@ -24,7 +24,7 @@ const USER_BIN_CAT: &str = "cat";
 const USER_BIN_PS: &str = "ps";
 const BUILD_STD: &str = "-Zbuild-std=core,compiler_builtins,alloc";
 const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
-const M6_DISK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+const M6_DISK_SIZE_BYTES: u64 = 32 * 1024 * 1024;
 const VERSION_MAJOR: u64 = 0;
 const VERSION_MINOR: u64 = 1;
 const BUILD_COUNTER_FILE: &str = ".arrost_build_count";

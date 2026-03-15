@@ -225,7 +225,7 @@ Three scheduler tables coexist:
 ### Storage
 - Virtio-blk legacy (PCI on x86_64, mmio on aarch64)
 - 512-byte sectors, synchronous I/O
-- diskfs-v2 uses 16 MiB disk image, 256 inodes, redo-only metadata journal
+- diskfs-v2 uses 32 MiB disk image, 256 inodes, redo-only metadata journal
 
 ## Coding Standards
 
