@@ -283,47 +283,47 @@ Non saltare mai questi step, anche se sembra inutile.
 | # | Milestone | Summary |
 |---|-----------|---------|
 | M11 | KPTI | Trampoline infrastructure, per-CPU scratch, CR3/TTBR0 switching on entry/exit |
-| M12 | VFS-backed ELF launch | `/bin/*` auto-dispatch, kernel-mediated spawn-from-path, 18 seeded binaries |
-| M13 | fork + CoW + demand paging | `SYS_FORK` with CoW pages via `Arc<UserPageHolder>`; demand-paged anonymous VMAs; `mmap`/`brk` live |
+| M12 | VFS-backed ELF launch | `/bin/*` auto-dispatch, kernel-mediated spawn-from-path, 18+ seeded binaries |
+| M13 | fork + CoW + demand paging | `SYS_FORK` with CoW pages via `Arc<UserPageHolder>`; demand-paged anonymous VMAs; `mmap`/`brk` |
 | M14 | Timer-driven preemption | PIT IRQ0 / GIC IRQ27, 10-tick quantum, full GPR save/restore |
-| M15 | Extended syscalls | 52 syscalls total, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
+| M15 | Extended syscalls | 52+ syscalls, ABI rev 5, pipe IPC, BSD sockets, dir/path/identity ops |
 | M16 | Extended ProcFS | Per-PID dirs, `/proc/net/*`, global system files |
 | M17 | Full-data journaling | `MetadataOnly`/`Ordered`/`Full` modes, shell control, on-disk persistence |
-| M19 | TCP/IP + utilities | Ethernet/ARP/IPv4/ICMP/UDP/TCP stack; `ping` (-c, RTT, hostname), `traceroute`, `host`, `dig`, `curl`; Ctrl+C; high-res RDTSC/CNTVCT RTT |
-| M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path; `smoke-execve` harness |
-| M18 | Hardware abstraction layer | `BlockDevice`/`NetDevice`/`DisplayDevice`/`AudioDevice`/`InputDevice` traits; `DeviceRegistry`; `RamDisk`; `LoopbackDevice`; `smoke-hal` harness |
-| M31 | Doom as first-class executable | `SYS_DOOM_LAUNCH=55`; `/bin/doom` ring-3 ELF; `/usr/share/doom/doom1.wad` VFS seeding; shell dispatch via `try_launch_shell_vfs_user_bin`; `-C code-model=large` fix in `build_userland_package` |
-| M31B | Doom UX enhancements | F12=release capture, ESC=in-game menu, CTRL=fire, ALT=strafe, F1/F3/F5/F7 keys; `doom fullscreen`/`doom window`; 660×440 default window; hint pill overlay; comb-filter reverb |
-| M31D | Doom authentic music (OPL2) | OPL2 emulator implemented, GENMIDI loading, MUS player — **audio plays but sounds incorrect (quasi-monotone); root cause not resolved** |
-| M21 | Full mmap / VMA layer | `munmap` (VMA split/remove + PTE clear + TLB flush + physical page free); `mprotect` (VMA flag update + PTE permission update); `brk` shrink; `/proc/<pid>/maps`; `arrostd::runtime::{munmap,mprotect}` |
-| M20 | Signal infrastructure | `sigaction`/`sigreturn` for ring-3; `pending_signals` bitmask; POSIX default actions; `SYS_KILL` ring-3 via `pending_signals`; fork inheritance; `arrostd::runtime::{sigaction,sigreturn,signal_signum}` |
-| M25 | ANSI terminal | `kernel/src/console/ansi.rs` CSI parser; per-cell 16-color rendering in GUI terminal; `ANSI_PALETTE`; `smoke-signals` + `smoke-env` harnesses |
-| M26 | Environment variables | Per-process env arrays (no heap); `SYS_GETENV=56`/`SYS_SETENV=57`/`SYS_UNSETENV=58`; shell `env`/`export`/`$VAR` expansion; GUI terminal env integration; ABI rev 6 |
-| M23 | /dev filesystem | Synthetic devfs mounted at `/dev`; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`); `FileType::CharDevice`/`BlockDevice`; xorshift32 PRNG; `smoke-dev` harness |
-| M24 | Shell pipes + process groups | `cmd1 \| cmd2` pipeline syntax (up to 4 stages); `SYS_SETPGID=59`/`SYS_GETPGID=60`; per-process pgid; `FdRedirect`-based pipe spawning; Ctrl+C kills pipeline; `smoke-pipes` harness |
-| M27 | SMP / multi-core (Phase A) | Per-CPU data via GS/TPIDR_EL1; x86_64 LAPIC + INIT-SIPI-SIPI trampoline; aarch64 PSCI CPU_ON; AP idle loop; `cpus` shell command; `smoke-smp` harness |
-| M28 | RTC + wall-clock time | CMOS RTC (x86_64) + PL031 (aarch64); `date` shell command; `/proc/datetime`; `SYS_CLOCK_GETTIME=61` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`); `Timespec` struct; ABI rev 7; `smoke-rtc` harness |
-| M29 | Block cache | 256-entry LRU write-back sector cache in `storage/cache.rs`; transparent read/write caching for all disk I/O; `cache`/`cache clear`/`cache sync` shell commands; `/proc/cache`; `smoke-cache` harness |
-| M30 | Multi-user + login | Per-process `uid`/`gid` on `Ring3ProcessContext`; `SYS_GETUID`/`SYS_GETGID` return actual UID/GID; `/etc/passwd` + `/etc/group` seeded at boot; `whoami`/`id`/`users` commands; `/bin/whoami` + `/bin/id`; `smoke-login` harness |
-
-### In progress
-| M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
+| M18 | Hardware abstraction layer | Device traits + registry; `RamDisk`; `LoopbackDevice`; `smoke-hal` harness |
+| M19 | TCP/IP + utilities | Full TCP state machine; BSD sockets; DNS; `ping`, `traceroute`, `host`, `dig`, `curl`, `nc` |
+| M20 | Signal infrastructure | `sigaction`/`sigreturn` for ring-3; pending bitmask; POSIX default actions; fork inheritance |
+| M21 | Full mmap / VMA layer | `munmap`, `mprotect`, `brk` shrink, `/proc/<pid>/maps` |
+| M22 | execve syscall | `SYS_EXECVE=54`; in-place image replacement from VFS path |
+| M23 | /dev filesystem | Synthetic devfs; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`) |
+| M24 | Shell pipes + process groups | `cmd1 \| cmd2` (up to 4 stages); `SYS_SETPGID`/`SYS_GETPGID`; Ctrl+C kills pipeline |
+| M25 | ANSI terminal | CSI parser; per-cell 16-color rendering; `ANSI_PALETTE` |
+| M26 | Environment variables | Per-process env arrays; `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `$VAR` expansion; ABI rev 6 |
+| M27 | SMP / multi-core (Phase A) | Per-CPU data; LAPIC + INIT-SIPI-SIPI (x86_64); PSCI CPU_ON (aarch64); AP idle loop |
+| M28 | RTC + wall-clock time | CMOS RTC / PL031; `date`; `/proc/datetime`; `SYS_CLOCK_GETTIME`; ABI rev 7 |
+| M29 | Block cache | 256-entry LRU write-back sector cache; `cache`/`sync` commands; `/proc/cache` |
+| M30 | Multi-user + login | Per-process `uid`/`gid`; `/etc/passwd` + `/etc/group`; `whoami`/`id`/`users` commands |
+| M31 | Doom first-class executable | Phases A+B+D: `SYS_DOOM_LAUNCH`; `/bin/doom`; F12/ESC/fullscreen; OPL2 FM music (quasi-monotone issue unresolved) |
 
 ### Planned
 | # | Milestone | Goal |
 |---|-----------|------|
-| M23 | /dev filesystem | **Complete** — see Completed table |
-| M24 | Shell pipes + process groups | **Complete** — see Completed table |
-| M27 | SMP / multi-core | **Phase A complete** — AP bootstrap, per-CPU state, idle loop; Phase B: SMP-aware ring-3 scheduling |
-| M28 | RTC + wall-clock | **Complete** — see Completed table |
-| M29 | Block cache | **Complete** — see Completed table |
-| M30 | Multi-user + login | **Complete** — see Completed table |
-| M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
-| M32 | Doom 100% userland | `video_blit`+`audio_write` syscalls; move Doom C to user build; remove kernel Doom engine |
+| M32 | Userland I/O + Doom 100% userland | `SYS_VIDEO_BLIT`/`SYS_AUDIO_WRITE`/`SYS_INPUT_READ`; move Doom C to user build; remove kernel Doom engine |
+| M33 | Signal completion | `sigprocmask`; nested signal delivery; `sa_restorer` trampoline |
+| M34 | File-backed mmap + shared memory | VFS page cache; `mmap(fd, ...)` `MAP_PRIVATE`/`MAP_SHARED`; `msync` |
+| M35 | Extended ProcFS Phase 2 | `/proc/<pid>/fd/`, `/proc/interrupts`, `/proc/diskstats`, `/proc/loadavg`, `/proc/stat` |
+| M36 | Minimal userland C library | `arrost-libc` static library: malloc/free, printf, stdio, unistd wrappers, crt0 |
+| M37 | SMP Phase B — multi-core scheduling | Per-CPU GDT/TSS; per-CPU KPTI scratch; global run queue; LAPIC timer on APs; lock audit |
+| M38 | TTY abstraction + job control | TTY device layer; `ioctl` termios; sessions; Ctrl+Z/`SIGTSTP`; `fg`/`bg`/`jobs` |
+| M39 | Shell scripting + globbing | `*`/`?` glob expansion; `if`/`while`/`for` control flow; `$?`; `&&`/`\|\|`; shebang scripts |
+| M40 | Dynamic linking + shared libraries | `PT_INTERP` handling; `ld-arrost.so` dynamic linker; `arrost-libc.so` |
+| M41 | ptrace + debugging interface | `SYS_PTRACE`; `/bin/strace`; optional GDB remote protocol |
+| M42 | IPv6 networking | IPv6 header; ICMPv6; NDP; dual-stack sockets; `ping6` |
+| M43 | HAL consumer migration | Route all I/O through `&dyn BlockDevice`/`&dyn NetDevice` trait objects |
+| M44 | Disk quotas + resource limits | Per-uid quotas; `SYS_GETRLIMIT`/`SYS_SETRLIMIT`; `RLIMIT_NOFILE`/`RLIMIT_AS`/`RLIMIT_NPROC` |
 
 ---
 
 ## Implementation Plans
 
 Detailed implementation plans for each milestone are in `docs/MILESTONES.md`.
-Each plan is written with step-by-step instructions, file paths, and code patterns suitable for Sonnet 4.6 development.
+Each plan is written with step-by-step instructions, file paths, and code patterns suitable for Claude development.
