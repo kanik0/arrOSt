@@ -213,6 +213,10 @@ impl DiskFsV2 {
         self.with_metadata_tx(|_| Ok(()))
     }
 
+    pub fn free_blocks(&self) -> u32 {
+        self.bitmap.free_count()
+    }
+
     pub fn journal_status(&self) -> JournalStatus {
         self.journal.status()
     }
