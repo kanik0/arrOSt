@@ -140,17 +140,20 @@ Useful runtime commands:
 
 ## Known limitations
 
-- File-backed `mmap` and `MAP_SHARED` are not yet implemented (return `ENOSYS`).
-- Signal infrastructure (M20) is implemented for ring-3 processes: `sigaction`/`sigreturn`, `pending_signals` bitmask, POSIX default actions, fork inheritance. Cooperative tasks still return `ENOSYS`. Signal masking (`sigprocmask`) is deferred.
-- No `/dev` filesystem or device nodes.
-- ANSI/VT100 CSI escape sequences (M25) are parsed and rendered in the GUI terminal with per-cell 16-color output. Serial pass-through and bold/underline rendering are deferred.
-- Environment variables (M26): per-process env arrays with `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `env`/`export`/`$VAR` expansion. `envp` passed to `execve` is deferred.
-- SMP Phase A (M27): APs boot and idle; ring-3 scheduling on APs is deferred to Phase B.
-- Block cache (M29) provides LRU sector caching with write-back; 256 entries (128 KiB).
-- `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
+- Doom engine runs inside the kernel via `SYS_DOOM_LAUNCH`; planned move to 100% userland (M32).
+- File-backed `mmap` and `MAP_SHARED` not yet implemented (return `ENOSYS`); planned in M34.
+- Signal masking (`sigprocmask`) not yet implemented; planned in M33.
+- SMP Phase A (M27): APs boot and idle; ring-3 scheduling on APs deferred to Phase B (M37).
+- `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`, or `/proc/loadavg`; planned in M35.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
-- TCP retransmission queue (RTO, Karn's algorithm) is not implemented; packet delivery in QEMU's slirp is reliable so this is not observable.
-- Device abstraction (M18 HAL) provides trait wrappers and a device registry; existing subsystem consumers still call virtio driver globals directly rather than going through `&dyn BlockDevice` / `&dyn NetDevice`.
+- No TTY/PTY abstraction or POSIX job control (`fg`/`bg`/Ctrl+Z); planned in M38.
+- No userland C library; ring-3 binaries use raw syscall stubs; planned in M36.
+- No dynamic linking or shared libraries; planned in M40.
+- No `ptrace` or debugging interface; planned in M41.
+- TCP retransmission queue (RTO, Karn's algorithm) is not implemented; QEMU slirp provides reliable delivery.
+- IPv4 only; IPv6 planned in M42.
+- HAL traits defined but subsystem consumers still call virtio globals directly; migration planned in M43.
+- OPL2 Doom music plays but sounds quasi-monotone; root cause unresolved.
 
 ## Milestone roadmap
 
@@ -170,7 +173,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M20 | Signal infrastructure | Complete |
 | M21 | Full mmap / VMA layer | Complete |
 | M22 | execve syscall | Complete |
-| M23 | /dev filesystem | Planned |
+| M23 | /dev filesystem | Complete |
 | M24 | Shell pipes + process groups | Complete |
 | M25 | ANSI terminal emulation | Complete |
 | M26 | Environment variables | Complete |
@@ -178,8 +181,20 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M28 | RTC + wall-clock time | Complete |
 | M29 | Block cache | Complete |
 | M30 | Multi-user + login | Complete |
-| M31 | Doom enhancements | Planned |
-| M31D | Doom authentic music (OPL2) | Complete |
+| M31 | Doom first-class executable (A+B+D) | Complete |
+| M32 | Userland I/O + Doom 100% userland | Planned |
+| M33 | Signal completion | Planned |
+| M34 | File-backed mmap + shared memory | Planned |
+| M35 | Extended ProcFS Phase 2 | Planned |
+| M36 | Minimal userland C library | Planned |
+| M37 | SMP Phase B — multi-core scheduling | Planned |
+| M38 | TTY abstraction + job control | Planned |
+| M39 | Shell scripting + globbing | Planned |
+| M40 | Dynamic linking + shared libraries | Planned |
+| M41 | ptrace + debugging interface | Planned |
+| M42 | IPv6 networking | Planned |
+| M43 | HAL consumer migration | Planned |
+| M44 | Disk quotas + resource limits | Planned |
 
 ## Build
 
