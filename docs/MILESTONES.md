@@ -26,7 +26,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M24** | Shell Pipes + Process Groups | **Complete** |
 | **M25** | ANSI Terminal Emulation | **Complete** |
 | **M26** | Environment Variables + Inheritance | **Complete** |
-| **M27** | SMP / Multi-Core | Not started |
+| **M27** | SMP / Multi-Core | **Complete** (Phase A) |
 | **M28** | RTC + Wall-Clock Time | Not started |
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
