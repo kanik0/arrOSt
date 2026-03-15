@@ -5,6 +5,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 ## Backends
 
 - `/`: `diskfs-v2` when storage is ready, otherwise `ramfs`.
+- `/dev`: synthetic read-only `devfs` with standard Unix device nodes (M23).
 - `/proc`: synthetic read-only `procfs`.
 - `/tmp`: volatile `tmpfs` with world-writable root (`0777`) for user scratch files.
 
@@ -12,7 +13,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 
 - Hierarchical path resolution with real directories
 - `.` / `..` handling in path walks
-- Path resolution across `/`, `/proc`, and `/tmp` mount boundaries
+- Path resolution across `/`, `/dev`, `/proc`, and `/tmp` mount boundaries
 - Per-process file-descriptor tables with `fd 0-2` reserved for serial stdin/stdout/stderr
 - Default user home directory and history file bootstrap (`/home/user`, `/home/user/.history`)
 - Read file (`cat`)
@@ -45,6 +46,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - Intended for deterministic kernel bring-up and tooling support, not full POSIX compatibility.
 - Filesystem descriptors are separate from the current UDP socket syscall namespace.
 - `procfs` is read-only and currently exposes a small fixed entry set.
+- `devfs` is read-only; device nodes are static (no `mknod`); `/dev/vda` does not support raw read/write via fd (use `storage::read_sector` directly).
 - `tmpfs` is independent from the root filesystem and is not persisted across boots.
 - Symlink resolution stops after 8 chained hops and returns `ELOOP`.
 - Permission model is intentionally small: kernel/external shell paths are privileged, ring-3 processes are treated as `uid=1000 gid=1000`.
@@ -58,6 +60,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `ls -a`
 - `ls -la /home/user`
 - `ls -ls /bin`
+- `ls /dev`
 - `ls /proc`
 - `ls /tmp`
 - `ls /bin`
@@ -105,6 +108,7 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `kernel/src/fs/diskfs_v2.rs`
 - `kernel/src/fs/journal.rs`
 - `kernel/src/fs/fd.rs`
+- `kernel/src/fs/devfs.rs`
 - `kernel/src/fs/procfs.rs`
 - `kernel/src/fs/ramfs.rs`
 - `kernel/src/fs/tmpfs.rs`
