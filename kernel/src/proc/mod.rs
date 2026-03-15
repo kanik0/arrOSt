@@ -199,7 +199,9 @@ pub struct ProcessSnapshot {
     pub tty: Option<u32>,
     #[allow(dead_code)]
     pub pgid: u32,
+    #[allow(dead_code)]
     pub uid: u16,
+    #[allow(dead_code)]
     pub gid: u16,
 }
 
