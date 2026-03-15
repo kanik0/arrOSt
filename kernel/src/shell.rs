@@ -24,6 +24,8 @@ const SERIAL_CAPTURE_HELD_KEYS: usize = 8;
 const SHELL_MAX_ENV_VARS: usize = 32;
 const SHELL_ENV_KEY_MAX: usize = 32;
 const SHELL_ENV_VAL_MAX: usize = 256;
+/// M24: maximum number of pipeline stages (cmd1 | cmd2 | ...).
+const MAX_PIPELINE_STAGES: usize = 4;
 const SERIAL_CAPTURE_HOLD_TICKS_DEFAULT: u64 = 8;
 const SERIAL_CAPTURE_HOLD_TICKS_MOVE: u64 = 12;
 const SERIAL_CAPTURE_HOLD_TICKS_ACTION: u64 = 14;
@@ -262,7 +264,9 @@ struct ShellState {
     cwd: [u8; fs::MAX_OPEN_PATH_BYTES],
     cwd_len: usize,
     history_nav: HistoryBrowseState,
-    waiting_vfs_pid: Option<u32>,
+    /// M24: waiting PIDs for pipeline stages (replaces single waiting_vfs_pid).
+    waiting_vfs_pids: [Option<u32>; MAX_PIPELINE_STAGES],
+    waiting_vfs_count: usize,
     doom_capture: bool,
     serial_escape: SerialEscapeState,
     held_serial_capture_keys: [HeldCaptureKey; SERIAL_CAPTURE_HELD_KEYS],
@@ -281,13 +285,31 @@ impl ShellState {
             cwd,
             cwd_len: 1,
             history_nav: HistoryBrowseState::new(),
-            waiting_vfs_pid: None,
+            waiting_vfs_pids: [None; MAX_PIPELINE_STAGES],
+            waiting_vfs_count: 0,
             doom_capture: false,
             serial_escape: SerialEscapeState::new(),
             held_serial_capture_keys: [HeldCaptureKey::inactive(); SERIAL_CAPTURE_HELD_KEYS],
             env_vars: [None; SHELL_MAX_ENV_VARS],
             env_count: 0,
         }
+    }
+
+    /// Set a single waiting PID (non-pipeline command).
+    fn set_waiting_vfs_pid(&mut self, pid: u32) {
+        self.waiting_vfs_pids[0] = Some(pid);
+        self.waiting_vfs_count = 1;
+    }
+
+    /// Clear all waiting PIDs.
+    fn clear_waiting_vfs_pids(&mut self) {
+        self.waiting_vfs_pids = [None; MAX_PIPELINE_STAGES];
+        self.waiting_vfs_count = 0;
+    }
+
+    /// Check if we are waiting for any child.
+    fn is_waiting(&self) -> bool {
+        self.waiting_vfs_count > 0
     }
 
     fn clear(&mut self) {
@@ -668,7 +690,7 @@ fn process_byte(byte: u8) {
             serial::write_str("\n");
             run_command(shell);
             shell.clear();
-            if !shell.doom_capture && shell.waiting_vfs_pid.is_none() {
+            if !shell.doom_capture && !shell.is_waiting() {
                 print_prompt();
             }
             return;
@@ -684,7 +706,7 @@ fn process_byte(byte: u8) {
             serial::write_str("\n");
             run_command(shell);
             shell.clear();
-            if !shell.doom_capture && shell.waiting_vfs_pid.is_none() {
+            if !shell.doom_capture && !shell.is_waiting() {
                 print_prompt();
             }
         }
@@ -711,10 +733,12 @@ fn process_byte(byte: u8) {
             }
         }
         0x03 => {
-            // Ctrl+C: kill the foreground vfs child if one is running.
-            if let Some(pid) = shell.waiting_vfs_pid {
-                proc::kill_process(pid);
-                shell.waiting_vfs_pid = None;
+            // Ctrl+C: kill the foreground vfs child(ren) if running.
+            if shell.is_waiting() {
+                for pid in shell.waiting_vfs_pids.iter().flatten() {
+                    proc::kill_process(*pid);
+                }
+                shell.clear_waiting_vfs_pids();
                 serial::write_str("\n^C\n");
                 print_prompt();
             } else if shell.len > 0 {
@@ -739,16 +763,26 @@ fn process_byte(byte: u8) {
 fn poll_waiting_vfs_child() -> bool {
     // SAFETY: shell is single-threaded and only mutated from main loop.
     let shell = unsafe { &mut *SHELL_STATE.0.get() };
-    let Some(pid) = shell.waiting_vfs_pid else {
+    if !shell.is_waiting() {
         return true;
-    };
-    let wait_rc = proc::wait_ring3_pid(pid);
-    if wait_rc == errno::EAGAIN {
+    }
+    // Poll all waiting PIDs; remove those that have exited.
+    let mut all_done = true;
+    for slot in &mut shell.waiting_vfs_pids[..shell.waiting_vfs_count] {
+        if let Some(pid) = *slot {
+            let wait_rc = proc::wait_ring3_pid(pid);
+            if wait_rc != errno::EAGAIN {
+                *slot = None;
+            } else {
+                all_done = false;
+            }
+        }
+    }
+    if !all_done {
         return false;
     }
-    shell.waiting_vfs_pid = None;
+    shell.clear_waiting_vfs_pids();
     if !shell.doom_capture {
-        // Binary output may not end with '\n'; always start the prompt on a fresh line.
         serial::write_str("\n");
         print_prompt();
     }
@@ -758,7 +792,7 @@ fn poll_waiting_vfs_child() -> bool {
 fn shell_waiting_for_vfs_child() -> bool {
     // SAFETY: shell state is read on the main loop thread.
     let shell = unsafe { &*SHELL_STATE.0.get() };
-    shell.waiting_vfs_pid.is_some()
+    shell.is_waiting()
 }
 
 fn run_command(shell: &mut ShellState) {
@@ -782,6 +816,12 @@ fn run_command(shell: &mut ShellState) {
     } else {
         input_owned
     };
+    // M24: detect pipe syntax and execute as pipeline.
+    if input_owned.contains('|') {
+        run_pipeline(shell, &input_owned);
+        return;
+    }
+
     if input_owned == "symlink" {
         serial::write_line("usage: symlink <target> <linkpath>");
         return;
@@ -901,7 +941,7 @@ fn run_command(shell: &mut ShellState) {
 
         match try_launch_shell_vfs_user_bin(SERIAL_BIN_LS, &argv[..argc]) {
             Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -937,7 +977,7 @@ fn run_command(shell: &mut ShellState) {
         };
         match try_launch_shell_vfs_user_bin(SERIAL_BIN_CAT, &[SERIAL_BIN_CAT, resolved.as_str()]) {
             Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -1125,7 +1165,7 @@ fn run_command(shell: &mut ShellState) {
     {
         match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "status"]) {
             Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -1137,7 +1177,7 @@ fn run_command(shell: &mut ShellState) {
     if input == "doom play" || input == "/bin/doom play" {
         match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "play"]) {
             Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -1149,7 +1189,7 @@ fn run_command(shell: &mut ShellState) {
     if input == "doom run" || input == "/bin/doom run" {
         match try_launch_shell_vfs_user_bin(SERIAL_BIN_DOOM, &[SERIAL_BIN_DOOM, "run"]) {
             Ok(Some(pid)) => {
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -1163,7 +1203,7 @@ fn run_command(shell: &mut ShellState) {
             Ok(Some(pid)) => {
                 shell.release_all_serial_capture_keys();
                 shell.doom_capture = false;
-                shell.waiting_vfs_pid = Some(pid);
+                shell.set_waiting_vfs_pid(pid);
                 return;
             }
             Ok(None) => {}
@@ -1783,7 +1823,7 @@ fn run_command(shell: &mut ShellState) {
         "ps" | "/bin/ps" => {
             match try_launch_shell_vfs_user_bin(SERIAL_BIN_PS, &[SERIAL_BIN_PS]) {
                 Ok(Some(pid)) => {
-                    shell.waiting_vfs_pid = Some(pid);
+                    shell.set_waiting_vfs_pid(pid);
                     return;
                 }
                 Ok(None) => {}
@@ -2058,6 +2098,167 @@ fn try_launch_shell_vfs_user_bin(path: &'static str, argv: &[&str]) -> Result<Op
         return Err(());
     }
     Ok(u32::try_from(pid_rc).ok())
+}
+
+// ── M24: Pipeline execution ─────────────────────────────────────────────────
+
+/// Resolve a single pipeline stage command to a `/bin/*` path. Returns
+/// `(path, [argv])` or `None` if the command doesn't map to a `/bin/*` binary.
+fn resolve_pipeline_stage<'a>(
+    stage: &'a str,
+    shell: &ShellState,
+) -> Option<(&'static str, [&'a str; 4], usize)> {
+    let stage = stage.trim();
+    if stage.is_empty() {
+        return None;
+    }
+    let bin = fs::resolve_bin_command(stage)?;
+    if !fs::file_exists(bin.path) {
+        return None;
+    }
+    let mut argv = [""; 4];
+    argv[0] = bin.path;
+    let mut argc = 1usize;
+    // For commands that take a path argument, resolve it against the shell cwd.
+    if !bin.args.is_empty() && argc < 4 {
+        // Split args by whitespace (simple; no quoting).
+        for token in bin.args.split_whitespace() {
+            if argc >= 4 {
+                break;
+            }
+            argv[argc] = token;
+            argc += 1;
+        }
+    }
+    let _ = shell; // may be used later for path resolution
+    Some((bin.path, argv, argc))
+}
+
+/// Execute a `cmd1 | cmd2 | ...` pipeline.
+fn run_pipeline(shell: &mut ShellState, input: &str) {
+    // Split by '|' and collect stages.
+    let mut stages: [&str; MAX_PIPELINE_STAGES] = [""; MAX_PIPELINE_STAGES];
+    let mut stage_count = 0usize;
+    for part in input.split('|') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if stage_count >= MAX_PIPELINE_STAGES {
+            serial::write_line("shell: too many pipeline stages (max 4)");
+            return;
+        }
+        stages[stage_count] = trimmed;
+        stage_count += 1;
+    }
+    if stage_count < 2 {
+        serial::write_line("shell: invalid pipeline (need at least 2 stages)");
+        return;
+    }
+
+    // Resolve all stages to /bin/* paths before creating any pipes.
+    struct StageInfo<'a> {
+        path: &'static str,
+        argv: [&'a str; 4],
+        argc: usize,
+    }
+    let mut infos: [Option<StageInfo<'_>>; MAX_PIPELINE_STAGES] = [None, None, None, None];
+    for i in 0..stage_count {
+        match resolve_pipeline_stage(stages[i], shell) {
+            Some((path, argv, argc)) => {
+                infos[i] = Some(StageInfo { path, argv, argc });
+            }
+            None => {
+                serial::write_fmt(format_args!(
+                    "shell: unknown command in pipeline: {}\n",
+                    stages[i]
+                ));
+                return;
+            }
+        }
+    }
+
+    // Allocate pipes between stages: stage[i] stdout -> pipe[i] -> stage[i+1] stdin.
+    let pipe_count = stage_count - 1;
+    let mut pipe_indices: [u8; MAX_PIPELINE_STAGES] = [0; MAX_PIPELINE_STAGES];
+    for i in 0..pipe_count {
+        let rc = fs::pipe::alloc_pipe();
+        if rc < 0 {
+            serial::write_fmt(format_args!(
+                "shell: failed to create pipe {} ({})\n",
+                i,
+                arrostd::syscall::errno::name(rc)
+            ));
+            // Clean up already-allocated pipes.
+            for idx in &pipe_indices[..i] {
+                fs::pipe::close_pipe_read(*idx);
+                fs::pipe::close_pipe_write(*idx);
+            }
+            return;
+        }
+        pipe_indices[i] = rc as u8;
+    }
+
+    // Spawn each pipeline stage with the appropriate fd redirections.
+    let mut spawned_pids: [Option<u32>; MAX_PIPELINE_STAGES] = [None; MAX_PIPELINE_STAGES];
+    let mut success = true;
+
+    for i in 0..stage_count {
+        let info = infos[i].as_ref().unwrap();
+        let redirect = proc::FdRedirect {
+            stdin_pipe: if i > 0 {
+                Some(pipe_indices[i - 1])
+            } else {
+                None
+            },
+            stdout_pipe: if i < pipe_count {
+                Some(pipe_indices[i])
+            } else {
+                None
+            },
+            pgid: 0, // will be set to first child's PID below
+        };
+        let rc = proc::spawn_shell_vfs_bin_process_with_pipes(
+            info.path,
+            &info.argv[..info.argc],
+            &redirect,
+        );
+        if rc <= 0 {
+            serial::write_fmt(format_args!(
+                "shell: failed to spawn pipeline stage {} ({}) rc={}\n",
+                i, stages[i], rc
+            ));
+            success = false;
+            break;
+        }
+        spawned_pids[i] = Some(rc as u32);
+    }
+
+    // Close all pipe ends in the shell (only child processes should hold them).
+    for idx in &pipe_indices[..pipe_count] {
+        fs::pipe::close_pipe_read(*idx);
+        fs::pipe::close_pipe_write(*idx);
+    }
+
+    if !success {
+        // Kill any already-spawned stages.
+        for pid in spawned_pids.iter().flatten() {
+            proc::kill_process(*pid);
+        }
+        return;
+    }
+
+    // Set all pipeline processes to the same pgid (first child's PID).
+    if let Some(first_pid) = spawned_pids[0] {
+        for pid in spawned_pids[..stage_count].iter().flatten() {
+            proc::set_process_pgid(*pid, first_pid);
+        }
+    }
+
+    // Register all spawned PIDs so the shell waits for the entire pipeline.
+    shell.waiting_vfs_pids = [None; MAX_PIPELINE_STAGES];
+    shell.waiting_vfs_pids[..stage_count].copy_from_slice(&spawned_pids[..stage_count]);
+    shell.waiting_vfs_count = stage_count;
 }
 
 fn run_shell_ps_command() {

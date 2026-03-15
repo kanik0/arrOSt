@@ -85,6 +85,10 @@ pub mod syscall {
     pub const SYS_SETENV: u64 = 57;
     /// M26: unset a process environment variable.
     pub const SYS_UNSETENV: u64 = 58;
+    /// M24: set process group ID.
+    pub const SYS_SETPGID: u64 = 59;
+    /// M24: get process group ID.
+    pub const SYS_GETPGID: u64 = 60;
 
     /// `SYS_DOOM_LAUNCH` subcommand codes.
     pub const DOOM_CMD_PLAY: u64 = 0;
@@ -338,6 +342,8 @@ pub mod syscall {
             SYS_BRK => "brk",
             SYS_PIPE => "pipe",
             SYS_PIPE2 => "pipe2",
+            SYS_SETPGID => "setpgid",
+            SYS_GETPGID => "getpgid",
             _ => "unknown",
         }
     }
@@ -487,11 +493,12 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_DOOM_LAUNCH, SYS_EXECVE, SYS_EXIT,
-        SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV,
-        SYS_GETGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
-        SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
-        SYS_SETENV, SYS_SIGACTION, SYS_SIGRETURN, SYS_SYMLINK, SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_DOOM_LAUNCH, SYS_DUP2, SYS_EXECVE,
+        SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV,
+        SYS_GETGID, SYS_GETPGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP,
+        SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME,
+        SYS_RMDIR, SYS_SEEK, SYS_SETENV, SYS_SETPGID, SYS_SIGACTION, SYS_SIGRETURN, SYS_SYMLINK,
+        SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -1137,6 +1144,26 @@ pub mod runtime {
     /// Returns 0 on success or negative errno (ENOENT if not set).
     pub fn unsetenv(key: &str) -> isize {
         syscall2(SYS_UNSETENV, key.as_ptr() as u64, key.len() as u64)
+    }
+
+    // ── M24: Process Groups ─────────────────────────────────────────────────────
+
+    /// Set the process group ID. If `pid` is 0, uses the calling process.
+    /// If `pgid` is 0, the target's PID is used as the new pgid.
+    /// Returns 0 on success or negative errno.
+    pub fn setpgid(pid: u32, pgid: u32) -> isize {
+        syscall2(SYS_SETPGID, pid as u64, pgid as u64)
+    }
+
+    /// Get the process group ID for `pid`. If `pid` is 0, returns the
+    /// calling process's pgid.
+    pub fn getpgid(pid: u32) -> isize {
+        syscall1(SYS_GETPGID, pid as u64)
+    }
+
+    /// Duplicate file descriptor `src_fd` to `dst_fd`, closing `dst_fd` first if open.
+    pub fn dup2(src_fd: u32, dst_fd: u32) -> isize {
+        syscall2(SYS_DUP2, src_fd as u64, dst_fd as u64)
     }
 }
 

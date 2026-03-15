@@ -1670,9 +1670,10 @@ impl FsState {
             let (data, mode) = builtin_bin_seed_payload(path);
             if let Err(err) = self.seed_file_with_mode(path, data, mode) {
                 serial::write_fmt(format_args!(
-                    "FS: seed {} failed ({})\n",
+                    "FS: seed {} failed ({}) len={}\n",
                     path,
-                    err.as_str()
+                    err.as_str(),
+                    data.len(),
                 ));
             }
         }
@@ -1740,9 +1741,10 @@ impl FsState {
         }
         if let Err(err) = self.seed_file_with_mode(USR_SHARE_DOOM_WAD_PATH, wad, 0o644) {
             serial::write_fmt(format_args!(
-                "FS: seed {} failed ({})\n",
+                "FS: seed {} failed ({}) len={}\n",
                 USR_SHARE_DOOM_WAD_PATH,
-                err.as_str()
+                err.as_str(),
+                wad.len(),
             ));
         }
     }

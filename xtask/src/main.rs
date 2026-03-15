@@ -24,7 +24,7 @@ const USER_BIN_CAT: &str = "cat";
 const USER_BIN_PS: &str = "ps";
 const BUILD_STD: &str = "-Zbuild-std=core,compiler_builtins,alloc";
 const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
-const M6_DISK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+const M6_DISK_SIZE_BYTES: u64 = 32 * 1024 * 1024;
 const VERSION_MAJOR: u64 = 0;
 const VERSION_MINOR: u64 = 1;
 const BUILD_COUNTER_FILE: &str = ".arrost_build_count";
@@ -135,6 +135,7 @@ enum TopLevelCommand {
     SmokeEnv,
     SmokeSignals,
     SmokeDev,
+    SmokePipes,
 }
 
 struct UserArtifact {
@@ -208,6 +209,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeEnv) => smoke_env(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeSignals) => smoke_signals(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeDev) => smoke_dev(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokePipes) => smoke_pipes(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -244,6 +246,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-env") => Ok(TopLevelCommand::SmokeEnv),
         Some("smoke-signals") => Ok(TopLevelCommand::SmokeSignals),
         Some("smoke-dev") => Ok(TopLevelCommand::SmokeDev),
+        Some("smoke-pipes") => Ok(TopLevelCommand::SmokePipes),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -382,7 +385,7 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
-    let user_doom_elf = build_userland_binary(
+    let user_doom_elf = build_userland_fs_binary(
         USER_DOOM_PACKAGE,
         USER_DOOM_RING3_BIN,
         KERNEL_TARGET,
@@ -860,7 +863,7 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
-    let user_doom_elf = build_userland_binary(
+    let user_doom_elf = build_userland_fs_binary(
         USER_DOOM_PACKAGE,
         USER_DOOM_RING3_BIN,
         KERNEL_TARGET_AARCH64,
@@ -6001,6 +6004,98 @@ fn reset_storage_disk_image() -> Result<PathBuf> {
     file.set_len(M6_DISK_SIZE_BYTES)
         .with_context(|| format!("failed to size {}", disk_path.display()))?;
     Ok(disk_path)
+}
+
+// ── M24: smoke-pipes ────────────────────────────────────────────────────────
+
+fn smoke_pipes(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-pipes";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // 1. Simple two-stage pipeline: echo | cat
+        send_serial_command(stdin, "echo hello_pipe | cat\n")?;
+        wait_for_log(
+            &log,
+            "hello_pipe",
+            Duration::from_secs(10),
+            "echo | cat pipeline output",
+        )?;
+
+        // 2. Wait for the shell prompt to return (pipeline finished).
+        wait_for_log(
+            &log,
+            "arrost",
+            Duration::from_secs(10),
+            "shell prompt after pipeline",
+        )?;
+
+        Ok(())
+    })();
+
+    // Shut down QEMU.
+    if let Ok(mut stdin) = child.stdin.take().context("stdin take") {
+        let _ = stdin.write_all(b"\x01x");
+    }
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    Ok(())
 }
 
 #[cfg(test)]

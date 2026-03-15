@@ -23,7 +23,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M21** | Full mmap / VMA Layer | **Complete** |
 | **M22** | execve Syscall | **Complete** |
 | **M23** | /dev Filesystem + Device Nodes | **Complete** |
-| **M24** | Shell Pipes + Process Groups | Not started |
+| **M24** | Shell Pipes + Process Groups | **Complete** |
 | **M25** | ANSI Terminal Emulation | **Complete** |
 | **M26** | Environment Variables + Inheritance | **Complete** |
 | **M27** | SMP / Multi-Core | Not started |
@@ -322,43 +322,42 @@ cargo xtask smoke-dev --arch aarch64
 
 ---
 
-### M24: Shell Pipes + Process Groups + Job Control
+### M24: Shell Pipes + Process Groups
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Enable `cmd1 | cmd2` pipe syntax in the shell with proper process group management.
 
 **Dependencies**: M15 (pipe IPC, done), M13 (fork), M22 (execve).
 
-#### Step 1: Shell pipe parsing
-**Files to modify**: `kernel/src/shell.rs`
+#### Delivered
 
-1. Parse `|` in command lines: split into pipeline stages.
-2. For `cmd1 | cmd2 | cmd3`:
-   - Create 2 pipes.
-   - Fork 3 processes.
-   - `cmd1`: stdout -> pipe1 write end.
-   - `cmd2`: stdin -> pipe1 read end, stdout -> pipe2 write end.
-   - `cmd3`: stdin -> pipe2 read end.
-   - Close unused pipe ends in each child.
-   - Parent waits for all children.
+- **Shell pipe parsing** (`kernel/src/shell.rs`):
+  - `|` token splits command lines into up to 4 pipeline stages (`MAX_PIPE_STAGES=4`).
+  - Each inter-stage boundary creates a kernel pipe via `pipe::create()`.
+  - Pipeline stages are spawned as ring-3 `/bin/*` processes with `FdRedirect`-based stdin/stdout rewiring.
+  - First stage: stdout redirected to pipe write end. Middle stages: stdin from previous pipe read end, stdout to next pipe write end. Last stage: stdin from last pipe read end.
+  - Shell waits for all pipeline children to exit before returning to the prompt.
+  - Ctrl+C sends `SIGKILL` to all stages in the pipeline's process group.
 
-#### Step 2: Process groups
-**Files to modify**: `kernel/src/proc/mod.rs`
+- **Process group ID** (`kernel/src/proc/mod.rs`):
+  - `pgid: u32` field added to `Ring3ProcessContext`; defaults to the process's own PID.
+  - `fork` inherits the parent's `pgid`.
+  - Pipeline stages share the same `pgid` (set to the first stage's PID).
 
-1. Add `pgid: u32` (process group ID) to `Ring3ProcessContext`.
-2. `fork` inherits parent's pgid.
-3. Add `SYS_SETPGID` / `SYS_GETPGID` syscalls.
-4. Shell sets each pipeline's processes to the same pgid.
+- **Syscalls** (`crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`):
+  - `SYS_SETPGID=59`: `(pid, pgid) -> 0 or -errno`. `pid=0` means self; `pgid=0` means set pgid to own PID.
+  - `SYS_GETPGID=60`: `(pid) -> pgid or -errno`. `pid=0` means self.
 
-#### Step 3: Job control (optional)
-1. `SIGTSTP` (Ctrl+Z): stop foreground process group.
-2. `bg` / `fg` shell builtins.
-3. `jobs` command lists stopped/background process groups.
+- **FdRedirect spawn integration** (`kernel/src/proc/mod.rs`):
+  - Existing `/bin/*` spawn path extended with optional `FdRedirect` array to override fd 0 and/or fd 1 at process creation time.
+  - Redirects consume pipe read/write ends directly into the child's fd table.
 
-#### Testing
-1. `echo hello | cat` prints `hello`.
-2. `ls | cat | cat` works correctly.
-3. `ps` shows correct pgid for piped processes.
+- **Smoke test** (`xtask/src/main.rs`):
+  - `cargo xtask smoke-pipes --arch x86_64` / `--arch aarch64`: validates `echo hello | cat`, multi-stage pipelines, and process group membership.
+
+#### Not delivered (deferred)
+- Job control (`SIGTSTP`, `bg`/`fg`, `jobs`) — deferred to a future milestone.
+- Background pipelines (`cmd1 | cmd2 &`) — not yet supported.
 
 ---
 

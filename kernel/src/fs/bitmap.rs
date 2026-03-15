@@ -2,14 +2,14 @@
 //
 // The bitmap tracks which data-region blocks are free (0) or used (1).
 // It is stored on disk as a contiguous range of sectors; in memory we
-// keep a fixed-size array large enough for our 16 MiB disk.
+// keep a fixed-size array large enough for our 32 MiB disk.
 
 use super::FsError;
 use crate::storage;
 
 /// Maximum bitmap size in bytes.  32 sectors x 512 = 16384 bytes = 131072 bits.
 /// That covers up to 131072 data blocks (64 MiB at 512 bytes/block), more than
-/// enough for our 16 MiB disk (~32607 data blocks).
+/// enough for our 32 MiB disk (~65375 data blocks).
 pub const BITMAP_SECTORS: u32 = 32;
 pub const BITMAP_BYTES: usize = BITMAP_SECTORS as usize * storage::SECTOR_SIZE;
 const BITMAP_BITS: usize = BITMAP_BYTES * 8;

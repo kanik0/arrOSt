@@ -257,6 +257,38 @@ impl FdTable {
         Ok(dst_fd)
     }
 
+    /// M24: replace fd 0 (stdin) with a pipe read end.
+    /// Closes whatever was at fd 0 first, then installs the pipe read end.
+    /// Bumps the pipe read ref count.
+    pub fn redirect_stdin_to_pipe(&mut self, pipe_idx: u8) {
+        // Close existing fd 0.
+        let _ = self.close(0);
+        // Install pipe read end at fd 0.
+        let desc_idx = match self.alloc_description_slot() {
+            Some(idx) => idx,
+            None => return,
+        };
+        self.descriptions[desc_idx] = FdSlot::new(FdTarget::PipeRead(pipe_idx), O_RDONLY, 1);
+        self.fd_slots[0] = Some(desc_idx as u8);
+        pipe::dup_pipe_read(pipe_idx);
+    }
+
+    /// M24: replace fd 1 (stdout) with a pipe write end.
+    /// Closes whatever was at fd 1 first, then installs the pipe write end.
+    /// Bumps the pipe write ref count.
+    pub fn redirect_stdout_to_pipe(&mut self, pipe_idx: u8) {
+        // Close existing fd 1.
+        let _ = self.close(1);
+        // Install pipe write end at fd 1.
+        let desc_idx = match self.alloc_description_slot() {
+            Some(idx) => idx,
+            None => return,
+        };
+        self.descriptions[desc_idx] = FdSlot::new(FdTarget::PipeWrite(pipe_idx), O_WRONLY, 1);
+        self.fd_slots[1] = Some(desc_idx as u8);
+        pipe::dup_pipe_write(pipe_idx);
+    }
+
     pub fn description(&self, fd: u32) -> Result<FdDescription, FdError> {
         let desc_index = Self::desc_index(&self.fd_slots, fd)?;
         Ok(self.descriptions[desc_index].description())

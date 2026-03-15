@@ -1,6 +1,6 @@
 // kernel/src/fs/diskfs_v2.rs: Inode-based on-disk filesystem (v2).
 //
-// Layout (16 MiB = 32768 sectors of 512 bytes):
+// Layout (32 MiB = 65536 sectors of 512 bytes):
 //   Sector 0:       Superblock (magic "AROSTFS2")
 //   Sectors 1-64:   Inode table  (256 inodes x 128 bytes)
 //   Sectors 65-96:  Data bitmap  (32 sectors = 131072 bits)
