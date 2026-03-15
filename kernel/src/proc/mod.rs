@@ -197,6 +197,8 @@ pub struct ProcessSnapshot {
     pub state: ProcessState,
     pub external_kind: Option<&'static str>,
     pub tty: Option<u32>,
+    #[allow(dead_code)]
+    pub pgid: u32,
 }
 
 impl ProcessSnapshot {
@@ -210,6 +212,7 @@ impl ProcessSnapshot {
             state: ProcessState::Ready,
             external_kind: None,
             tty: None,
+            pgid: 0,
         }
     }
 }
@@ -425,6 +428,8 @@ pub struct Ring3ProcessContext {
     /// M26: environment variable table.
     pub env_vars: [Option<EnvEntry>; MAX_ENV_VARS],
     pub env_count: usize,
+    /// M24: process group ID.
+    pub pgid: u32,
 }
 
 const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
@@ -451,6 +456,7 @@ const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
         signal_saved_frame: None,
         env_vars: [None; MAX_ENV_VARS],
         env_count: 0,
+        pgid: 0,
     };
     ctx.cwd[0] = b'/';
     ctx
@@ -1972,6 +1978,9 @@ impl Scheduler {
             SYS_GETENV => self.syscall_getenv_ring3(arg0, arg1, arg2, arg3),
             SYS_SETENV => self.syscall_setenv_ring3(arg0, arg1, arg2),
             SYS_UNSETENV => self.syscall_unsetenv_ring3(arg0, arg1),
+            // M24: process groups
+            arrostd::syscall::SYS_SETPGID => self.syscall_setpgid_ring3(arg0 as u32, arg1 as u32),
+            arrostd::syscall::SYS_GETPGID => self.syscall_getpgid_ring3(arg0 as u32),
             // M13: real mmap / brk; munmap / mprotect remain ENOSYS
             SYS_MMAP => {
                 // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
@@ -2538,6 +2547,56 @@ impl Scheduler {
         }
     }
 
+    // ── M24: Process Groups ──────────────────────────────────────────────
+
+    fn syscall_setpgid_ring3(&mut self, pid: u32, pgid: u32) -> isize {
+        let target_pid = if pid == 0 {
+            self.ring3_context.process.pid
+        } else {
+            pid
+        };
+        let new_pgid = if pgid == 0 { target_pid } else { pgid };
+        // If targeting the active process, update context directly.
+        if target_pid == self.ring3_context.process.pid {
+            self.ring3_context.process.pgid = new_pgid;
+            if let Some(slot) = self.ring3_active_slot
+                && let Some(task) = self.ring3_tasks[slot].as_mut()
+            {
+                task.process.pgid = new_pgid;
+            }
+            return 0;
+        }
+        // Otherwise find the target in the ring3 task table.
+        for task_opt in &mut self.ring3_tasks {
+            if let Some(task) = task_opt.as_mut()
+                && task.pid == target_pid
+            {
+                task.process.pgid = new_pgid;
+                return 0;
+            }
+        }
+        errno::ESRCH
+    }
+
+    fn syscall_getpgid_ring3(&self, pid: u32) -> isize {
+        let target_pid = if pid == 0 {
+            self.ring3_context.process.pid
+        } else {
+            pid
+        };
+        if target_pid == self.ring3_context.process.pid {
+            return self.ring3_context.process.pgid as isize;
+        }
+        for task_opt in &self.ring3_tasks {
+            if let Some(task) = task_opt.as_ref()
+                && task.pid == target_pid
+            {
+                return task.process.pgid as isize;
+            }
+        }
+        errno::ESRCH
+    }
+
     /// SYS_FORK: create a child process with CoW-shared address space.
     ///
     /// Returns the child PID to the parent; the child receives 0 via its trap frame.
@@ -2599,6 +2658,8 @@ impl Scheduler {
         // M26: inherit environment variables.
         child_task.process.env_vars = self.ring3_context.process.env_vars;
         child_task.process.env_count = self.ring3_context.process.env_count;
+        // M24: inherit parent's process group.
+        child_task.process.pgid = self.ring3_context.process.pgid;
         // Copy parent VMA list; mark writable VMAs as CoW in child.
         child_task.process.vma_list = self.ring3_context.process.vma_list;
         child_task.process.vma_count = self.ring3_context.process.vma_count;
@@ -3178,6 +3239,7 @@ impl Scheduler {
         task.process.pid = pid;
         task.process.name = worker_name;
         task.process.syscall_caps = syscall_caps;
+        task.process.pgid = pid;
         task.process.seed_default_env();
         if let Some(tty) = tty {
             task.process.fd_table.set_tty_stdio(tty);
@@ -3197,6 +3259,19 @@ impl Scheduler {
 
     fn alloc_ring3_task_slot(&self) -> Option<usize> {
         (0..MAX_RING3_TASKS).find(|&index| self.ring3_tasks[index].is_none())
+    }
+
+    /// M24: apply pipe fd redirections and pgid to a just-created ring3 process.
+    fn apply_pipe_redirects(&mut self, pid: u32, redirect: &FdRedirect) {
+        let task = self.ring3_tasks.iter_mut().flatten().find(|t| t.pid == pid);
+        let Some(task) = task else { return };
+        task.process.pgid = redirect.pgid;
+        if let Some(pipe_idx) = redirect.stdin_pipe {
+            task.process.fd_table.redirect_stdin_to_pipe(pipe_idx);
+        }
+        if let Some(pipe_idx) = redirect.stdout_pipe {
+            task.process.fd_table.redirect_stdout_to_pipe(pipe_idx);
+        }
     }
 
     fn wake_sleeping_ring3_tasks(&mut self, now_ticks: u64) {
@@ -5385,6 +5460,7 @@ impl Scheduler {
                 state,
                 external_kind: None,
                 tty: None,
+                pgid: 0,
             };
             written = written.saturating_add(1);
         }
@@ -5409,6 +5485,7 @@ impl Scheduler {
                 state,
                 external_kind: task.name.starts_with("/bin/").then_some("binary"),
                 tty: task.tty,
+                pgid: task.process.pgid,
             };
             written = written.saturating_add(1);
         }
@@ -5430,6 +5507,7 @@ impl Scheduler {
                 state,
                 external_kind: Some(task.kind.as_str()),
                 tty: task.tty,
+                pgid: 0,
             };
             written = written.saturating_add(1);
         }
@@ -6590,7 +6668,11 @@ fn syscall_required_caps(number: u64) -> u32 {
             caps::PROC
         }
         // M26: environment variable ops
-        SYS_GETENV | SYS_SETENV | SYS_UNSETENV => caps::CORE,
+        SYS_GETENV
+        | SYS_SETENV
+        | SYS_UNSETENV
+        | arrostd::syscall::SYS_SETPGID
+        | arrostd::syscall::SYS_GETPGID => caps::CORE,
         SYS_TIME_MS => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
         | SYS_LISTEN | SYS_ACCEPT | SYS_PING => caps::NET,
@@ -6994,6 +7076,39 @@ pub fn spawn_shell_vfs_bin_process(path: &'static str, argv: &[&str]) -> isize {
     })
 }
 
+/// M24: fd redirection for pipeline stages.
+pub struct FdRedirect {
+    /// If Some, dup2 this pipe read-end as fd 0 (stdin).
+    pub stdin_pipe: Option<u8>,
+    /// If Some, dup2 this pipe write-end as fd 1 (stdout).
+    pub stdout_pipe: Option<u8>,
+    /// Process group ID to assign.
+    pub pgid: u32,
+}
+
+/// Spawn a VFS binary with pipe fd redirections for pipeline execution.
+pub fn spawn_shell_vfs_bin_process_with_pipes(
+    path: &'static str,
+    argv: &[&str],
+    redirect: &FdRedirect,
+) -> isize {
+    let parent_pid = with_scheduler(|scheduler| scheduler.find_pid("sh").unwrap_or_default());
+    let prepared = match prepare_ring3_vfs_bin(path, argv) {
+        Ok(prepared) => prepared,
+        Err(error) => return error,
+    };
+    with_scheduler(|scheduler| {
+        match scheduler.enqueue_prepared_ring3_vfs_bin(parent_pid, prepared, None, false) {
+            Ok(pid) => {
+                // Apply fd redirections to the just-created process.
+                scheduler.apply_pipe_redirects(pid, redirect);
+                pid as isize
+            }
+            Err(error) => error,
+        }
+    })
+}
+
 pub fn spawn_terminal_vfs_bin_process(path: &'static str, tty: u32, argv: &[&str]) -> isize {
     let parent_pid = with_scheduler(|scheduler| scheduler.find_pid("sh").unwrap_or_default());
     let prepared = match prepare_ring3_vfs_bin(path, argv) {
@@ -7006,6 +7121,20 @@ pub fn spawn_terminal_vfs_bin_process(path: &'static str, tty: u32, argv: &[&str
             Err(error) => error,
         }
     })
+}
+
+/// M24: set pgid on a ring3 process from the shell.
+pub fn set_process_pgid(pid: u32, pgid: u32) {
+    with_scheduler(|scheduler| {
+        for task_opt in &mut scheduler.ring3_tasks {
+            if let Some(task) = task_opt.as_mut()
+                && task.pid == pid
+            {
+                task.process.pgid = pgid;
+                return;
+            }
+        }
+    });
 }
 
 pub fn exit_external_process(pid: u32) -> bool {

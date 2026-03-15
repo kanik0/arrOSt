@@ -52,6 +52,8 @@ cargo xtask smoke-signals --arch x86_64   # M20 signals smoke
 cargo xtask smoke-signals --arch aarch64
 cargo xtask smoke-dev --arch x86_64       # M23 /dev filesystem smoke
 cargo xtask smoke-dev --arch aarch64
+cargo xtask smoke-pipes --arch x86_64     # M24 shell pipes smoke
+cargo xtask smoke-pipes --arch aarch64
 ```
 
 ### Environment Variables
@@ -195,6 +197,7 @@ Three scheduler tables coexist:
   - networking: socket(6) sendto(7) recvfrom(8) bind(47) listen(48) accept(49) connect(50) send(51) recv(52) ping(53)
   - process image: execve(54) doom_launch(55)
   - env vars (M26): getenv(56) setenv(57) unsetenv(58)
+  - process groups (M24): setpgid(59) getpgid(60)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -286,6 +289,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M25 | ANSI terminal | `kernel/src/console/ansi.rs` CSI parser; per-cell 16-color rendering in GUI terminal; `ANSI_PALETTE`; `smoke-signals` + `smoke-env` harnesses |
 | M26 | Environment variables | Per-process env arrays (no heap); `SYS_GETENV=56`/`SYS_SETENV=57`/`SYS_UNSETENV=58`; shell `env`/`export`/`$VAR` expansion; GUI terminal env integration; ABI rev 6 |
 | M23 | /dev filesystem | Synthetic devfs mounted at `/dev`; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`); `FileType::CharDevice`/`BlockDevice`; xorshift32 PRNG; `smoke-dev` harness |
+| M24 | Shell pipes + process groups | `cmd1 \| cmd2` pipeline syntax (up to 4 stages); `SYS_SETPGID=59`/`SYS_GETPGID=60`; per-process pgid; `FdRedirect`-based pipe spawning; Ctrl+C kills pipeline; `smoke-pipes` harness |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -294,7 +298,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | # | Milestone | Goal |
 |---|-----------|------|
 | M23 | /dev filesystem | **Complete** — see Completed table |
-| M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
+| M24 | Shell pipes + process groups | **Complete** — see Completed table |
 | M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
 | M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
 | M29 | Block cache | LRU sector cache, write-back, cache stats |

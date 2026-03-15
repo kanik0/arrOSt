@@ -66,6 +66,13 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 | 37 | `getgid` | `() -> gid` | Group ID (stub: 0) |
 | 38 | `kill` | `(pid, sig) -> 0 or -errno` | Send signal to process |
 
+### Process groups (59-60)
+
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 59 | `setpgid` | `(pid, pgid) -> 0 or -errno` | Set process group ID; `pid=0` means self, `pgid=0` means set pgid to own PID |
+| 60 | `getpgid` | `(pid) -> pgid or -errno` | Get process group ID; `pid=0` means self |
+
 ### Signals (39-40)
 
 | Number | Name | Signature | Notes |
@@ -218,6 +225,7 @@ On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: sysca
 `fork` (M13), anonymous `mmap`, `munmap`, `mprotect`, and `brk` are fully implemented (M13/M21). File-backed `mmap` and `MAP_SHARED` remain `ENOSYS`.
 `sigaction` (M20, SYS_SIGACTION=39) and `sigreturn` (M20, SYS_SIGRETURN=40) are fully implemented for ring-3 processes. Cooperative tasks still return `ENOSYS`.
 `getenv`/`setenv`/`unsetenv` (M26, SYS_GETENV=56 / SYS_SETENV=57 / SYS_UNSETENV=58) are fully implemented for ring-3 processes. Shell-level `env`/`export` commands and `$VAR` expansion are available on the serial and GUI terminal.
+`setpgid`/`getpgid` (M24, SYS_SETPGID=59 / SYS_GETPGID=60) are fully implemented for ring-3 processes. Shell pipe syntax (`cmd1 | cmd2`, up to 4 stages) uses process groups for coordinated lifecycle and signal delivery.
 
 ## Userland shim
 

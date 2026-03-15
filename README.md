@@ -71,7 +71,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - File metadata tracks `uid`, `gid`, `mode`, `nlink`, `atime`, `mtime`, and `ctime`.
 - Permission enforcement is active in the VFS.
 - Per-process fd tables support `open`, `close`, `fread`, `fwrite`, `seek`, `fstat`, `dup`, and `dup2`.
-- Pipe IPC: 8-slot global table, 4 KiB circular buffers, ref-counted read/write ends.
+- Pipe IPC: 8-slot global table, 4 KiB circular buffers, ref-counted read/write ends. Shell `cmd1 | cmd2` pipeline syntax (up to 4 stages).
 - Repeated path walks use a dentry cache with conservative invalidation on namespace mutations.
 - Shell and GUI terminal commands auto-dispatch to `/bin/<cmd>` when that path exists and carries execute permission.
 - Default user home is `/home/user`, and shell history persists in `/home/user/.history`.
@@ -170,7 +170,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M21 | Full mmap / VMA layer | Complete |
 | M22 | execve syscall | Complete |
 | M23 | /dev filesystem | Planned |
-| M24 | Shell pipes + process groups | Planned |
+| M24 | Shell pipes + process groups | Complete |
 | M25 | ANSI terminal emulation | Complete |
 | M26 | Environment variables | Complete |
 | M27 | SMP / multi-core | Planned |
