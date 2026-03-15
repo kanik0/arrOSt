@@ -8,6 +8,7 @@ use crate::keyboard;
 use crate::mouse;
 use crate::net;
 use crate::proc;
+use crate::rtc;
 use crate::serial;
 use crate::shell;
 use crate::storage;
@@ -2354,7 +2355,7 @@ impl GfxState {
         if command == "help" {
             self.push_terminal_text(
                 index,
-                "help: help version ticks uptime pid tty pwd cd clear terminal ls [-als] [<path>] cat echo > stat chmod mkdir mv link symlink fm [list|cd|open|copy|delete] doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal link symlink)\n",
+                "help: help version ticks uptime date pid tty pwd cd clear terminal ls [-als] [<path>] cat echo > stat chmod mkdir mv link symlink fm [list|cd|open|copy|delete] doom ui user ring3 spawn wait waitx ps kill syscalls net ping udp curl disk sync reload watch on|off exit (/bin: ls ps kill cat echo fm doom terminal link symlink date)\n",
             );
             return true;
         }
@@ -2520,6 +2521,13 @@ impl GfxState {
             let millis = time::uptime_millis();
             let mut line = String::new();
             let _ = writeln!(line, "uptime: {} ms ({} s)", millis, millis / 1000);
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if command == "date" {
+            let dt = rtc::datetime();
+            let mut line = String::new();
+            let _ = writeln!(line, "{}", dt);
             self.push_terminal_text(index, &line);
             return true;
         }

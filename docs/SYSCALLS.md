@@ -4,7 +4,7 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 
 ## ABI revision
 
-- Current revision: `6`
+- Current revision: `7`
 - Shared constants live in `crates/arrostd/src/lib.rs`
 
 ## Syscall numbers
@@ -123,6 +123,16 @@ Pipe implementation: 8-slot global table, 4 KiB circular buffers, ref-counted en
 | 53 | `ping` | `(ip_ptr, ip_len) -> rtt_ms or -errno` | ICMP echo request/reply |
 | 54 | `execve` | `(path_ptr, path_len) -> ! or -errno` | Replace process image with ELF at VFS path |
 
+### Clock (61)
+
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 61 | `clock_gettime` | `(clock_id, ts_ptr) -> 0 or -errno` | Write `Timespec { tv_sec, tv_nsec }` to user buffer. `clock_id`: `CLOCK_REALTIME=0` (RTC wall-clock), `CLOCK_MONOTONIC=1` (PIT/GIC uptime). Requires `caps::TIME`. |
+
+`Timespec` is `#[repr(C)]` with two `u64` fields (`tv_sec`, `tv_nsec`).
+`CLOCK_REALTIME` reads the hardware RTC (CMOS on x86_64, PL031 on aarch64); `tv_nsec` is always 0.
+`CLOCK_MONOTONIC` derives seconds and nanoseconds from `time::uptime_millis()`.
+
 ## File descriptor model
 
 Fresh processes start with:
@@ -151,7 +161,7 @@ Syscall capability flags are shared via `crates/arrostd/src/lib.rs` (`syscall::c
 - `CORE`: basic read/write/exit/yield/sleep, filesystem ops, pipe ops
 - `NET`: socket/send/recv/connect and UDP path
 - `PROC`: process identity (`getpid`, `getppid`, `getuid`, `getgid`, `kill`, `spawn`, `waitpid`)
-- `TIME`: monotonic uptime (`time_ms`)
+- `TIME`: monotonic uptime (`time_ms`), wall-clock (`clock_gettime`)
 
 Kernel process-layer dispatch enforces required capability bits per task/process before syscall handling.
 `cap_get` returns the current task capability mask.
@@ -195,6 +205,7 @@ Current mapped set used by runtime paths:
 - `TcpConnectReq` — TCP connect request (addr, port)
 - `FileStat` — file status (inode, type, mode, nlink, uid, gid, size, timestamps)
 - `DirEntry` — directory entry for `getdents` (inode, type, name)
+- `Timespec` — clock time (`tv_sec: u64`, `tv_nsec: u64`)
 
 All are `#[repr(C)]` and designed for stable kernel/user data exchange.
 
@@ -226,6 +237,7 @@ On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: sysca
 `sigaction` (M20, SYS_SIGACTION=39) and `sigreturn` (M20, SYS_SIGRETURN=40) are fully implemented for ring-3 processes. Cooperative tasks still return `ENOSYS`.
 `getenv`/`setenv`/`unsetenv` (M26, SYS_GETENV=56 / SYS_SETENV=57 / SYS_UNSETENV=58) are fully implemented for ring-3 processes. Shell-level `env`/`export` commands and `$VAR` expansion are available on the serial and GUI terminal.
 `setpgid`/`getpgid` (M24, SYS_SETPGID=59 / SYS_GETPGID=60) are fully implemented for ring-3 processes. Shell pipe syntax (`cmd1 | cmd2`, up to 4 stages) uses process groups for coordinated lifecycle and signal delivery.
+`clock_gettime` (M28, SYS_CLOCK_GETTIME=61) is fully implemented for ring-3 processes. `CLOCK_REALTIME` reads the hardware RTC; `CLOCK_MONOTONIC` derives from PIT/GIC tick counting.
 
 ## Userland shim
 

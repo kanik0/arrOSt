@@ -23,6 +23,7 @@ mod user_bin_embed {
 use crate::mem;
 use crate::net;
 use crate::proc::{self, FsIdentity};
+use crate::rtc;
 use crate::serial;
 use crate::storage;
 use alloc::string::String;
@@ -44,7 +45,7 @@ use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 21] = [
+pub const BIN_EXEC_PATHS: [&str; 22] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -66,6 +67,7 @@ pub const BIN_EXEC_PATHS: [&str; 21] = [
     "/bin/traceroute",
     "/bin/host",
     "/bin/dig",
+    "/bin/date",
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
@@ -525,6 +527,7 @@ impl FsState {
             ProcOpenFile::NetArp => Ok(self.render_proc_net_arp_text()),
             ProcOpenFile::NetTcp => Ok(self.render_proc_net_tcp_text()),
             ProcOpenFile::NetRoute => Ok(self.render_proc_net_route_text()),
+            ProcOpenFile::DateTime => Ok(self.render_proc_datetime_text()),
             ProcOpenFile::PidStatus { pid } => self.render_proc_pid_status_text(pid),
             ProcOpenFile::PidCmdline { pid } => self.render_proc_pid_cmdline_text(pid),
             ProcOpenFile::PidStat { pid } => self.render_proc_pid_stat_text(pid),
@@ -545,6 +548,7 @@ impl FsState {
                 | ProcOpenFile::NetArp
                 | ProcOpenFile::NetTcp
                 | ProcOpenFile::NetRoute
+                | ProcOpenFile::DateTime
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -579,6 +583,7 @@ impl FsState {
                 | ProcOpenFile::NetArp
                 | ProcOpenFile::NetTcp
                 | ProcOpenFile::NetRoute
+                | ProcOpenFile::DateTime
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -824,6 +829,15 @@ impl FsState {
             text,
             "lo\t7F000000\t00000000\t0001\t0\t0\t0\tFF000000\t0\t0\t0"
         );
+        text
+    }
+
+    fn render_proc_datetime_text(&self) -> String {
+        let dt = rtc::datetime();
+        let epoch = rtc::unix_epoch_secs();
+        let mut text = String::new();
+        let _ = writeln!(text, "datetime: {}", dt);
+        let _ = writeln!(text, "epoch: {}", epoch);
         text
     }
 

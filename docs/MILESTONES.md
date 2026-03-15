@@ -27,7 +27,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M25** | ANSI Terminal Emulation | **Complete** |
 | **M26** | Environment Variables + Inheritance | **Complete** |
 | **M27** | SMP / Multi-Core | Not started |
-| **M28** | RTC + Wall-Clock Time | Not started |
+| **M28** | RTC + Wall-Clock Time | **Complete** |
 | **M29** | Block Cache / Buffer Cache | Not started |
 | **M30** | Multi-User + Login | Not started |
 | **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
@@ -468,35 +468,50 @@ cargo xtask smoke-dev --arch aarch64
 
 ### M28: RTC + Wall-Clock Time
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Read real-time clock for wall-clock timestamps.
 
 **Dependencies**: None.
 
-#### Step 1: RTC driver
-**Files to create**: `kernel/src/drivers/rtc.rs` (or `kernel/src/arch/x86_64/rtc.rs`, `kernel/src/arch/aarch64/rtc.rs`)
+#### Delivered
 
-1. **x86_64**: Read CMOS RTC via I/O ports `0x70`/`0x71`. Read year/month/day/hour/minute/second.
-2. **aarch64**: Read PL031 RTC via MMIO (QEMU `virt` machine provides one at a known base address).
-3. Convert to Unix epoch seconds.
-
-#### Step 2: Time syscalls
-**Files to modify**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`
-
-1. Enhance `SYS_TIME_MS` or add `SYS_CLOCK_GETTIME`:
-   - `CLOCK_REALTIME`: RTC-based wall clock.
-   - `CLOCK_MONOTONIC`: existing tick-based timer.
-2. Expose via `/proc/uptime` (already exists) and new `/proc/datetime`.
-
-#### Step 3: `date` command
-**Files to modify**: `kernel/src/shell.rs`
-
-1. `date` prints current date/time in ISO 8601 format.
-2. Add to `/bin/date`.
+- **`kernel/src/rtc.rs`** — Cross-architecture RTC driver:
+  - x86_64: CMOS RTC via I/O ports `0x70`/`0x71` with BCD auto-detection via status register B.
+  - aarch64: PL031 RTC via MMIO at `0x0901_0000` (QEMU `virt`); reads 32-bit `RTCDR` data register → Unix epoch seconds.
+  - `DateTime` struct with ISO 8601 `Display` formatter.
+  - `unix_epoch_secs()` and `datetime()` public API.
+  - Pure-arithmetic epoch ↔ datetime conversion (no libm).
+- **`rtc::init()`** called after `fs::init()` on both architecture boot paths; logs `RTC: backend=cmos|pl031 ready=true epoch=... datetime=...`.
+- **`date` shell command**: prints ISO 8601 datetime (`YYYY-MM-DDTHH:MM:SSZ`). Available in serial shell and GUI terminal.
+- **`/bin/date`** added to `BIN_EXEC_PATHS` (22 entries).
+- **`/proc/datetime`**: synthetic procfs file showing `datetime: ...` and `epoch: ...` lines.
+- **`SYS_CLOCK_GETTIME = 61`** (`crates/arrostd/src/lib.rs`):
+  - `CLOCK_REALTIME` (0): RTC wall-clock → `Timespec { tv_sec, tv_nsec=0 }`.
+  - `CLOCK_MONOTONIC` (1): uptime ticks → `Timespec { tv_sec, tv_nsec }`.
+  - Writes `Timespec` struct to user buffer via `ring3_copy_to_user`.
+  - Gated on `caps::TIME`.
+- **`arrostd::runtime::clock_gettime(clock_id, &mut Timespec)`** helper.
+- **ABI revision** bumped to 7.
+- **`cargo xtask smoke-rtc [--arch <x86_64|aarch64>]`**: boots QEMU, verifies RTC init log, `date` output, `cat /proc/datetime` output.
 
 #### Testing
-1. `date` prints a reasonable date (QEMU provides a default).
-2. `cat /proc/uptime` still works.
+```
+date                          # ISO 8601 datetime
+cat /proc/datetime            # datetime + epoch seconds
+cargo xtask smoke-rtc --arch x86_64
+cargo xtask smoke-rtc --arch aarch64
+```
+
+#### Relevant files
+- `kernel/src/rtc.rs`
+- `kernel/src/main.rs` (init call)
+- `kernel/src/shell.rs` (date command)
+- `kernel/src/gfx/mod.rs` (GUI terminal date command)
+- `kernel/src/fs/mod.rs` (BIN_EXEC_PATHS, proc datetime renderer)
+- `kernel/src/fs/procfs.rs` (DateTime variant + inode)
+- `crates/arrostd/src/lib.rs` (SYS_CLOCK_GETTIME, Timespec, clock constants)
+- `kernel/src/proc/mod.rs` (syscall dispatch + handler)
+- `xtask/src/main.rs` (smoke-rtc harness)
 
 ---
 

@@ -63,6 +63,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - `cat /proc/self/pid`
 - `cat /proc/mounts`
 - `cat /proc/uptime`
+- `cat /proc/datetime`
 - `syscalls`
 - `spawn <init|doom>`
 - `wait <pid|any|all>`
@@ -76,7 +77,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Timer-driven hard preemption (M14 complete): PIT IRQ0 (x86_64) and GIC virtual timer IRQ27 (aarch64) preempt ring-3 processes at any instruction boundary with full GPR save/restore. Quantum = 10 timer ticks (`RING3_PREEMPT_QUANTUM`). Syscall-timeslice preemption also remains active.
 - Capability masks remain policy checks layered on top of hardware user/kernel separation.
 - External process entries are lifecycle-tracked as `running`/`exited`; exited entries are reaped through `waitx`.
-- `procfs` (M16 complete) exposes global system files (`version`, `cpuinfo`, `meminfo`, `mounts`, `uptime`, `ps`), `/proc/net/` subsystem (`dev`, `arp`, `tcp`), and dynamic per-PID directories (`/proc/<pid>/status`, `/proc/<pid>/cmdline`, `/proc/<pid>/stat`). Remaining: `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`.
+- `procfs` (M16 complete) exposes global system files (`version`, `cpuinfo`, `meminfo`, `mounts`, `uptime`, `ps`, `datetime`), `/proc/net/` subsystem (`dev`, `arp`, `tcp`), and dynamic per-PID directories (`/proc/<pid>/status`, `/proc/<pid>/cmdline`, `/proc/<pid>/stat`). `/proc/datetime` (M28) shows ISO 8601 wall-clock time and Unix epoch seconds from the hardware RTC. Remaining: `/proc/<pid>/maps`, `/proc/<pid>/fd/`, `/proc/diskstats`, `/proc/interrupts`.
 - External GUI/runtime entries carry an fd table for model consistency, but they do not issue filesystem syscalls yet.
 - Bare command names in shell/GUI terminal can auto-dispatch to filesystem-backed `/bin/*` helpers; those executions appear in the ring-3 process table as `kind=binary`.
 

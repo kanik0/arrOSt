@@ -79,7 +79,7 @@ const USER_BIN_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_HINT";
 const USER_BIN_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-execve [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]|smoke-hal [--arch <x86_64|aarch64>]|smoke-env [--arch <x86_64|aarch64>]|smoke-signals [--arch <x86_64|aarch64>]|smoke-dev [--arch <x86_64|aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-execve [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]|smoke-hal [--arch <x86_64|aarch64>]|smoke-env [--arch <x86_64|aarch64>]|smoke-signals [--arch <x86_64|aarch64>]|smoke-dev [--arch <x86_64|aarch64>]|smoke-rtc [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -137,6 +137,7 @@ enum TopLevelCommand {
     SmokeDev,
     SmokePipes,
     SmokeSmp,
+    SmokeRtc,
 }
 
 struct UserArtifact {
@@ -212,6 +213,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeDev) => smoke_dev(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokePipes) => smoke_pipes(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeSmp) => smoke_smp(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeRtc) => smoke_rtc(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -250,6 +252,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-dev") => Ok(TopLevelCommand::SmokeDev),
         Some("smoke-pipes") => Ok(TopLevelCommand::SmokePipes),
         Some("smoke-smp") => Ok(TopLevelCommand::SmokeSmp),
+        Some("smoke-rtc") => Ok(TopLevelCommand::SmokeRtc),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -6204,6 +6207,110 @@ fn smoke_smp(arch_override: Option<String>) -> Result<()> {
 
     println!("{smoke_name}: PASS");
     if let Some(line) = last_matching_line(&log_snapshot, "SMP:") {
+        println!("{smoke_name}: {line}");
+    }
+    Ok(())
+}
+
+// ── M28: smoke-rtc ──────────────────────────────────────────────────────────
+
+fn smoke_rtc(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-rtc";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // Verify RTC init log line.
+        wait_for_log(
+            &log,
+            "RTC: backend=",
+            Duration::from_secs(5),
+            "RTC init log",
+        )?;
+
+        // Run `date` command and verify ISO 8601 output.
+        send_serial_command(stdin, "date\n")?;
+        wait_for_log(
+            &log,
+            "20",
+            Duration::from_secs(5),
+            "date command output (year starts with 20xx)",
+        )?;
+
+        // Run `cat /proc/datetime` and verify output.
+        send_serial_command(stdin, "cat /proc/datetime\n")?;
+        wait_for_log(
+            &log,
+            "epoch:",
+            Duration::from_secs(5),
+            "cat /proc/datetime shows epoch",
+        )?;
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    if let Some(line) = last_matching_line(&log_snapshot, "RTC:") {
         println!("{smoke_name}: {line}");
     }
     Ok(())

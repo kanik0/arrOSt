@@ -56,6 +56,8 @@ cargo xtask smoke-pipes --arch x86_64     # M24 shell pipes smoke
 cargo xtask smoke-pipes --arch aarch64
 cargo xtask smoke-smp --arch x86_64       # M27 SMP multi-core smoke
 cargo xtask smoke-smp --arch aarch64
+cargo xtask smoke-rtc --arch x86_64       # M28 RTC wall-clock smoke
+cargo xtask smoke-rtc --arch aarch64
 ```
 
 ### Environment Variables
@@ -76,6 +78,7 @@ kernel/                     Rust no_std kernel crate
     shell.rs                Shell command dispatcher (serial + GUI)
     serial.rs               Serial I/O (always available)
     time.rs                 Time management
+    rtc.rs                  RTC driver (CMOS x86_64 / PL031 aarch64)
     arch/
       mod.rs                Architecture dispatch
       x86_64/
@@ -185,7 +188,7 @@ Three scheduler tables coexist:
 2. **Ring-3 ELF processes** - Per-process page tables, dedicated user virtual range (`0x0000_2000_...`). Round-robin scheduling. State: `ready/running/sleep/exited/faulted`.
 3. **External process table** - Compositor-launched entries (GUI terminals, Doom sessions, `/bin/*` helpers).
 
-### Syscall ABI (revision 6)
+### Syscall ABI (revision 7)
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
 - Numbers:
@@ -200,6 +203,7 @@ Three scheduler tables coexist:
   - process image: execve(54) doom_launch(55)
   - env vars (M26): getenv(56) setenv(57) unsetenv(58)
   - process groups (M24): setpgid(59) getpgid(60)
+  - clock (M28): clock_gettime(61)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -293,6 +297,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M23 | /dev filesystem | Synthetic devfs mounted at `/dev`; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`); `FileType::CharDevice`/`BlockDevice`; xorshift32 PRNG; `smoke-dev` harness |
 | M24 | Shell pipes + process groups | `cmd1 \| cmd2` pipeline syntax (up to 4 stages); `SYS_SETPGID=59`/`SYS_GETPGID=60`; per-process pgid; `FdRedirect`-based pipe spawning; Ctrl+C kills pipeline; `smoke-pipes` harness |
 | M27 | SMP / multi-core (Phase A) | Per-CPU data via GS/TPIDR_EL1; x86_64 LAPIC + INIT-SIPI-SIPI trampoline; aarch64 PSCI CPU_ON; AP idle loop; `cpus` shell command; `smoke-smp` harness |
+| M28 | RTC + wall-clock time | CMOS RTC (x86_64) + PL031 (aarch64); `date` shell command; `/proc/datetime`; `SYS_CLOCK_GETTIME=61` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`); `Timespec` struct; ABI rev 7; `smoke-rtc` harness |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -303,7 +308,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M23 | /dev filesystem | **Complete** — see Completed table |
 | M24 | Shell pipes + process groups | **Complete** — see Completed table |
 | M27 | SMP / multi-core | **Phase A complete** — AP bootstrap, per-CPU state, idle loop; Phase B: SMP-aware ring-3 scheduling |
-| M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |
+| M28 | RTC + wall-clock | **Complete** — see Completed table |
 | M29 | Block cache | LRU sector cache, write-back, cache stats |
 | M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
 | M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
