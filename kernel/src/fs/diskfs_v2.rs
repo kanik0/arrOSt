@@ -1441,7 +1441,10 @@ impl Vfs for DiskFsV2 {
                             }
                         }
                     }
-                    FileType::Regular | FileType::Symlink => {
+                    FileType::Regular
+                    | FileType::Symlink
+                    | FileType::CharDevice
+                    | FileType::BlockDevice => {
                         if written < out.len() {
                             let flat_name = core::str::from_utf8(&prefix_buf[..full_len])
                                 .unwrap_or("<invalid>");
@@ -1594,7 +1597,7 @@ fn pack_dir_entry(
     block[off + 4..off + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
     block[off + 6] = name.len() as u8;
     block[off + 7] = match ft {
-        FileType::Regular => 1,
+        FileType::Regular | FileType::CharDevice | FileType::BlockDevice => 1,
         FileType::Directory => 2,
         FileType::Symlink => 7,
     };
@@ -1655,7 +1658,7 @@ fn try_insert_entry(
             result[new_off + 4..new_off + 6].copy_from_slice(&(new_rec as u16).to_le_bytes());
             result[new_off + 6] = name.len() as u8;
             result[new_off + 7] = match ft {
-                FileType::Regular => 1,
+                FileType::Regular | FileType::CharDevice | FileType::BlockDevice => 1,
                 FileType::Directory => 2,
                 FileType::Symlink => 7,
             };

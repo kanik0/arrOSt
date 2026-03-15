@@ -22,7 +22,7 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M20** | Signal Infrastructure | **Complete** |
 | **M21** | Full mmap / VMA Layer | **Complete** |
 | **M22** | execve Syscall | **Complete** |
-| **M23** | /dev Filesystem + Device Nodes | Not started |
+| **M23** | /dev Filesystem + Device Nodes | **Complete** |
 | **M24** | Shell Pipes + Process Groups | Not started |
 | **M25** | ANSI Terminal Emulation | **Complete** |
 | **M26** | Environment Variables + Inheritance | **Complete** |
@@ -284,39 +284,41 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 
 ### M23: /dev Filesystem + Device Nodes
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Mount `/dev` as a device filesystem with standard Unix device nodes.
 
 **Dependencies**: None (builds on existing VFS).
 
-#### Step 1: Create devfs
-**Files to create**: `kernel/src/fs/devfs.rs`
-**Files to modify**: `kernel/src/fs/mount.rs`, `kernel/src/fs/mod.rs`
+#### Delivered
 
-1. Implement a synthetic filesystem similar to `procfs`/`tmpfs`.
-2. Mount at `/dev` during `fs::init()`.
-3. Device nodes are inode entries with `FileType::CharDevice` or `FileType::BlockDevice` (add to `FileType` enum).
-4. Each device node has a `(major, minor)` pair stored in inode metadata.
-
-#### Step 2: Standard device entries
-1. `/dev/null` (major 1, minor 3): read returns EOF, write discards.
-2. `/dev/zero` (major 1, minor 5): read returns zero bytes, write discards.
-3. `/dev/random` (major 1, minor 8): read returns pseudo-random bytes (simple xorshift PRNG seeded from time).
-4. `/dev/console` (major 5, minor 1): maps to serial I/O.
-5. `/dev/tty` (major 5, minor 0): maps to current terminal.
-6. `/dev/vda` (major 254, minor 0): maps to virtio-blk device.
-
-#### Step 3: Read/write dispatch
-**Files to modify**: `kernel/src/fs/mod.rs` (VFS open/read/write)
-
-1. When `open()` resolves to a device node, create an `FdTarget::Device(major, minor)`.
-2. `fread`/`fwrite` on device fds dispatch to device-specific handlers via a global device table.
+- **`kernel/src/fs/devfs.rs`** — Synthetic `/dev` filesystem (new file):
+  - `DeviceKind` (Char, Block), `DeviceId` (major, minor, kind), `DevOpenFile` structs.
+  - `DevFs` with `stat_path`, `open_file`, `stat_open_file`, `readdir`, `read_device`, `write_device`.
+  - 6 static device nodes: `/dev/null` (1,3), `/dev/zero` (1,5), `/dev/random` (1,8), `/dev/console` (5,1), `/dev/tty` (5,0), `/dev/vda` (254,0).
+  - xorshift32 PRNG for `/dev/random`, seeded from monotonic timer at `fs::init()`.
+  - Device read/write behavior: null (read=EOF, write=discard), zero (read=zeros, write=discard), random (read=PRNG bytes, write=discard), console/tty (write→serial), vda (returns error for raw read/write).
+- **`kernel/src/fs/mount.rs`** — Added `MountKind::Dev` variant mounted at `/dev` (read-only mount).
+- **`kernel/src/fs/mod.rs`** — Full VFS integration:
+  - `FileType::CharDevice` and `FileType::BlockDevice` variants added to the `FileType` enum.
+  - `OpenFile::Dev(DevOpenFile)` and `OpenFile::DevDir` variants for fd-table storage.
+  - `ResolvedPath::Dev(CanonicalPath)` for mount-aware path resolution.
+  - All VFS operations (`stat_path`, `open_path`, `read_open_file`, `write_open_file`, `stat_open_file`, `readdir_open_file`, `list_dir`) dispatch to devfs for `/dev` paths.
+  - All mutating operations (`mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `write_path`, `truncate_path`) return `FsError::ReadOnly` for `/dev`.
+- **`kernel/src/fs/dentry.rs`** — Added `CachedResolution::Dev` variant.
+- **`crates/arrostd/src/lib.rs`** — Added `FILE_TYPE_BLOCK = 5` ABI constant.
+- **`kernel/src/proc/mod.rs`** — `file_type_to_abi` maps `CharDevice` → `FILE_TYPE_CHAR`, `BlockDevice` → `FILE_TYPE_BLOCK`.
+- **Smoke test**: `cargo xtask smoke-dev [--arch <x86_64|aarch64>]` — boots QEMU, verifies `ls /dev` lists all 6 device nodes, `stat /dev` shows directory, `stat /dev/null` shows chardev, `stat /dev/vda` shows blkdev.
 
 #### Testing
-1. `echo test > /dev/null` succeeds silently.
-2. `cat /dev/zero | head -c 16` returns 16 zero bytes.
-3. `cat /dev/random | head -c 8` returns 8 pseudo-random bytes.
-4. `ls /dev` lists all device nodes.
+```
+ls /dev                          # lists null zero random console tty vda
+stat /dev                        # type=dir mode=0o755
+stat /dev/null                   # type=chardev mode=0o666
+stat /dev/vda                    # type=blkdev mode=0o660
+cat /dev/zero                    # outputs zero bytes (Ctrl+C to stop)
+cargo xtask smoke-dev --arch x86_64
+cargo xtask smoke-dev --arch aarch64
+```
 
 ---
 

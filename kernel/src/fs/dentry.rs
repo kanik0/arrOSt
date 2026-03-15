@@ -6,6 +6,7 @@ pub const DENTRY_CACHE_SLOTS: usize = 32;
 pub enum CachedResolution {
     Inode { mount: MountKind, ino: InodeNum },
     Proc,
+    Dev,
 }
 
 #[derive(Clone, Copy)]

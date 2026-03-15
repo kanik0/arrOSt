@@ -107,7 +107,7 @@ impl Inode {
         let nlen = name.len().min(DIR_RECORD_NAME_MAX);
         self.data[base + 4] = nlen as u8;
         self.data[base + 5] = match ft {
-            FileType::Regular => 1,
+            FileType::Regular | FileType::CharDevice | FileType::BlockDevice => 1,
             FileType::Directory => 2,
             FileType::Symlink => 4,
         };
@@ -852,7 +852,10 @@ impl Vfs for RamFs {
             };
 
             match ft {
-                FileType::Regular | FileType::Symlink => {
+                FileType::Regular
+                | FileType::Symlink
+                | FileType::CharDevice
+                | FileType::BlockDevice => {
                     let mut entry = DirEntry::empty();
                     if let Ok(name_str) = core::str::from_utf8(&full_name[..full_len]) {
                         entry.set_name(name_str);

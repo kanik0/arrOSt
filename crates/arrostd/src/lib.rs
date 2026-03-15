@@ -178,6 +178,7 @@ pub mod syscall {
     pub const FILE_TYPE_DIRECTORY: u16 = 2;
     pub const FILE_TYPE_SYMLINK: u16 = 3;
     pub const FILE_TYPE_CHAR: u16 = 4;
+    pub const FILE_TYPE_BLOCK: u16 = 5;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

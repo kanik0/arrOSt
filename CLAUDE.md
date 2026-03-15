@@ -50,6 +50,8 @@ cargo xtask smoke-env --arch x86_64       # M26 env vars smoke
 cargo xtask smoke-env --arch aarch64
 cargo xtask smoke-signals --arch x86_64   # M20 signals smoke
 cargo xtask smoke-signals --arch aarch64
+cargo xtask smoke-dev --arch x86_64       # M23 /dev filesystem smoke
+cargo xtask smoke-dev --arch aarch64
 ```
 
 ### Environment Variables
@@ -98,6 +100,7 @@ kernel/                     Rust no_std kernel crate
       ramfs.rs              RAM filesystem (fallback root)
       tmpfs.rs              Volatile /tmp filesystem
       procfs.rs             Synthetic /proc filesystem
+      devfs.rs              Synthetic /dev filesystem (M23)
       fd.rs                 Per-process file descriptor table
       pipe.rs               Kernel pipe IPC (global table, 4 KiB circular buffers)
       dentry.rs             Dentry cache
@@ -198,6 +201,7 @@ Three scheduler tables coexist:
 
 ### Filesystem (Mount-aware VFS)
 - Root `/`: `diskfs-v2` (inode-based, journaled metadata) or `ramfs` fallback
+- `/dev`: synthetic devfs with device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`)
 - `/proc`: read-only synthetic procfs
 - `/tmp`: volatile tmpfs (0777)
 - Per-process fd tables (fd 0-2 = serial stdin/stdout/stderr)
@@ -281,6 +285,7 @@ Non saltare mai questi step, anche se sembra inutile.
 | M20 | Signal infrastructure | `sigaction`/`sigreturn` for ring-3; `pending_signals` bitmask; POSIX default actions; `SYS_KILL` ring-3 via `pending_signals`; fork inheritance; `arrostd::runtime::{sigaction,sigreturn,signal_signum}` |
 | M25 | ANSI terminal | `kernel/src/console/ansi.rs` CSI parser; per-cell 16-color rendering in GUI terminal; `ANSI_PALETTE`; `smoke-signals` + `smoke-env` harnesses |
 | M26 | Environment variables | Per-process env arrays (no heap); `SYS_GETENV=56`/`SYS_SETENV=57`/`SYS_UNSETENV=58`; shell `env`/`export`/`$VAR` expansion; GUI terminal env integration; ABI rev 6 |
+| M23 | /dev filesystem | Synthetic devfs mounted at `/dev`; 6 device nodes (`null`, `zero`, `random`, `console`, `tty`, `vda`); `FileType::CharDevice`/`BlockDevice`; xorshift32 PRNG; `smoke-dev` harness |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -288,7 +293,7 @@ Non saltare mai questi step, anche se sembra inutile.
 ### Planned
 | # | Milestone | Goal |
 |---|-----------|------|
-| M23 | /dev filesystem | Device nodes (`null`, `zero`, `random`, `console`, `tty`) |
+| M23 | /dev filesystem | **Complete** — see Completed table |
 | M24 | Shell pipes + groups | `cmd1 | cmd2` syntax, process groups, job control |
 | M27 | SMP / multi-core | AP bootstrap, per-CPU state, concurrent scheduling |
 | M28 | RTC + wall-clock | CMOS/PL031 RTC driver, `CLOCK_REALTIME`, `date` command |

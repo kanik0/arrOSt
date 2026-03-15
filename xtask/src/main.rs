@@ -79,7 +79,7 @@ const USER_BIN_DOOM_ELF_HINT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_HINT";
 const USER_BIN_DOOM_ELF_PRESENT_ENV: &str = "ARROST_USER_BIN_DOOM_ELF_PRESENT";
 const QEMU_SCRIPT_X86_64: &str = "scripts/qemu.sh";
 const QEMU_SCRIPT_AARCH64: &str = "scripts/qemu-aarch64.sh";
-const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-execve [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]|smoke-hal [--arch <x86_64|aarch64>]|smoke-env [--arch <x86_64|aarch64>]|smoke-signals [--arch <x86_64|aarch64>]>";
+const XTASK_USAGE: &str = "Usage: cargo xtask <build|abi-check [--arch <x86_64|aarch64>]...|run [--arch <x86_64|aarch64>]|smoke-doom [--arch <x86_64|aarch64>]|smoke-doom-long [--arch <x86_64|aarch64>]|smoke-doom-virtio [--arch <x86_64|aarch64>]|smoke-doom-fallback [--arch <x86_64|aarch64>]|smoke-proc-caps [--arch <x86_64|aarch64>]|smoke-proc-spawn [--arch <x86_64|aarch64>]|smoke-bin-exec [--arch <x86_64|aarch64>]|smoke-fork [--arch <x86_64|aarch64>]|smoke-execve [--arch <x86_64|aarch64>]|smoke-fs [--arch <x86_64|aarch64>]|smoke-ring3 [--arch <x86_64|aarch64>]|smoke-ring3-run [--arch <x86_64|aarch64>]|smoke-ring3-fault [--arch <aarch64>]|smoke-kpti-m11|smoke-net [--arch <x86_64|aarch64>]|smoke-hal [--arch <x86_64|aarch64>]|smoke-env [--arch <x86_64|aarch64>]|smoke-signals [--arch <x86_64|aarch64>]|smoke-dev [--arch <x86_64|aarch64>]>";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeArch {
@@ -134,6 +134,7 @@ enum TopLevelCommand {
     SmokeHal,
     SmokeEnv,
     SmokeSignals,
+    SmokeDev,
 }
 
 struct UserArtifact {
@@ -206,6 +207,7 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokeHal) => smoke_hal(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeEnv) => smoke_env(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeSignals) => smoke_signals(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeDev) => smoke_dev(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -241,6 +243,7 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-hal") => Ok(TopLevelCommand::SmokeHal),
         Some("smoke-env") => Ok(TopLevelCommand::SmokeEnv),
         Some("smoke-signals") => Ok(TopLevelCommand::SmokeSignals),
+        Some("smoke-dev") => Ok(TopLevelCommand::SmokeDev),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -3480,6 +3483,128 @@ fn smoke_env(arch_override: Option<String>) -> Result<()> {
             "SMOKE_TEST=m26ok",
             Duration::from_secs(5),
             "custom env var after export",
+        )?;
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    Ok(())
+}
+
+// ── M23: smoke-dev ──────────────────────────────────────────────────────────
+
+fn smoke_dev(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-dev";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // 1. List /dev and verify device nodes are present.
+        send_serial_command(stdin, "ls /dev\n")?;
+        thread::sleep(Duration::from_millis(500));
+        let ls_snapshot = snapshot_log(&log);
+        let ls_lines = lines_after_matching_until_prompt(&ls_snapshot, "ls /dev");
+        for expected_node in &["null", "zero", "random", "console", "tty", "vda"] {
+            if !ls_lines.iter().any(|line| line.contains(expected_node)) {
+                bail!("expected '{expected_node}' in ls /dev output, got {ls_lines:?}");
+            }
+        }
+
+        // 2. Stat /dev to verify it is a directory.
+        send_serial_command(stdin, "stat /dev\n")?;
+        wait_for_log(
+            &log,
+            "type=dir",
+            Duration::from_secs(5),
+            "stat /dev shows directory",
+        )?;
+
+        // 3. Stat /dev/null shows char device.
+        send_serial_command(stdin, "stat /dev/null\n")?;
+        wait_for_log(
+            &log,
+            "type=chardev",
+            Duration::from_secs(5),
+            "stat /dev/null shows chardev",
+        )?;
+
+        // 4. Stat /dev/zero shows char device.
+        send_serial_command(stdin, "stat /dev/zero\n")?;
+        wait_for_log(
+            &log,
+            "type=chardev",
+            Duration::from_secs(5),
+            "stat /dev/zero shows chardev",
+        )?;
+
+        // 5. Stat /dev/vda shows block device.
+        send_serial_command(stdin, "stat /dev/vda\n")?;
+        wait_for_log(
+            &log,
+            "type=blkdev",
+            Duration::from_secs(5),
+            "stat /dev/vda shows blkdev",
         )?;
 
         Ok(())

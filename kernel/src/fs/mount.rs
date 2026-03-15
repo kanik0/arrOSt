@@ -8,6 +8,7 @@ pub enum MountKind {
     Root,
     Proc,
     Tmp,
+    Dev,
 }
 
 impl MountKind {
@@ -16,13 +17,14 @@ impl MountKind {
             Self::Root => "/",
             Self::Proc => "/proc",
             Self::Tmp => "/tmp",
+            Self::Dev => "/dev",
         }
     }
 
     pub const fn writable(self) -> bool {
         match self {
             Self::Root | Self::Tmp => true,
-            Self::Proc => false,
+            Self::Proc | Self::Dev => false,
         }
     }
 }
@@ -33,7 +35,7 @@ pub struct MountInfo {
     pub path: &'static str,
 }
 
-pub const MOUNTS: [MountInfo; 3] = [
+pub const MOUNTS: [MountInfo; 4] = [
     MountInfo {
         kind: MountKind::Root,
         path: "/",
@@ -45,6 +47,10 @@ pub const MOUNTS: [MountInfo; 3] = [
     MountInfo {
         kind: MountKind::Tmp,
         path: "/tmp",
+    },
+    MountInfo {
+        kind: MountKind::Dev,
+        path: "/dev",
     },
 ];
 
@@ -145,6 +151,8 @@ pub fn resolve_mount(path: &CanonicalPath) -> ResolvedMountPath {
     let canonical = path.as_str();
     let kind = if matches_mount(canonical, MountKind::Proc.path()) {
         MountKind::Proc
+    } else if matches_mount(canonical, MountKind::Dev.path()) {
+        MountKind::Dev
     } else if matches_mount(canonical, MountKind::Tmp.path()) {
         MountKind::Tmp
     } else {

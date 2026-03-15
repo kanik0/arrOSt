@@ -5,6 +5,7 @@
 
 mod bitmap;
 mod dentry;
+mod devfs;
 mod diskfs_v1;
 mod diskfs_v2;
 mod fd;
@@ -31,6 +32,7 @@ use core::fmt::Write;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
 use dentry::{CachedResolution, DentryCache};
+use devfs::{DevFs, DevOpenFile};
 use diskfs_v1::DiskFs as DiskFsV1;
 use diskfs_v2::DiskFsV2;
 pub(crate) use fd::FdTarget;
@@ -122,6 +124,8 @@ pub enum FileType {
     Regular,
     Directory,
     Symlink,
+    CharDevice,
+    BlockDevice,
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +154,8 @@ pub(crate) enum OpenFile {
         path_len: usize,
         current_pid: Option<u32>,
     },
+    Dev(DevOpenFile),
+    DevDir,
 }
 
 #[derive(Clone, Copy)]
@@ -348,6 +354,7 @@ struct FsState {
     diskfs_v2: DiskFsV2,
     procfs: ProcFs,
     tmpfs: TmpFs,
+    devfs: DevFs,
     dentry_cache: UnsafeCell<DentryCache>,
 }
 
@@ -361,6 +368,7 @@ impl FsState {
             diskfs_v2: DiskFsV2::new(),
             procfs: ProcFs::new(),
             tmpfs: TmpFs::new(),
+            devfs: DevFs::new(),
             dentry_cache: UnsafeCell::new(DentryCache::new()),
         }
     }
@@ -481,6 +489,7 @@ impl FsState {
                 MountKind::Root => self.root_backend_name(),
                 MountKind::Proc => "procfs",
                 MountKind::Tmp => "tmpfs",
+                MountKind::Dev => "devfs",
             };
             let mode = if mount.kind.writable() { "rw" } else { "ro" };
             serial::write_fmt(format_args!(
@@ -930,7 +939,7 @@ impl FsState {
                 FsBackend::DiskFsV2 => self.diskfs_v2.stat(node.ino),
             },
             MountKind::Tmp => self.tmpfs.stat(node.ino),
-            MountKind::Proc => Err(FsError::InvalidPath),
+            MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
         }
     }
 
@@ -941,7 +950,7 @@ impl FsState {
                 FsBackend::DiskFsV2 => self.diskfs_v2.touch_accessed(node.ino),
             },
             MountKind::Tmp => self.tmpfs.touch_accessed(node.ino),
-            MountKind::Proc => Err(FsError::InvalidPath),
+            MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
         }
     }
 
@@ -952,7 +961,7 @@ impl FsState {
                 FsBackend::DiskFsV2 => self.diskfs_v2.chmod(node.ino, mode),
             },
             MountKind::Tmp => self.tmpfs.chmod(node.ino, mode),
-            MountKind::Proc => Err(FsError::InvalidPath),
+            MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
         }
     }
 
@@ -973,6 +982,7 @@ impl FsState {
                     ResolvedPath::Inode(ResolvedInode { mount, ino })
                 }
                 CachedResolution::Proc => ResolvedPath::Proc(canonical),
+                CachedResolution::Dev => ResolvedPath::Dev(canonical),
             });
         }
 
@@ -997,6 +1007,7 @@ impl FsState {
                 ),
             },
             MountKind::Proc => Ok(ResolvedPath::Proc(canonical)),
+            MountKind::Dev => Ok(ResolvedPath::Dev(canonical)),
             MountKind::Tmp => resolve_backend_mount_path(
                 self,
                 &self.tmpfs,
@@ -1013,6 +1024,7 @@ impl FsState {
                 ino: node.ino,
             },
             ResolvedPath::Proc(_) => CachedResolution::Proc,
+            ResolvedPath::Dev(_) => CachedResolution::Dev,
         };
         self.with_dentry_cache_mut(|cache| {
             cache.insert(canonical.as_str(), follow_final, cached);
@@ -1032,12 +1044,15 @@ impl FsState {
                 let resolved = resolve_mount(&canonical);
                 let local_path = resolved.local_path();
                 let ctx = self.procfs_context(current_pid);
-                // Attempt to open as a file; if the path is a directory, fall back to stat_path.
                 match self.procfs.open_file(local_path, ctx) {
                     Ok(file) => self.proc_generated_stat(file),
                     Err(FsError::IsADirectory) => self.procfs.stat_path(local_path, ctx),
                     Err(e) => Err(e),
                 }
+            }
+            ResolvedPath::Dev(canonical) => {
+                let resolved = resolve_mount(&canonical);
+                self.devfs.stat_path(resolved.local_path())
             }
         }
     }
@@ -1053,19 +1068,29 @@ impl FsState {
             ResolvedPath::Inode(node) => {
                 let stat = self.inode_stat(node)?;
                 require_inode_permission(identity, &stat, 0o4)?;
-                match node.mount {
+                let mut count = match node.mount {
                     MountKind::Root => match self.backend {
                         FsBackend::RamFs => list_inode_dir(&self.ramfs, node.ino, out),
                         FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, node.ino, out),
                     },
                     MountKind::Tmp => list_inode_dir(&self.tmpfs, node.ino, out),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
+                }?;
+                // Inject synthetic entries for non-root mount points when
+                // listing the root directory (they have no real inodes).
+                if node.mount == MountKind::Root && node.ino == ROOT_INO {
+                    count = inject_mount_point_entries(out, count);
                 }
+                Ok(count)
             }
             ResolvedPath::Proc(canonical) => {
                 let resolved = resolve_mount(&canonical);
                 self.procfs
                     .readdir(resolved.local_path(), self.procfs_context(current_pid), out)
+            }
+            ResolvedPath::Dev(canonical) => {
+                let resolved = resolve_mount(&canonical);
+                self.devfs.readdir(resolved.local_path(), out)
             }
         }
     }
@@ -1087,7 +1112,7 @@ impl FsState {
                         FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, node.ino, 0, out),
                     },
                     MountKind::Tmp => read_inode_file(&self.tmpfs, node.ino, 0, out),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }?;
                 self.inode_touch_accessed(node)?;
                 Ok(read)
@@ -1098,6 +1123,11 @@ impl FsState {
                     .procfs
                     .open_file(resolved.local_path(), self.procfs_context(current_pid))?;
                 self.proc_generated_read(file, 0, out)
+            }
+            ResolvedPath::Dev(canonical) => {
+                let resolved = resolve_mount(&canonical);
+                let file = self.devfs.open_file(resolved.local_path())?;
+                DevFs::read_device(file, 0, out)
             }
         }
     }
@@ -1121,10 +1151,10 @@ impl FsState {
                         FsBackend::DiskFsV2 => self.diskfs_v2.unlink(node.ino, name.as_bytes()),
                     },
                     MountKind::Tmp => self.tmpfs.unlink(node.ino, name.as_bytes()),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1142,7 +1172,7 @@ impl FsState {
         let identity = proc::fs_identity(current_pid);
         let source = match self.resolve_path(source, false)? {
             ResolvedPath::Inode(node) => node,
-            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => return Err(FsError::ReadOnly),
         };
         let source_stat = self.inode_stat(source)?;
         if source_stat.file_type == FileType::Directory {
@@ -1168,10 +1198,10 @@ impl FsState {
                         }
                     },
                     MountKind::Tmp => self.tmpfs.link(parent.ino, name.as_bytes(), source.ino),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1226,10 +1256,10 @@ impl FsState {
                         .tmpfs
                         .symlink(parent.ino, name.as_bytes(), target.as_bytes())
                         .map(|_| ()),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1263,10 +1293,10 @@ impl FsState {
                         .tmpfs
                         .mkdir(parent.ino, name.as_bytes(), mode)
                         .map(|_| ()),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1288,7 +1318,7 @@ impl FsState {
                 require_owner(identity, &stat)?;
                 self.inode_chmod(node, mode)
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         }
     }
 
@@ -1310,11 +1340,11 @@ impl FsState {
 
         let old_parent = match self.resolve_path(old_parent_path, true)? {
             ResolvedPath::Inode(node) => node,
-            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => return Err(FsError::ReadOnly),
         };
         let new_parent = match self.resolve_path(new_parent_path, true)? {
             ResolvedPath::Inode(node) => node,
-            ResolvedPath::Proc(_) => return Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => return Err(FsError::ReadOnly),
         };
         if old_parent.mount != new_parent.mount {
             return Err(FsError::InvalidPath);
@@ -1346,7 +1376,7 @@ impl FsState {
                 new_parent.ino,
                 new_name.as_bytes(),
             ),
-            MountKind::Proc => Err(FsError::InvalidPath),
+            MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1396,7 +1426,7 @@ impl FsState {
                             FsBackend::DiskFsV2 => self.diskfs_v2.truncate(node.ino, 0)?,
                         },
                         MountKind::Tmp => self.tmpfs.truncate(node.ino, 0)?,
-                        MountKind::Proc => return Err(FsError::InvalidPath),
+                        MountKind::Proc | MountKind::Dev => return Err(FsError::InvalidPath),
                     }
                 }
                 Ok(OpenFile::File {
@@ -1428,6 +1458,20 @@ impl FsState {
                     Err(error) => Err(error),
                 }
             }
+            Ok(ResolvedPath::Dev(canonical)) => {
+                let resolved = resolve_mount(&canonical);
+                let local_path = resolved.local_path();
+                match self.devfs.open_file(local_path) {
+                    Ok(file) => Ok(OpenFile::Dev(file)),
+                    Err(FsError::IsADirectory) => {
+                        if access != O_RDONLY {
+                            return Err(FsError::IsADirectory);
+                        }
+                        Ok(OpenFile::DevDir)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             Err(FsError::NotFound) if (flags & O_CREAT) != 0 => {
                 let canonical = canonicalize(path)?;
                 let (parent_path, name) = split_parent_path(canonical.as_str())?;
@@ -1447,7 +1491,7 @@ impl FsState {
                             MountKind::Tmp => {
                                 self.tmpfs.create(parent.ino, name.as_bytes(), 0o644)?
                             }
-                            MountKind::Proc => return Err(FsError::InvalidPath),
+                            MountKind::Proc | MountKind::Dev => return Err(FsError::InvalidPath),
                         };
                         self.invalidate_dentry_cache();
                         trace_dentry_invalidate("create");
@@ -1456,7 +1500,7 @@ impl FsState {
                             ino,
                         })
                     }
-                    ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+                    ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
                 }
             }
             Err(error) => Err(error),
@@ -1477,13 +1521,15 @@ impl FsState {
                         FsBackend::DiskFsV2 => read_inode_file(&self.diskfs_v2, ino, offset, out),
                     },
                     MountKind::Tmp => read_inode_file(&self.tmpfs, ino, offset, out),
-                    MountKind::Proc => Err(FsError::InvalidPath),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
                 }?;
                 self.inode_touch_accessed(ResolvedInode { mount, ino })?;
                 Ok(read)
             }
             OpenFile::Proc(file) => self.proc_generated_read(file, offset, out),
             OpenFile::ProcDir { .. } => Err(FsError::IsADirectory),
+            OpenFile::Dev(file) => DevFs::read_device(file, offset, out),
+            OpenFile::DevDir => Err(FsError::IsADirectory),
         }
     }
 
@@ -1500,10 +1546,15 @@ impl FsState {
                     FsBackend::DiskFsV2 => write_inode_file(&mut self.diskfs_v2, ino, offset, data),
                 },
                 MountKind::Tmp => write_inode_file(&mut self.tmpfs, ino, offset, data),
-                MountKind::Proc => Err(FsError::ReadOnly),
+                MountKind::Proc | MountKind::Dev => Err(FsError::ReadOnly),
             },
             OpenFile::Proc(_) => Err(FsError::ReadOnly),
             OpenFile::ProcDir { .. } => Err(FsError::ReadOnly),
+            OpenFile::Dev(file) => {
+                let _ = offset;
+                DevFs::write_device(file, data)
+            }
+            OpenFile::DevDir => Err(FsError::ReadOnly),
         }
     }
 
@@ -1515,7 +1566,7 @@ impl FsState {
                     FsBackend::DiskFsV2 => self.diskfs_v2.stat(ino),
                 },
                 MountKind::Tmp => self.tmpfs.stat(ino),
-                MountKind::Proc => Err(FsError::InvalidPath),
+                MountKind::Proc | MountKind::Dev => Err(FsError::InvalidPath),
             },
             OpenFile::Proc(file) => self.proc_generated_stat(file),
             OpenFile::ProcDir {
@@ -1526,6 +1577,8 @@ impl FsState {
                 proc_dir_path(&path, path_len),
                 self.procfs_context(current_pid),
             ),
+            OpenFile::Dev(file) => self.devfs.stat_open_file(file),
+            OpenFile::DevDir => self.devfs.stat_path(""),
         }
     }
 
@@ -1544,14 +1597,18 @@ impl FsState {
                 let identity = proc::fs_identity(current_pid);
                 require_inode_permission(identity, &stat, 0o4)?;
                 // list_inode_dir verifies the inode is a directory.
-                match mount {
+                let mut count = match mount {
                     MountKind::Root => match self.backend {
                         FsBackend::RamFs => list_inode_dir(&self.ramfs, ino, out),
                         FsBackend::DiskFsV2 => list_inode_dir(&self.diskfs_v2, ino, out),
                     },
                     MountKind::Tmp => list_inode_dir(&self.tmpfs, ino, out),
-                    MountKind::Proc => Err(FsError::NotADirectory),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::NotADirectory),
+                }?;
+                if mount == MountKind::Root && ino == ROOT_INO {
+                    count = inject_mount_point_entries(out, count);
                 }
+                Ok(count)
             }
             OpenFile::Proc(_) => Err(FsError::NotADirectory),
             OpenFile::ProcDir {
@@ -1563,6 +1620,8 @@ impl FsState {
                 self.procfs_context(current_pid),
                 out,
             ),
+            OpenFile::Dev(_) => Err(FsError::NotADirectory),
+            OpenFile::DevDir => self.devfs.readdir("", out),
         }
     }
 
@@ -1708,10 +1767,10 @@ impl FsState {
                         FsBackend::DiskFsV2 => self.diskfs_v2.rmdir(node.ino, name.as_bytes()),
                     },
                     MountKind::Tmp => self.tmpfs.rmdir(node.ino, name.as_bytes()),
-                    MountKind::Proc => Err(FsError::ReadOnly),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::ReadOnly),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         };
         if result.is_ok() {
             self.invalidate_dentry_cache();
@@ -1741,10 +1800,10 @@ impl FsState {
                         FsBackend::DiskFsV2 => self.diskfs_v2.readlink(node.ino, buf),
                     },
                     MountKind::Tmp => self.tmpfs.readlink(node.ino, buf),
-                    MountKind::Proc => Err(FsError::ReadOnly),
+                    MountKind::Proc | MountKind::Dev => Err(FsError::ReadOnly),
                 }
             }
-            ResolvedPath::Proc(_) => Err(FsError::ReadOnly),
+            ResolvedPath::Proc(_) | ResolvedPath::Dev(_) => Err(FsError::ReadOnly),
         }
     }
 }
@@ -1802,6 +1861,7 @@ pub(crate) fn net_tcp_listener_close(idx: u8) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn init() -> FsInitReport {
+    devfs::seed_random(crate::time::ticks());
     with_fs_mut(|state| state.init())
 }
 
@@ -2248,6 +2308,7 @@ struct ResolvedInode {
 enum ResolvedPath {
     Inode(ResolvedInode),
     Proc(CanonicalPath),
+    Dev(CanonicalPath),
 }
 
 fn split_parent_path(path: &str) -> Result<(&str, &str), FsError> {
@@ -2348,6 +2409,32 @@ fn list_inode_dir(
         }
     }
     Ok(written)
+}
+
+/// Inject synthetic directory entries for non-root mount points (/dev, /proc, /tmp)
+/// into the root directory listing so they appear in `ls /`.
+fn inject_mount_point_entries(out: &mut [VfsDirEntry], mut count: usize) -> usize {
+    const MOUNT_NAMES: [&str; 3] = ["dev", "proc", "tmp"];
+    for name in &MOUNT_NAMES {
+        if count >= out.len() {
+            break;
+        }
+        // Skip if already present (e.g. a real directory exists).
+        let already = out[..count].iter().any(|e| e.name_str() == *name);
+        if already {
+            continue;
+        }
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len().min(MAX_VNAME_LEN);
+        let mut entry = VfsDirEntry::empty();
+        entry.ino = 0; // synthetic
+        entry.file_type = FileType::Directory;
+        entry.name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+        entry.name_len = name_len as u8;
+        out[count] = entry;
+        count += 1;
+    }
+    count
 }
 
 fn resolve_backend_mount_path(
@@ -2456,6 +2543,8 @@ fn file_type_name(file_type: FileType) -> &'static str {
         FileType::Regular => "file",
         FileType::Directory => "dir",
         FileType::Symlink => "symlink",
+        FileType::CharDevice => "chardev",
+        FileType::BlockDevice => "blkdev",
     }
 }
 
@@ -2473,6 +2562,9 @@ fn trace_dentry_hit(path: &str, cached: CachedResolution) {
         )),
         CachedResolution::Proc => {
             serial::write_fmt(format_args!("dentry: hit path={} mount=/proc\n", path))
+        }
+        CachedResolution::Dev => {
+            serial::write_fmt(format_args!("dentry: hit path={} mount=/dev\n", path))
         }
     }
 }
