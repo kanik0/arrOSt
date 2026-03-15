@@ -2,7 +2,7 @@
 
 // crates/arrostd/src/lib.rs: shared no_std helpers for ArrOSt crates.
 pub mod abi {
-    pub const USERLAND_ABI_REVISION: u16 = 5;
+    pub const USERLAND_ABI_REVISION: u16 = 7;
     pub const USERLAND_INIT_APP: &str = "init";
     pub const USERLAND_DOOM_APP: &str = "doom";
     pub const USERLAND_PATH_MAX: usize = 160;
@@ -13,7 +13,7 @@ pub mod abi {
 }
 
 pub mod syscall {
-    pub const ABI_REVISION: u16 = 5;
+    pub const ABI_REVISION: u16 = 7;
 
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_READ: u64 = 2;
@@ -89,6 +89,20 @@ pub mod syscall {
     pub const SYS_SETPGID: u64 = 59;
     /// M24: get process group ID.
     pub const SYS_GETPGID: u64 = 60;
+    /// M28: get wall-clock or monotonic time.
+    pub const SYS_CLOCK_GETTIME: u64 = 61;
+
+    /// Clock IDs for `SYS_CLOCK_GETTIME`.
+    pub const CLOCK_REALTIME: u64 = 0;
+    pub const CLOCK_MONOTONIC: u64 = 1;
+
+    /// Timespec struct returned by `SYS_CLOCK_GETTIME`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct Timespec {
+        pub tv_sec: u64,
+        pub tv_nsec: u64,
+    }
 
     /// `SYS_DOOM_LAUNCH` subcommand codes.
     pub const DOOM_CMD_PLAY: u64 = 0;
@@ -344,6 +358,7 @@ pub mod syscall {
             SYS_PIPE2 => "pipe2",
             SYS_SETPGID => "setpgid",
             SYS_GETPGID => "getpgid",
+            SYS_CLOCK_GETTIME => "clock_gettime",
             _ => "unknown",
         }
     }
@@ -493,12 +508,12 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_DOOM_LAUNCH, SYS_DUP2, SYS_EXECVE,
-        SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV,
-        SYS_GETGID, SYS_GETPGID, SYS_GETPPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP,
-        SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME,
-        SYS_RMDIR, SYS_SEEK, SYS_SETENV, SYS_SETPGID, SYS_SIGACTION, SYS_SIGRETURN, SYS_SYMLINK,
-        SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DOOM_LAUNCH,
+        SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD,
+        SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPGID, SYS_GETPPID, SYS_GETUID, SYS_KILL,
+        SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2,
+        SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SETENV, SYS_SETPGID, SYS_SIGACTION,
+        SYS_SIGRETURN, SYS_SYMLINK, SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -1161,6 +1176,18 @@ pub mod runtime {
         syscall1(SYS_GETPGID, pid as u64)
     }
 
+    // ── M28: Clock ──────────────────────────────────────────────────────────────
+
+    /// Read clock `clock_id` into `ts`. Returns 0 on success or negative errno.
+    /// `CLOCK_REALTIME` (0) = wall-clock from RTC; `CLOCK_MONOTONIC` (1) = uptime.
+    pub fn clock_gettime(clock_id: u64, ts: &mut crate::syscall::Timespec) -> isize {
+        syscall2(
+            SYS_CLOCK_GETTIME,
+            clock_id,
+            ts as *mut crate::syscall::Timespec as u64,
+        )
+    }
+
     /// Duplicate file descriptor `src_fd` to `dst_fd`, closing `dst_fd` first if open.
     pub fn dup2(src_fd: u32, dst_fd: u32) -> isize {
         syscall2(SYS_DUP2, src_fd as u64, dst_fd as u64)
@@ -1287,7 +1314,7 @@ mod tests {
 
     #[test]
     fn syscall_numbering_matches_golden_contract() {
-        assert_eq!(syscall::ABI_REVISION, 5);
+        assert_eq!(syscall::ABI_REVISION, 7);
         assert_eq!(
             [
                 syscall::SYS_WRITE,

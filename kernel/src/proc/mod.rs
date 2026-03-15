@@ -1981,6 +1981,8 @@ impl Scheduler {
             // M24: process groups
             arrostd::syscall::SYS_SETPGID => self.syscall_setpgid_ring3(arg0 as u32, arg1 as u32),
             arrostd::syscall::SYS_GETPGID => self.syscall_getpgid_ring3(arg0 as u32),
+            // M28: clock_gettime
+            arrostd::syscall::SYS_CLOCK_GETTIME => self.syscall_clock_gettime_ring3(arg0, arg1),
             // M13: real mmap / brk; munmap / mprotect remain ENOSYS
             SYS_MMAP => {
                 // arg0=addr (hint), arg1=len, arg2=prot, arg3=flags
@@ -2595,6 +2597,33 @@ impl Scheduler {
             }
         }
         errno::ESRCH
+    }
+
+    /// SYS_CLOCK_GETTIME: write Timespec to user buffer.
+    fn syscall_clock_gettime_ring3(&mut self, clock_id: u64, ts_ptr: u64) -> isize {
+        use arrostd::syscall::{CLOCK_MONOTONIC, CLOCK_REALTIME, Timespec};
+
+        let ts = match clock_id {
+            CLOCK_REALTIME => {
+                let secs = crate::rtc::unix_epoch_secs();
+                Timespec {
+                    tv_sec: secs,
+                    tv_nsec: 0,
+                }
+            }
+            CLOCK_MONOTONIC => {
+                let ms = crate::time::uptime_millis();
+                Timespec {
+                    tv_sec: ms / 1000,
+                    tv_nsec: (ms % 1000) * 1_000_000,
+                }
+            }
+            _ => return errno::EINVAL,
+        };
+        if let Err(e) = self.ring3_copy_to_user(ts_ptr, &ts) {
+            return e;
+        }
+        0
     }
 
     /// SYS_FORK: create a child process with CoW-shared address space.
@@ -6673,7 +6702,7 @@ fn syscall_required_caps(number: u64) -> u32 {
         | SYS_UNSETENV
         | arrostd::syscall::SYS_SETPGID
         | arrostd::syscall::SYS_GETPGID => caps::CORE,
-        SYS_TIME_MS => caps::TIME,
+        SYS_TIME_MS | arrostd::syscall::SYS_CLOCK_GETTIME => caps::TIME,
         SYS_SOCKET | SYS_SENDTO | SYS_RECVFROM | SYS_CONNECT | SYS_SEND | SYS_RECV | SYS_BIND
         | SYS_LISTEN | SYS_ACCEPT | SYS_PING => caps::NET,
         _ => 0,

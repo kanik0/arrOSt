@@ -22,6 +22,7 @@ mod mouse;
 mod net;
 mod percpu;
 mod proc;
+mod rtc;
 mod serial;
 mod shell;
 mod storage;
@@ -398,6 +399,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         fs_report.max_file_bytes
     ));
 
+    rtc::init();
+
     let hal_report = hal::init(&gfx_report);
     serial::write_fmt(format_args!(
         "HAL: block={} net={} display={} audio={} input={}\n",
@@ -745,6 +748,8 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         fs_report.max_files,
         fs_report.max_file_bytes
     ));
+
+    rtc::init();
 
     let hal_report = hal::init(&gfx_report);
     serial::write_fmt(format_args!(

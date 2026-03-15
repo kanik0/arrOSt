@@ -22,7 +22,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 - Mount-aware inode-based VFS with persistent `diskfs-v2`, `ramfs` fallback, `procfs`, and `tmpfs`.
 - Full-data journaling: `MetadataOnly`, `Ordered` (default), and `Full` modes with on-disk persistence and runtime shell control.
 - `fork` + CoW + demand paging: `SYS_FORK` clones ring-3 processes with CoW-shared address spaces; write faults trigger per-page copy; anonymous VMAs via `mmap`/`brk` are demand-paged on first access.
-- Syscall ABI revision `5` with 52+ syscalls, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, `fork`, `mmap` (anonymous), and `brk`.
+- Syscall ABI revision `7` with 53+ syscalls, including filesystem syscalls, per-process fd tables, BSD TCP socket syscalls, extended POSIX-like directory and process-identity ops, pipe IPC, `fork`, `mmap` (anonymous), and `brk`.
 - VFS-backed `/bin/*` command dispatch: shell and GUI terminal auto-execute ring-3 ELF binaries from the mounted filesystem.
 - Extended `/proc` with global system files, per-PID directories, and `/proc/net/` subsystem.
 - TCP/IP networking with state machine (SYN_SENT through LAST_ACK), BSD socket syscalls, and kernel-side Unix network utilities.
@@ -59,7 +59,7 @@ The project favors observable behavior, serial-first diagnostics, reproducible s
 
 - Root filesystem mounts `diskfs-v2` when persistent storage is ready, otherwise falls back to `ramfs`.
 - Synthetic mounts:
-  - `/proc` -> read-only `procfs` (dynamic per-PID dirs, `net/`, `cpuinfo`, `meminfo`, `version`)
+  - `/proc` -> read-only `procfs` (dynamic per-PID dirs, `net/`, `cpuinfo`, `meminfo`, `version`, `datetime`)
   - `/tmp` -> volatile `tmpfs` with world-writable root (`0777`)
 - `diskfs-v2` provides:
   - inode-based hierarchical directories
@@ -85,6 +85,7 @@ Representative commands:
 - `link <src> <dst>`, `symlink <target> <linkpath>`
 - `stat <path>`, `chmod <mode> <path>`
 - `sync`, `reload`, `journal`, `journal mode <metadata|ordered|full>`
+- `date`, `cat /proc/datetime`
 - `cat /proc/self/pid`, `cat /proc/mounts`, `cat /proc/uptime`
 
 ### Processes and syscalls
@@ -100,9 +101,9 @@ Representative commands:
 - `fork` (M13, complete): `SYS_FORK` clones the active ring-3 process with CoW-shared address space; write faults copy pages on demand; anonymous VMAs (`mmap`/`brk`) are demand-paged.
 - User-mode CPU faults transition the active ring-3 task to `faulted` and resume the kernel instead of taking down the whole system.
 - Capability masks gate syscall families (`CORE`, `NET`, `PROC`, `TIME`).
-- ABI revision is `5`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
+- ABI revision is `7`. Shell prompt is context-aware and starts in `/home/user`: `user@arrost /path> ` in both serial and GUI terminals.
 
-Current syscall surface (52 syscalls):
+Current syscall surface (53 syscalls):
 
 - lifecycle: `exit`, `yield`, `sleep`, `getpid`, `time_ms`, `spawn`, `waitpid`, `fork`
 - capabilities: `cap_get`, `cap_drop`
@@ -111,6 +112,7 @@ Current syscall surface (52 syscalls):
 - directory/path: `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`, `readlink`, `getcwd`, `chdir`, `getdents`
 - process identity: `getppid`, `getuid`, `getgid`, `kill`
 - ipc: `pipe`, `pipe2`
+- clock: `clock_gettime`
 - stubs (return `ENOSYS`): `sigaction`, `sigreturn`
 
 Useful runtime commands:
@@ -144,7 +146,6 @@ Useful runtime commands:
 - ANSI/VT100 CSI escape sequences (M25) are parsed and rendered in the GUI terminal with per-cell 16-color output. Serial pass-through and bold/underline rendering are deferred.
 - Environment variables (M26): per-process env arrays with `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `env`/`export`/`$VAR` expansion. `envp` passed to `execve` is deferred.
 - SMP Phase A (M27): APs boot and idle; ring-3 scheduling on APs is deferred to Phase B.
-- No real-time clock or wall-clock timestamps.
 - No block/buffer cache; all disk I/O is synchronous and uncached.
 - `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
@@ -174,7 +175,7 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M25 | ANSI terminal emulation | Complete |
 | M26 | Environment variables | Complete |
 | M27 | SMP / multi-core | Phase A complete |
-| M28 | RTC + wall-clock time | Planned |
+| M28 | RTC + wall-clock time | Complete |
 | M29 | Block cache | Planned |
 | M30 | Multi-user + login | Planned |
 | M31 | Doom enhancements | Planned |
