@@ -45,7 +45,7 @@ use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 23] = [
+pub const BIN_EXEC_PATHS: [&str; 21] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -67,8 +67,6 @@ pub const BIN_EXEC_PATHS: [&str; 23] = [
     "/bin/traceroute",
     "/bin/host",
     "/bin/dig",
-    "/bin/whoami",
-    "/bin/id",
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
@@ -1758,7 +1756,12 @@ impl FsState {
     /// M30: seed /etc/passwd and /etc/group at boot.
     fn ensure_etc_users(&mut self) {
         match self.mkdir_path("/etc", 0o755, None) {
-            Ok(()) | Err(FsError::AlreadyExists) => {}
+            Ok(()) => {
+                serial::write_line("FS: /etc created");
+            }
+            Err(FsError::AlreadyExists) => {
+                serial::write_line("FS: /etc already exists");
+            }
             Err(err) => {
                 serial::write_fmt(format_args!(
                     "FS: seed /etc mkdir failed ({})\n",
@@ -1770,22 +1773,32 @@ impl FsState {
         // /etc/passwd: root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n
         let passwd = b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n";
         if self.stat_path("/etc/passwd", None).is_err() {
-            if let Err(err) = self.seed_file_with_mode("/etc/passwd", passwd, 0o644) {
-                serial::write_fmt(format_args!(
-                    "FS: seed /etc/passwd failed ({})\n",
-                    err.as_str()
-                ));
+            match self.seed_file_with_mode("/etc/passwd", passwd, 0o644) {
+                Ok(()) => serial::write_line("FS: /etc/passwd seeded"),
+                Err(err) => {
+                    serial::write_fmt(format_args!(
+                        "FS: seed /etc/passwd failed ({})\n",
+                        err.as_str()
+                    ));
+                }
             }
+        } else {
+            serial::write_line("FS: /etc/passwd already exists");
         }
         // /etc/group: root:x:0:\nuser:x:1000:\n
         let group = b"root:x:0:\nuser:x:1000:\n";
         if self.stat_path("/etc/group", None).is_err() {
-            if let Err(err) = self.seed_file_with_mode("/etc/group", group, 0o644) {
-                serial::write_fmt(format_args!(
-                    "FS: seed /etc/group failed ({})\n",
-                    err.as_str()
-                ));
+            match self.seed_file_with_mode("/etc/group", group, 0o644) {
+                Ok(()) => serial::write_line("FS: /etc/group seeded"),
+                Err(err) => {
+                    serial::write_fmt(format_args!(
+                        "FS: seed /etc/group failed ({})\n",
+                        err.as_str()
+                    ));
+                }
             }
+        } else {
+            serial::write_line("FS: /etc/group already exists");
         }
         // /root home directory.
         match self.mkdir_path("/root", 0o700, None) {
