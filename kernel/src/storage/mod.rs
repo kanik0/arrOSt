@@ -1,4 +1,5 @@
 // kernel/src/storage/mod.rs: M6 virtio-blk (legacy PCI) storage backend for QEMU.
+pub mod cache;
 use crate::arch::port;
 use crate::mem;
 use crate::serial;
@@ -508,11 +509,26 @@ pub fn status() -> StorageInitReport {
     with_storage(|state| state.report())
 }
 
+/// Read a sector through the block cache (M29). Falls back to raw I/O before cache init.
 pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> Result<(), StorageError> {
+    cache::cached_read(sector, out)
+}
+
+/// Write a sector through the block cache (M29). Falls back to raw I/O before cache init.
+pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
+    cache::cached_write(sector, data)
+}
+
+/// Raw (uncached) sector read — used by the cache layer itself.
+pub(crate) fn read_sector_raw(
+    sector: u64,
+    out: &mut [u8; SECTOR_SIZE],
+) -> Result<(), StorageError> {
     with_storage_mut(|state| state.read_sector(sector, out))
 }
 
-pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
+/// Raw (uncached) sector write — used by the cache layer itself.
+pub(crate) fn write_sector_raw(sector: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
     with_storage_mut(|state| state.write_sector(sector, data))
 }
 

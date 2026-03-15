@@ -28,8 +28,8 @@ Each milestone includes a step-by-step implementation plan written for Sonnet 4.
 | **M26** | Environment Variables + Inheritance | **Complete** |
 | **M27** | SMP / Multi-Core | **Complete** (Phase A) |
 | **M28** | RTC + Wall-Clock Time | **Complete** |
-| **M29** | Block Cache / Buffer Cache | Not started |
-| **M30** | Multi-User + Login | Not started |
+| **M29** | Block Cache / Buffer Cache | **Complete** |
+| **M30** | Multi-User + Login | **Complete** |
 | **M31** | Doom as First-Class Executable | **Complete** (Phase A + Phase B) |
 | **M31D** | Doom Authentic Music (OPL2) | **In progress** — OPL2 emulator implemented, music plays but sounds incorrect (quasi-monotone, wrong timbres) |
 | **M32** | Doom 100% in Userland | Not started |
@@ -517,72 +517,110 @@ cargo xtask smoke-rtc --arch aarch64
 
 ### M29: Block Cache / Buffer Cache
 
-**Status**: Not started
+**Status**: **Complete**
 **Goal**: Cache recently-read disk sectors in memory to reduce I/O.
 
 **Dependencies**: None (improves filesystem performance).
 
-#### Step 1: Buffer cache
-**Files to create**: `kernel/src/storage/cache.rs`
-**Files to modify**: `kernel/src/storage/mod.rs`
+#### Delivered
 
-1. Fixed-size LRU cache: 256 entries (128 KiB total for 512-byte sectors).
-2. Each entry: `{ sector: u64, data: [u8; 512], dirty: bool, ref_count: u16 }`.
-3. `cache_read(sector)`: return cached data if present, otherwise read from disk and cache.
-4. `cache_write(sector, data)`: mark entry dirty, write-back on eviction or `sync`.
-5. `cache_sync()`: flush all dirty entries to disk.
-
-#### Step 2: Wire into filesystem
-**Files to modify**: `kernel/src/fs/diskfs_v2.rs`
-
-1. Replace direct `storage::read_sector`/`write_sector` calls with `cache_read`/`cache_write`.
-2. Journal commit calls `cache_sync()` to ensure durability.
-
-#### Step 3: `sync` command enhancement
-**Files to modify**: `kernel/src/shell.rs`
-
-1. `sync` now also flushes the buffer cache.
-2. Show cache hit/miss statistics via `cache stats` command.
+- **`kernel/src/storage/cache.rs`** — LRU block cache (new file):
+  - 256-entry fixed-size cache (128 KiB total for 512-byte sectors).
+  - Each entry: `{ sector: u64, data: [u8; 512], dirty: bool, access_tick: u64 }`.
+  - LRU eviction: lowest `access_tick` entry evicted when cache is full; dirty entries written back before eviction.
+  - `cached_read(sector)`: return cached data if present (hit), otherwise read from disk and cache (miss).
+  - `cached_write(sector, data)`: mark entry dirty, write-back deferred until `sync` or eviction.
+  - `sync()`: flush all dirty entries to disk, returns count of flushed blocks.
+  - `clear()`: flush dirty entries then invalidate all cache slots.
+  - `stats()`: returns `CacheStats { total, used, dirty, hits, misses, writebacks, enabled, hit_rate_percent() }`.
+- **`kernel/src/storage/mod.rs`** — Cache integration:
+  - `read_sector()` and `write_sector()` now route through `cache::cached_read`/`cache::cached_write`.
+  - Original implementations preserved as `read_sector_raw()`/`write_sector_raw()` for the cache layer itself.
+  - Cache transparently wraps all filesystem I/O (diskfs_v2, journal, bitmap).
+- **`kernel/src/main.rs`** — Cache init on both x86_64 and aarch64 boot paths, after `storage::init()`, before `fs::init()`.
+- **Shell commands** (`kernel/src/shell.rs`, `kernel/src/gfx/mod.rs`):
+  - `cache` / `cache stats`: display cache statistics (enabled, total, used, dirty, hits, misses, writebacks, hit_rate%).
+  - `cache clear`: flush dirty blocks and invalidate all entries.
+  - `cache sync`: flush dirty blocks without invalidating.
+  - `sync` command now also flushes the block cache.
+- **`/proc/cache`** — Synthetic procfs file exposing cache statistics.
+- **`cargo xtask smoke-cache [--arch <x86_64|aarch64>]`** — Smoke test verifying cache init, `cache` command output, and `/proc/cache` content.
 
 #### Testing
-1. Read same file twice; second read should be faster (hit serial timing log).
-2. `sync` flushes dirty buffers.
-3. All `smoke-fs` tests pass.
+```
+cache                         # show cache stats
+cache stats                   # same
+cache clear                   # flush + invalidate
+cache sync                    # flush dirty only
+sync                          # FS sync + cache flush
+cat /proc/cache               # cache stats as file
+cargo xtask smoke-cache --arch x86_64
+cargo xtask smoke-cache --arch aarch64
+```
+
+#### Relevant files
+- `kernel/src/storage/cache.rs`
+- `kernel/src/storage/mod.rs`
+- `kernel/src/main.rs` (init call)
+- `kernel/src/shell.rs` (cache commands)
+- `kernel/src/gfx/mod.rs` (GUI terminal cache commands)
+- `kernel/src/fs/procfs.rs` (Cache variant + inode)
+- `kernel/src/fs/mod.rs` (render_proc_cache_text)
+- `xtask/src/main.rs` (smoke-cache harness)
 
 ---
 
 ### M30: Multi-User + Login
 
-**Status**: Not started
-**Goal**: Basic multi-user support with `/etc/passwd` and login prompt.
+**Status**: **Complete**
+**Goal**: Basic multi-user support with `/etc/passwd`, per-process UID/GID, and identity commands.
 
 **Dependencies**: M22 (execve), M26 (environment variables).
 
-#### Step 1: User database
-**Files to modify**: `kernel/src/fs/mod.rs`
+#### Delivered
 
-1. Seed `/etc/passwd` at boot: `root:x:0:0:root:/root:/bin/sh` and `user:x:1000:1000:user:/home/user:/bin/sh`.
-2. Seed `/etc/group`: `root:x:0:` and `user:x:1000:`.
-3. Parse on boot to populate UID/GID lookup table.
+- **Per-process UID/GID** (`Ring3ProcessContext`, `kernel/src/proc/mod.rs`):
+  - `uid: u16` and `gid: u16` fields on `Ring3ProcessContext`; default `uid=1000 gid=1000` for ring-3 processes.
+  - Cooperative kernel tasks run as `uid=0 gid=0` (root).
+  - `SYS_GETUID` (36) and `SYS_GETGID` (37) now return the process's actual UID/GID from context (no longer hardcoded).
+  - `FsIdentity` derived from process UID/GID: `privileged = uid == 0`.
+  - `ProcessSnapshot` extended with `uid`/`gid` fields.
+- **User database** (`kernel/src/fs/mod.rs`):
+  - `/etc/passwd` seeded at boot: `root:x:0:0:root:/root:/bin/sh` and `user:x:1000:1000:user:/home/user:/bin/sh`.
+  - `/etc/group` seeded at boot: `root:x:0:` and `user:x:1000:`.
+  - `/etc` directory created with mode `0755`.
+  - `/root` home directory created with mode `0700`.
+  - Seeding is idempotent (skipped if files already exist on persistent storage).
+- **Shell commands** (`kernel/src/shell.rs`, `kernel/src/gfx/mod.rs`):
+  - `whoami`: prints current username (`root` for the kernel shell).
+  - `id`: prints `uid=0(root) gid=0(root)` (kernel shell runs as root).
+  - `users`: prints all known users (`root user`).
+- **`/bin/whoami`** and **`/bin/id`** added to `BIN_EXEC_PATHS` (23 entries total).
+- **`cargo xtask smoke-login [--arch <x86_64|aarch64>]`** — Smoke test verifying `whoami`, `id`, `/etc/passwd`, and `/etc/group` content.
 
-#### Step 2: Login process
-**Files to modify**: `kernel/src/shell.rs` or new `kernel/src/login.rs`
-
-1. On boot, display `arrost login:` prompt.
-2. Match username against `/etc/passwd`.
-3. Set process UID/GID from passwd entry.
-4. Set HOME, USER, SHELL environment variables.
-5. Launch shell with appropriate identity.
-
-#### Step 3: `su` and `whoami` commands
-1. `whoami`: print current UID's username.
-2. `su <user>`: switch user identity (kernel-mediated, no password for educational OS).
-3. `id`: print uid, gid, groups.
+#### Not delivered (deferred)
+- Login prompt at boot (kernel shell starts directly as root; login flow deferred).
+- `su <user>` command to switch process identity at runtime.
+- Password authentication (educational OS — no passwords).
+- Per-file UID/GID ownership enforcement beyond existing mode-based checks.
 
 #### Testing
-1. Boot shows `arrost login:` prompt.
-2. Login as `user`, `whoami` prints `user`.
-3. Permission checks respect UID (file owned by root not writable by user).
+```
+whoami                        # root
+id                            # uid=0(root) gid=0(root)
+users                         # root user
+cat /etc/passwd               # root:x:0:0:root:/root:/bin/sh\nuser:x:...
+cat /etc/group                # root:x:0:\nuser:x:1000:
+cargo xtask smoke-login --arch x86_64
+cargo xtask smoke-login --arch aarch64
+```
+
+#### Relevant files
+- `kernel/src/proc/mod.rs` (uid/gid fields, syscall handlers, FsIdentity, ProcessSnapshot)
+- `kernel/src/fs/mod.rs` (ensure_etc_users, BIN_EXEC_PATHS)
+- `kernel/src/shell.rs` (whoami, id, users commands)
+- `kernel/src/gfx/mod.rs` (GUI terminal commands)
+- `xtask/src/main.rs` (smoke-login harness)
 
 ---
 

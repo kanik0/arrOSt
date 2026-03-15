@@ -49,7 +49,8 @@ ArrOSt exposes a small mount-aware VFS facade with disk-backed, RAM-backed, and 
 - `devfs` is read-only; device nodes are static (no `mknod`); `/dev/vda` does not support raw read/write via fd (use `storage::read_sector` directly).
 - `tmpfs` is independent from the root filesystem and is not persisted across boots.
 - Symlink resolution stops after 8 chained hops and returns `ELOOP`.
-- Permission model is intentionally small: kernel/external shell paths are privileged, ring-3 processes are treated as `uid=1000 gid=1000`.
+- Permission model is intentionally small: kernel/external shell paths are privileged, ring-3 processes default to `uid=1000 gid=1000`.
+- `/etc/passwd` and `/etc/group` are seeded at boot (M30). Two entries: `root` (uid=0) and `user` (uid=1000).
 - Dentry caching is a performance hint only; it can be disabled at build time with `ARROST_DISABLE_DENTRY_CACHE=1`.
 
 ## User-visible shell commands

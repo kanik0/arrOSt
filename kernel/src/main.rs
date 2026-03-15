@@ -365,6 +365,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         storage_report.capacity_bytes
     ));
 
+    // M29: enable block cache after storage init, before filesystem init.
+    if storage_report.ready {
+        storage::cache::init();
+        serial::write_line("Cache: block cache enabled (256 entries, LRU, write-back)");
+    }
+
     let net_report = net::init();
     serial::write_fmt(format_args!(
         "Net: backend={} cfg={} ready={} io={:#06x} pci={:02x}:{:02x}.{} devid={:#06x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ip={}.{}.{}.{}\n",
@@ -714,6 +720,12 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         storage_report.capacity_sectors,
         storage_report.capacity_bytes
     ));
+
+    // M29: enable block cache after storage init, before filesystem init.
+    if storage_report.ready {
+        storage::cache::init();
+        serial::write_line("Cache: block cache enabled (256 entries, LRU, write-back)");
+    }
 
     let net_report = net::init();
     serial::write_fmt(format_args!(

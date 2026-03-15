@@ -28,16 +28,25 @@ Storage initialization report includes:
 - I/O base
 - total sectors and bytes
 
+## Block cache (M29)
+
+- 256-entry LRU write-back sector cache (`kernel/src/storage/cache.rs`).
+- Sits between the filesystem and the virtio-blk driver, caching all sector reads and writes transparently.
+- Write-back policy: dirty entries are deferred until `sync`, cache eviction, or explicit `cache clear`.
+- Initialized after `storage::init()`, before `fs::init()` on both architectures.
+- Shell commands: `cache` (stats), `cache clear` (flush + invalidate), `cache sync` (flush only).
+- `/proc/cache` exposes hit/miss/writeback statistics.
+
 ## Limits
 
 - QEMU/virtio focused implementation.
-- No storage-device cache or journal below the filesystem layer.
 - `diskfs-v2` now provides its own redo journal above sector I/O, with `Ordered` default mode and optional `Full` data journaling mode.
 - No multi-device scheduling yet.
 
 ## Relevant files
 
 - `kernel/src/storage/mod.rs`
+- `kernel/src/storage/cache.rs`
 - `kernel/src/arch/x86_64/port.rs`
 - `kernel/src/arch/aarch64/port.rs`
 - `scripts/qemu.sh`

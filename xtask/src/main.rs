@@ -138,6 +138,8 @@ enum TopLevelCommand {
     SmokePipes,
     SmokeSmp,
     SmokeRtc,
+    SmokeCache,
+    SmokeLogin,
 }
 
 struct UserArtifact {
@@ -214,6 +216,8 @@ fn main() -> Result<()> {
         Ok(TopLevelCommand::SmokePipes) => smoke_pipes(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeSmp) => smoke_smp(parse_run_arch_arg(args)?),
         Ok(TopLevelCommand::SmokeRtc) => smoke_rtc(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeCache) => smoke_cache(parse_run_arch_arg(args)?),
+        Ok(TopLevelCommand::SmokeLogin) => smoke_login(parse_run_arch_arg(args)?),
         Err(error) => {
             print_usage();
             Err(error)
@@ -253,6 +257,8 @@ fn parse_top_level_command(value: Option<&str>) -> Result<TopLevelCommand> {
         Some("smoke-pipes") => Ok(TopLevelCommand::SmokePipes),
         Some("smoke-smp") => Ok(TopLevelCommand::SmokeSmp),
         Some("smoke-rtc") => Ok(TopLevelCommand::SmokeRtc),
+        Some("smoke-cache") => Ok(TopLevelCommand::SmokeCache),
+        Some("smoke-login") => Ok(TopLevelCommand::SmokeLogin),
         Some(other) => bail!("unsupported xtask command: {other}"),
     }
 }
@@ -6313,6 +6319,209 @@ fn smoke_rtc(arch_override: Option<String>) -> Result<()> {
     if let Some(line) = last_matching_line(&log_snapshot, "RTC:") {
         println!("{smoke_name}: {line}");
     }
+    Ok(())
+}
+
+fn smoke_cache(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-cache";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // Verify cache init log line.
+        wait_for_log(
+            &log,
+            "Cache: block cache enabled",
+            Duration::from_secs(5),
+            "cache init log",
+        )?;
+
+        // Run `cache` command and verify output.
+        send_serial_command(stdin, "cache\n")?;
+        wait_for_log(
+            &log,
+            "cache: enabled=true",
+            Duration::from_secs(5),
+            "cache stats output",
+        )?;
+
+        // Run `cat /proc/cache` and verify output.
+        send_serial_command(stdin, "cat /proc/cache\n")?;
+        wait_for_log(
+            &log,
+            "hits:",
+            Duration::from_secs(5),
+            "cat /proc/cache shows hits",
+        )?;
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
+    Ok(())
+}
+
+fn smoke_login(arch_override: Option<String>) -> Result<()> {
+    let arch = resolve_runtime_arch(arch_override)?;
+    ensure_runtime_artifacts(arch)?;
+
+    let smoke_name = "smoke-login";
+    let smoke_tag = format!("{smoke_name}-{}", arch.as_str());
+    let mut qemu_cmd = Command::new("bash");
+    qemu_cmd
+        .args([arch.qemu_script()])
+        .env("QEMU_DISPLAY", "none")
+        .env("QEMU_AUDIO", "none");
+    if arch == RuntimeArch::Aarch64 {
+        qemu_cmd.env("QEMU_FB", "auto");
+        qemu_cmd.env("QEMU_VIRTIO_BUS", "mmio");
+    }
+    qemu_cmd.env("QEMU_INPUT", "virtio");
+    qemu_cmd.env(
+        "QEMU_AUDIO_WAV_PATH",
+        format!("target/{}/debug/{smoke_tag}.wav", arch.kernel_target()),
+    );
+    let mut child = qemu_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start qemu run for {smoke_tag}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture qemu stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture qemu stderr")?;
+
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
+    let stderr_reader = spawn_log_reader(stderr, Arc::clone(&log));
+
+    let smoke_result = (|| -> Result<()> {
+        wait_for_log(&log, "arrost /", Duration::from_secs(40), "shell prompt")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture qemu stdin")?;
+
+        // Verify whoami outputs root.
+        send_serial_command(stdin, "whoami\n")?;
+        wait_for_log(&log, "root", Duration::from_secs(5), "whoami shows root")?;
+
+        // Verify id outputs uid=0.
+        send_serial_command(stdin, "id\n")?;
+        wait_for_log(
+            &log,
+            "uid=0(root)",
+            Duration::from_secs(5),
+            "id shows uid=0(root)",
+        )?;
+
+        // Verify /etc/passwd exists.
+        send_serial_command(stdin, "cat /etc/passwd\n")?;
+        wait_for_log(
+            &log,
+            "root:x:0:0",
+            Duration::from_secs(5),
+            "/etc/passwd contains root entry",
+        )?;
+
+        // Verify /etc/group exists.
+        send_serial_command(stdin, "cat /etc/group\n")?;
+        wait_for_log(
+            &log,
+            "user:x:1000",
+            Duration::from_secs(5),
+            "/etc/group contains user entry",
+        )?;
+
+        Ok(())
+    })();
+
+    if child
+        .try_wait()
+        .context("failed to query qemu process status")?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let log_snapshot = snapshot_log(&log);
+    if let Err(error) = smoke_result {
+        eprintln!("{smoke_name} failed: {error}");
+        eprintln!("----- serial tail -----");
+        eprintln!("{}", log_tail(&log_snapshot, 60));
+        return Err(error);
+    }
+
+    println!("{smoke_name}: PASS");
     Ok(())
 }
 
