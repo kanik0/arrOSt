@@ -58,6 +58,10 @@ cargo xtask smoke-smp --arch x86_64       # M27 SMP multi-core smoke
 cargo xtask smoke-smp --arch aarch64
 cargo xtask smoke-rtc --arch x86_64       # M28 RTC wall-clock smoke
 cargo xtask smoke-rtc --arch aarch64
+cargo xtask smoke-cache --arch x86_64     # M29 block cache smoke
+cargo xtask smoke-cache --arch aarch64
+cargo xtask smoke-login --arch x86_64     # M30 multi-user smoke
+cargo xtask smoke-login --arch aarch64
 ```
 
 ### Environment Variables
@@ -128,6 +132,7 @@ kernel/                     Rust no_std kernel crate
       font.rs               Bitmap monospace font (32K)
     storage/
       mod.rs                Virtio-blk sector I/O
+      cache.rs              LRU block cache (M29)
     audio.rs                Audio backend selection
     audio/
       virtio_sound.rs       Virtio-snd driver (64K)
@@ -298,6 +303,8 @@ Non saltare mai questi step, anche se sembra inutile.
 | M24 | Shell pipes + process groups | `cmd1 \| cmd2` pipeline syntax (up to 4 stages); `SYS_SETPGID=59`/`SYS_GETPGID=60`; per-process pgid; `FdRedirect`-based pipe spawning; Ctrl+C kills pipeline; `smoke-pipes` harness |
 | M27 | SMP / multi-core (Phase A) | Per-CPU data via GS/TPIDR_EL1; x86_64 LAPIC + INIT-SIPI-SIPI trampoline; aarch64 PSCI CPU_ON; AP idle loop; `cpus` shell command; `smoke-smp` harness |
 | M28 | RTC + wall-clock time | CMOS RTC (x86_64) + PL031 (aarch64); `date` shell command; `/proc/datetime`; `SYS_CLOCK_GETTIME=61` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`); `Timespec` struct; ABI rev 7; `smoke-rtc` harness |
+| M29 | Block cache | 256-entry LRU write-back sector cache in `storage/cache.rs`; transparent read/write caching for all disk I/O; `cache`/`cache clear`/`cache sync` shell commands; `/proc/cache`; `smoke-cache` harness |
+| M30 | Multi-user + login | Per-process `uid`/`gid` on `Ring3ProcessContext`; `SYS_GETUID`/`SYS_GETGID` return actual UID/GID; `/etc/passwd` + `/etc/group` seeded at boot; `whoami`/`id`/`users` commands; `/bin/whoami` + `/bin/id`; `smoke-login` harness |
 
 ### In progress
 | M31D | Doom authentic music (OPL2) | OPL2 emulator + GENMIDI + MUS player implemented; music plays but sounds quasi-monotone — root cause unknown |
@@ -309,8 +316,8 @@ Non saltare mai questi step, anche se sembra inutile.
 | M24 | Shell pipes + process groups | **Complete** — see Completed table |
 | M27 | SMP / multi-core | **Phase A complete** — AP bootstrap, per-CPU state, idle loop; Phase B: SMP-aware ring-3 scheduling |
 | M28 | RTC + wall-clock | **Complete** — see Completed table |
-| M29 | Block cache | LRU sector cache, write-back, cache stats |
-| M30 | Multi-user + login | `/etc/passwd`, login prompt, UID/GID enforcement |
+| M29 | Block cache | **Complete** — see Completed table |
+| M30 | Multi-user + login | **Complete** — see Completed table |
 | M31C | Doom enhancements (Phase C) | Savegames to `/home/user/.doom/`, network multiplayer groundwork |
 | M32 | Doom 100% userland | `video_blit`+`audio_write` syscalls; move Doom C to user build; remove kernel Doom engine |
 

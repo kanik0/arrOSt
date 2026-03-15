@@ -1928,10 +1928,68 @@ fn run_command(shell: &mut ShellState) {
         }
         "sync" => {
             fs::sync_to_disk_to_serial();
+            // M29: also flush block cache on sync.
+            match storage::cache::sync() {
+                Ok(flushed) => {
+                    if flushed > 0 {
+                        serial::write_fmt(format_args!(
+                            "cache: flushed {} dirty blocks\n",
+                            flushed
+                        ));
+                    }
+                }
+                Err(e) => {
+                    serial::write_fmt(format_args!("cache: sync error: {}\n", e.as_str()));
+                }
+            }
         }
         "reload" => {
             fs::reload_from_disk_to_serial();
         }
+        // M29: block cache commands.
+        "cache" | "cache stats" => {
+            let s = storage::cache::stats();
+            serial::write_fmt(format_args!(
+                "cache: enabled={} total={} used={} dirty={} hits={} misses={} writebacks={} hit_rate={}%\n",
+                s.enabled,
+                s.total,
+                s.used,
+                s.dirty,
+                s.hits,
+                s.misses,
+                s.writebacks,
+                s.hit_rate_percent()
+            ));
+        }
+        "cache clear" => match storage::cache::clear() {
+            Ok(flushed) => {
+                serial::write_fmt(format_args!(
+                    "cache: cleared (flushed {} dirty blocks)\n",
+                    flushed
+                ));
+            }
+            Err(e) => {
+                serial::write_fmt(format_args!("cache: clear error: {}\n", e.as_str()));
+            }
+        },
+        // M30: multi-user commands.
+        "whoami" => {
+            serial::write_line("root");
+        }
+        "id" => {
+            serial::write_line("uid=0(root) gid=0(root)");
+        }
+        "users" => {
+            serial::write_line("root user");
+        }
+        "cache sync" => match storage::cache::sync() {
+            Ok(flushed) => {
+                serial::write_fmt(format_args!("cache: synced {} dirty blocks\n", flushed));
+            }
+            Err(e) => {
+                serial::write_fmt(format_args!("cache: sync error: {}\n", e.as_str()));
+            }
+        },
         "watch on" => {
             time::set_heartbeat(true);
             serial::write_line("watch: tick heartbeat enabled");

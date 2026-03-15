@@ -45,7 +45,7 @@ use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 21] = [
+pub const BIN_EXEC_PATHS: [&str; 23] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -67,6 +67,8 @@ pub const BIN_EXEC_PATHS: [&str; 21] = [
     "/bin/traceroute",
     "/bin/host",
     "/bin/dig",
+    "/bin/whoami",
+    "/bin/id",
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
@@ -527,6 +529,7 @@ impl FsState {
             ProcOpenFile::NetTcp => Ok(self.render_proc_net_tcp_text()),
             ProcOpenFile::NetRoute => Ok(self.render_proc_net_route_text()),
             ProcOpenFile::DateTime => Ok(self.render_proc_datetime_text()),
+            ProcOpenFile::Cache => Ok(self.render_proc_cache_text()),
             ProcOpenFile::PidStatus { pid } => self.render_proc_pid_status_text(pid),
             ProcOpenFile::PidCmdline { pid } => self.render_proc_pid_cmdline_text(pid),
             ProcOpenFile::PidStat { pid } => self.render_proc_pid_stat_text(pid),
@@ -548,6 +551,7 @@ impl FsState {
                 | ProcOpenFile::NetTcp
                 | ProcOpenFile::NetRoute
                 | ProcOpenFile::DateTime
+                | ProcOpenFile::Cache
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -583,6 +587,7 @@ impl FsState {
                 | ProcOpenFile::NetTcp
                 | ProcOpenFile::NetRoute
                 | ProcOpenFile::DateTime
+                | ProcOpenFile::Cache
                 | ProcOpenFile::PidStatus { .. }
                 | ProcOpenFile::PidCmdline { .. }
                 | ProcOpenFile::PidStat { .. }
@@ -837,6 +842,20 @@ impl FsState {
         let mut text = String::new();
         let _ = writeln!(text, "datetime: {}", dt);
         let _ = writeln!(text, "epoch: {}", epoch);
+        text
+    }
+
+    fn render_proc_cache_text(&self) -> String {
+        let s = storage::cache::stats();
+        let mut text = String::new();
+        let _ = writeln!(text, "enabled: {}", s.enabled);
+        let _ = writeln!(text, "blocks_total: {}", s.total);
+        let _ = writeln!(text, "blocks_used: {}", s.used);
+        let _ = writeln!(text, "blocks_dirty: {}", s.dirty);
+        let _ = writeln!(text, "hits: {}", s.hits);
+        let _ = writeln!(text, "misses: {}", s.misses);
+        let _ = writeln!(text, "writebacks: {}", s.writebacks);
+        let _ = writeln!(text, "hit_rate: {}%", s.hit_rate_percent());
         text
     }
 
@@ -1648,6 +1667,7 @@ impl FsState {
             .write("/MILESTONE.TXT", b"M2: inode-based diskfs-v2\n");
         self.ensure_builtin_bins();
         self.ensure_default_home_tree();
+        self.ensure_etc_users();
         self.ensure_usr_share_doom();
     }
 
@@ -1664,6 +1684,7 @@ impl FsState {
         );
         self.ensure_builtin_bins();
         self.ensure_default_home_tree();
+        self.ensure_etc_users();
         self.ensure_usr_share_doom();
         let _ = self.diskfs_v2.sync_metadata();
     }
@@ -1731,6 +1752,45 @@ impl FsState {
                 DEFAULT_HISTORY_PATH,
                 err.as_str()
             )),
+        }
+    }
+
+    /// M30: seed /etc/passwd and /etc/group at boot.
+    fn ensure_etc_users(&mut self) {
+        match self.mkdir_path("/etc", 0o755, None) {
+            Ok(()) | Err(FsError::AlreadyExists) => {}
+            Err(err) => {
+                serial::write_fmt(format_args!(
+                    "FS: seed /etc mkdir failed ({})\n",
+                    err.as_str()
+                ));
+                return;
+            }
+        }
+        // /etc/passwd: root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n
+        let passwd = b"root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n";
+        if self.stat_path("/etc/passwd", None).is_err() {
+            if let Err(err) = self.seed_file_with_mode("/etc/passwd", passwd, 0o644) {
+                serial::write_fmt(format_args!(
+                    "FS: seed /etc/passwd failed ({})\n",
+                    err.as_str()
+                ));
+            }
+        }
+        // /etc/group: root:x:0:\nuser:x:1000:\n
+        let group = b"root:x:0:\nuser:x:1000:\n";
+        if self.stat_path("/etc/group", None).is_err() {
+            if let Err(err) = self.seed_file_with_mode("/etc/group", group, 0o644) {
+                serial::write_fmt(format_args!(
+                    "FS: seed /etc/group failed ({})\n",
+                    err.as_str()
+                ));
+            }
+        }
+        // /root home directory.
+        match self.mkdir_path("/root", 0o700, None) {
+            Ok(()) | Err(FsError::AlreadyExists) => {}
+            Err(_) => {}
         }
     }
 

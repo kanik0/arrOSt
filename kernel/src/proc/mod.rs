@@ -199,6 +199,8 @@ pub struct ProcessSnapshot {
     pub tty: Option<u32>,
     #[allow(dead_code)]
     pub pgid: u32,
+    pub uid: u16,
+    pub gid: u16,
 }
 
 impl ProcessSnapshot {
@@ -213,6 +215,8 @@ impl ProcessSnapshot {
             external_kind: None,
             tty: None,
             pgid: 0,
+            uid: 0,
+            gid: 0,
         }
     }
 }
@@ -430,6 +434,10 @@ pub struct Ring3ProcessContext {
     pub env_count: usize,
     /// M24: process group ID.
     pub pgid: u32,
+    /// M30: user ID.
+    pub uid: u16,
+    /// M30: group ID.
+    pub gid: u16,
 }
 
 const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
@@ -457,6 +465,8 @@ const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
         env_vars: [None; MAX_ENV_VARS],
         env_count: 0,
         pgid: 0,
+        uid: 1000,
+        gid: 1000,
     };
     ctx.cwd[0] = b'/';
     ctx
@@ -1960,11 +1970,11 @@ impl Scheduler {
             }
             SYS_GETUID => {
                 self.stats.getuid = self.stats.getuid.saturating_add(1);
-                1000 // ring-3 processes run as uid=1000
+                self.ring3_context.process.uid as isize
             }
             SYS_GETGID => {
                 self.stats.getgid = self.stats.getgid.saturating_add(1);
-                1000 // ring-3 processes run as gid=1000
+                self.ring3_context.process.gid as isize
             }
             SYS_KILL => {
                 self.stats.kill = self.stats.kill.saturating_add(1);
@@ -5490,6 +5500,8 @@ impl Scheduler {
                 external_kind: None,
                 tty: None,
                 pgid: 0,
+                uid: 0,
+                gid: 0,
             };
             written = written.saturating_add(1);
         }
@@ -5515,6 +5527,8 @@ impl Scheduler {
                 external_kind: task.name.starts_with("/bin/").then_some("binary"),
                 tty: task.tty,
                 pgid: task.process.pgid,
+                uid: task.process.uid,
+                gid: task.process.gid,
             };
             written = written.saturating_add(1);
         }
@@ -5537,6 +5551,8 @@ impl Scheduler {
                 external_kind: Some(task.kind.as_str()),
                 tty: task.tty,
                 pgid: 0,
+                uid: 0,
+                gid: 0,
             };
             written = written.saturating_add(1);
         }
@@ -5581,13 +5597,17 @@ impl Scheduler {
             return FsIdentity::root();
         };
 
-        if self
+        if let Some(task) = self
             .ring3_tasks
             .iter()
             .flatten()
-            .any(|task| task.pid == pid)
+            .find(|task| task.pid == pid)
         {
-            return FsIdentity::user();
+            return FsIdentity {
+                uid: task.process.uid,
+                gid: task.process.gid,
+                privileged: task.process.uid == 0,
+            };
         }
 
         FsIdentity::root()

@@ -2531,6 +2531,51 @@ impl GfxState {
             self.push_terminal_text(index, &line);
             return true;
         }
+        // M30: multi-user commands.
+        if command == "whoami" {
+            self.push_terminal_text(index, "root\n");
+            return true;
+        }
+        if command == "id" {
+            self.push_terminal_text(index, "uid=0(root) gid=0(root)\n");
+            return true;
+        }
+        if command == "users" {
+            self.push_terminal_text(index, "root user\n");
+            return true;
+        }
+        // M29: block cache commands.
+        if command == "cache" || command == "cache stats" {
+            let s = storage::cache::stats();
+            let mut line = String::new();
+            let _ = writeln!(
+                line,
+                "cache: enabled={} total={} used={} dirty={} hits={} misses={} writebacks={} hit_rate={}%",
+                s.enabled,
+                s.total,
+                s.used,
+                s.dirty,
+                s.hits,
+                s.misses,
+                s.writebacks,
+                s.hit_rate_percent()
+            );
+            self.push_terminal_text(index, &line);
+            return true;
+        }
+        if command == "cache clear" {
+            let mut line = String::new();
+            match storage::cache::clear() {
+                Ok(flushed) => {
+                    let _ = writeln!(line, "cache: cleared (flushed {} dirty blocks)", flushed);
+                }
+                Err(e) => {
+                    let _ = writeln!(line, "cache: clear error: {}", e.as_str());
+                }
+            }
+            self.push_terminal_text(index, &line);
+            return true;
+        }
         if command == "user" {
             let mut line = String::new();
             let _ = writeln!(

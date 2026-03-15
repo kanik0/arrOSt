@@ -11,6 +11,7 @@ ArrOSt uses a hybrid scheduler model: cooperative kernel tasks plus a ring-3 mul
 - Round-robin ring-3 scheduling with syscall-timeslice preemption (`yield/sleep/exit` force kernel return; other syscalls can be timesliced).
 - Per-task syscall capability masks (coarse-grained isolation step).
 - Per-process `pgid` (process group ID): defaults to own PID, inherited by `fork`, shared across pipeline stages. `SYS_SETPGID`/`SYS_GETPGID` syscalls for query/update. Shell sets all stages in a pipeline to the same pgid and uses it for group-wide signal delivery (Ctrl+C).
+- Per-process `uid`/`gid` (M30): ring-3 processes default to `uid=1000 gid=1000`; cooperative kernel tasks run as `uid=0 gid=0`. `SYS_GETUID`/`SYS_GETGID` return the process's actual identity. `FsIdentity` derived from process UID/GID.
 - Per-process file-descriptor tables for cooperative and ring-3 execution contexts (`fd 0-2` = serial).
 - Per-process address-space ownership for ring-3 ELF tasks: each process gets its own root page table plus dedicated user mappings for ELF segments and stack.
 - Scheduler tracks KPTI scratch roots (`kernel_root_table`, `user_root_table`) during ring-3 address-space switch/restore and exposes per-CPU root/RSP scratch state consumed by trampoline transition paths.

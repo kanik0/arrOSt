@@ -146,7 +146,7 @@ Useful runtime commands:
 - ANSI/VT100 CSI escape sequences (M25) are parsed and rendered in the GUI terminal with per-cell 16-color output. Serial pass-through and bold/underline rendering are deferred.
 - Environment variables (M26): per-process env arrays with `SYS_GETENV`/`SYS_SETENV`/`SYS_UNSETENV`; shell `env`/`export`/`$VAR` expansion. `envp` passed to `execve` is deferred.
 - SMP Phase A (M27): APs boot and idle; ring-3 scheduling on APs is deferred to Phase B.
-- No block/buffer cache; all disk I/O is synchronous and uncached.
+- Block cache (M29) provides LRU sector caching with write-back; 256 entries (128 KiB).
 - `procfs` does not yet expose `/proc/<pid>/fd/`, `/proc/diskstats`, or `/proc/interrupts`.
 - `diskfs-v2` journaling is transaction-size limited by fixed journal capacity (63 staged sectors per transaction).
 - TCP retransmission queue (RTO, Karn's algorithm) is not implemented; packet delivery in QEMU's slirp is reliable so this is not observable.
@@ -176,8 +176,8 @@ See `docs/MILESTONES.md` for detailed implementation plans. Summary:
 | M26 | Environment variables | Complete |
 | M27 | SMP / multi-core | Phase A complete |
 | M28 | RTC + wall-clock time | Complete |
-| M29 | Block cache | Planned |
-| M30 | Multi-user + login | Planned |
+| M29 | Block cache | Complete |
+| M30 | Multi-user + login | Complete |
 | M31 | Doom enhancements | Planned |
 | M31D | Doom authentic music (OPL2) | Complete |
 
