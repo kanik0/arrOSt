@@ -391,6 +391,7 @@ impl FsState {
                         self.seed_defaults_diskfs();
                     } else {
                         self.ensure_builtin_bins();
+                        self.ensure_etc_users();
                         let _ = self.diskfs_v2.sync_metadata();
                     }
                 }
