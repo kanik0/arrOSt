@@ -385,7 +385,7 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
-    let user_doom_elf = build_userland_binary(
+    let user_doom_elf = build_userland_fs_binary(
         USER_DOOM_PACKAGE,
         USER_DOOM_RING3_BIN,
         KERNEL_TARGET,
@@ -863,7 +863,7 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
-    let user_doom_elf = build_userland_binary(
+    let user_doom_elf = build_userland_fs_binary(
         USER_DOOM_PACKAGE,
         USER_DOOM_RING3_BIN,
         KERNEL_TARGET_AARCH64,
