@@ -45,7 +45,7 @@ use procfs::{ProcFs, ProcFsContext, ProcOpenFile};
 pub use ramfs::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES, MAX_FILES, RamFs};
 pub use tmpfs::TmpFs;
 
-pub const BIN_EXEC_PATHS: [&str; 22] = [
+pub const BIN_EXEC_PATHS: [&str; 21] = [
     "/bin/ls",
     "/bin/ps",
     "/bin/kill",
@@ -67,7 +67,6 @@ pub const BIN_EXEC_PATHS: [&str; 22] = [
     "/bin/traceroute",
     "/bin/host",
     "/bin/dig",
-    "/bin/date",
 ];
 
 pub const MAX_SYMLINK_DEPTH: usize = 8;
