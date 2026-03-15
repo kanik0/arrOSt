@@ -1,6 +1,6 @@
 // kernel/src/percpu.rs: Per-CPU data structures for SMP support (M27).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 4;
@@ -41,9 +41,6 @@ unsafe impl Sync for PerCpu {}
 /// Global array of per-CPU data, indexed by CPU ID.
 static CPU_DATA: [PerCpu; MAX_CPUS] = [PerCpu::new(), PerCpu::new(), PerCpu::new(), PerCpu::new()];
 
-/// Number of CPUs currently online.
-static CPU_COUNT_ONLINE: AtomicU32 = AtomicU32::new(0);
-
 /// AP kernel stacks (one per AP, not used for BSP which has its own stack).
 #[repr(C, align(4096))]
 pub struct ApStacks(pub [[u8; AP_STACK_SIZE]; MAX_CPUS]);
@@ -62,7 +59,6 @@ pub fn init_bsp() {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cpu0_ptr).cpu_id), 0);
     }
     CPU_DATA[0].online.store(true, Ordering::Release);
-    CPU_COUNT_ONLINE.store(1, Ordering::Release);
 
     // Set the architecture-specific per-CPU register to point at CPU_DATA[0].
     set_percpu_base(&CPU_DATA[0]);
@@ -81,7 +77,6 @@ pub fn init_ap(cpu_id: u32) {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cpu_ptr).is_bsp), false);
     }
     CPU_DATA[idx].online.store(true, Ordering::Release);
-    CPU_COUNT_ONLINE.fetch_add(1, Ordering::AcqRel);
 
     set_percpu_base(&CPU_DATA[idx]);
 }
@@ -148,8 +143,17 @@ pub fn current_cpu_id() -> u32 {
 }
 
 /// Get the number of CPUs currently online.
+/// Computed dynamically from per-CPU `online` flags rather than a separate counter,
+/// because per-CPU atomics are reliably visible across CPUs while a global counter
+/// may not be incremented correctly during early AP boot.
 pub fn online_count() -> u32 {
-    CPU_COUNT_ONLINE.load(Ordering::Acquire)
+    let mut count = 0u32;
+    for cpu in &CPU_DATA {
+        if cpu.online.load(Ordering::Acquire) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Check if the current CPU is the BSP.
