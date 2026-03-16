@@ -390,6 +390,21 @@ fn build_impl(
         &major_env,
         &minor_env,
     )?;
+    // Pre-detect DoomGeneric sources so user/doom/build.rs can compile the C engine.
+    {
+        let dg_root = std::path::Path::new("user/doom/third_party/doomgeneric/doomgeneric");
+        let dg_ready = dg_root.join("doomgeneric.h").exists()
+            && dg_root.join("doomkeys.h").exists()
+            && dg_root.join("doomgeneric.c").exists()
+            && dg_root.join("Makefile.soso").exists();
+        // SAFETY: single-threaded at this point — no concurrent env readers.
+        unsafe {
+            std::env::set_var(
+                "ARROST_DOOM_GENERIC_READY",
+                if dg_ready { "true" } else { "false" },
+            );
+        }
+    }
     let user_doom = build_userland_package(
         USER_DOOM_PACKAGE,
         KERNEL_TARGET,
@@ -868,6 +883,21 @@ fn build_secondary_target(
         version.major,
         version.minor,
     )?;
+    // Pre-detect DoomGeneric sources so user/doom/build.rs can compile the C engine.
+    {
+        let dg_root = std::path::Path::new("user/doom/third_party/doomgeneric/doomgeneric");
+        let dg_ready = dg_root.join("doomgeneric.h").exists()
+            && dg_root.join("doomkeys.h").exists()
+            && dg_root.join("doomgeneric.c").exists()
+            && dg_root.join("Makefile.soso").exists();
+        // SAFETY: single-threaded at this point — no concurrent env readers.
+        unsafe {
+            std::env::set_var(
+                "ARROST_DOOM_GENERIC_READY",
+                if dg_ready { "true" } else { "false" },
+            );
+        }
+    }
     let user_doom = build_userland_package(
         USER_DOOM_PACKAGE,
         KERNEL_TARGET_AARCH64,
