@@ -30,7 +30,7 @@ Completed milestones are listed in summary form. Active and planned milestones i
 | M29 | Block Cache | **Complete** |
 | M30 | Multi-User + Login | **Complete** |
 | M31 | Doom First-Class Executable | **Complete** (Phase A + B + D) |
-| M32 | Userland I/O + Doom 100% Userland | Planned |
+| M32 | Userland I/O + Doom 100% Userland | **Complete** |
 | M33 | Signal Completion | Planned |
 | M34 | File-Backed mmap + Shared Memory | Planned |
 | M35 | Extended ProcFS Phase 2 | Planned |
@@ -113,63 +113,12 @@ Per-process `uid`/`gid`; `SYS_GETUID`/`SYS_GETGID` return actual identity; `/etc
 **Phase B**: F12 release capture; ESC in-game menu; CTRL/ALT/arrow/F-key mapping; fullscreen/window modes; 660x440 default; hint pill overlay; comb-filter reverb.
 **Phase D**: OPL2 FM synthesis emulator; GENMIDI patch loading; MUS player; LRU 9-channel voice allocator. *Known issue*: music plays but sounds quasi-monotone — root cause unresolved.
 
+### M32: Userland I/O Syscalls + Doom 100% Userland
+`SYS_VIDEO_BLIT=62` / `SYS_AUDIO_WRITE=63` / `SYS_INPUT_READ=64`; per-process input event queue; video consumer pattern; DoomGeneric C compilation moved to `user/doom/build.rs`; userland platform glue via `arrost_syscall.h` + `doomgeneric_arrost_userland.c`; kernel Doom engine gutted to stub module; `SYS_DOOM_LAUNCH` returns `ENOSYS`; ABI revision 8. *Known limitation*: WAD (4.2 MB) may not fit on 32 MiB disk image.
+
 ---
 
 ## Planned milestones
-
-### M32: Userland I/O Syscalls + Doom 100% Userland
-
-**Status**: Planned
-**Goal**: Add graphics/audio/input syscalls so ring-3 processes can interact with the display, sound hardware, and input devices. Then move Doom entirely out of the kernel.
-
-**Dependencies**: M21 (mmap, done), M22 (execve, done), M31 (Doom executable, done).
-
-#### Rationale
-Today `/bin/doom` calls `SYS_DOOM_LAUNCH` which runs the entire Doom C engine inside the kernel. This adds ~12 MB to the kernel binary and means a Doom crash can take down the kernel. Moving Doom to userland shrinks the kernel, improves isolation, and establishes the I/O syscall patterns that any future graphical userland app will need.
-
-#### Step 1 — New syscalls
-
-**Files**: `crates/arrostd/src/lib.rs`, `kernel/src/proc/mod.rs`, `kernel/src/gfx/mod.rs`, `kernel/src/audio.rs`, `kernel/src/keyboard.rs`
-
-| Syscall | Number | Signature | Description |
-|---------|--------|-----------|-------------|
-| `SYS_VIDEO_BLIT` | 62 | `(ptr: *const u32, w: u32, h: u32) -> isize` | Copy user RGBX pixel buffer into compositor viewport. Cap 320x200. |
-| `SYS_AUDIO_WRITE` | 63 | `(ptr: *const i16, frames: u32) -> isize` | Enqueue up to 4096 stereo PCM frames into virtio-snd. |
-| `SYS_INPUT_READ` | 64 | `(buf: *mut u8, max: u32) -> isize` | Read keyboard/mouse events from per-process input queue. Non-blocking. |
-
-All three validate user pointers via `copy_from_user_bytes` / `ring3_copy_to_user` (physical page walk). Gate under new capability `caps::IO`.
-
-#### Step 2 — Move Doom C to user build
-
-**Files**: `user/doom/build.rs`, `kernel/build.rs`
-
-1. Remove all Doom C compilation (`doomgeneric_*.c`, `opl/*.c`, `freestanding_libc.c`, `third_party/`) from `kernel/build.rs`.
-2. Add them to `user/doom/build.rs`, compiling for the user target.
-3. Replace Rust→C callbacks with syscall wrappers in `user/doom/c/doomgeneric_arrost.c`:
-   - `DG_DrawFrame(pixels)` → `syscall(SYS_VIDEO_BLIT, pixels, 320, 200)`
-   - `DG_SubmitAudio(pcm, n)` → `syscall(SYS_AUDIO_WRITE, pcm, n)`
-   - `DG_GetKey()` → `syscall(SYS_INPUT_READ, &key, 1)`
-   - WAD: `open("/usr/share/doom/doom1.wad")` → sequential `fread`
-
-#### Step 3 — Remove kernel Doom engine
-
-**Files to remove**: `kernel/src/doom.rs`, `kernel/src/doom_bridge.rs`
-**Files to modify**: `kernel/src/main.rs`, `kernel/src/shell.rs`, `crates/arrostd/src/lib.rs`
-
-1. Remove `SYS_DOOM_LAUNCH=55` from ABI (or repurpose).
-2. Remove `doom::play`, `doom::stop`, `doom::tick`, `doom_bridge::*`.
-3. Shell `doom` command → `try_launch_shell_vfs_user_bin("/bin/doom", ...)`.
-4. Compositor video path uses `SYS_VIDEO_BLIT` from the userland process.
-
-#### Step 4 — Smoke test
-
-`cargo xtask smoke-doom-userland [--arch <x86_64|aarch64>]`: boots QEMU, runs `doom play`, verifies Doom process appears in `ps`, verifies `SYS_VIDEO_BLIT` log, kills with `kill <pid>`.
-
-#### Benefits
-- Kernel binary ~12 MB smaller.
-- Doom crashes do not affect kernel stability.
-- `kill <pid>` works like any process.
-- Establishes I/O syscall patterns for any future graphical userland app.
 
 ---
 

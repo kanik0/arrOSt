@@ -342,7 +342,7 @@ impl ShellState {
     fn release_all_serial_capture_keys(&mut self) {
         for slot in &mut self.held_serial_capture_keys {
             if slot.active {
-                let _ = doom::inject_key_release(slot.byte);
+                let _ = doom_inject_key_release(slot.byte);
                 *slot = HeldCaptureKey::inactive();
             }
         }
@@ -351,7 +351,7 @@ impl ShellState {
     fn release_expired_serial_capture_keys(&mut self, now_ticks: u64) {
         for slot in &mut self.held_serial_capture_keys {
             if slot.active && now_ticks >= slot.release_tick {
-                let _ = doom::inject_key_release(slot.byte);
+                let _ = doom_inject_key_release(slot.byte);
                 *slot = HeldCaptureKey::inactive();
             }
         }
@@ -452,7 +452,7 @@ impl ShellState {
             }
         }
 
-        if !doom::inject_key(byte) {
+        if !doom_inject_key(byte) {
             return;
         }
 
@@ -479,7 +479,7 @@ impl ShellState {
 
         let oldest = self.held_serial_capture_keys[oldest_index];
         if oldest.active {
-            let _ = doom::inject_key_release(oldest.byte);
+            let _ = doom_inject_key_release(oldest.byte);
         }
         self.held_serial_capture_keys[oldest_index] = HeldCaptureKey {
             byte,
@@ -559,7 +559,7 @@ fn process_keyboard_event(event: keyboard::KeyEvent) {
                 return;
             }
             if let Some(byte) = map_doom_capture_key(event.code) {
-                let _ = doom::inject_key_release(byte);
+                let _ = doom_inject_key_release(byte);
             }
             return;
         }
@@ -608,9 +608,9 @@ fn process_keyboard_event(event: keyboard::KeyEvent) {
     };
     // ESC (0x1b) is forwarded to Doom so the in-game menu opens/closes.
     let _ = if event.pressed {
-        doom::inject_key(byte)
+        doom_inject_key(byte)
     } else {
-        doom::inject_key_release(byte)
+        doom_inject_key_release(byte)
     };
 }
 
@@ -641,6 +641,23 @@ fn doom_capture_enabled() -> bool {
     // SAFETY: shell state is read on the main loop thread.
     let shell = unsafe { &*SHELL_STATE.0.get() };
     shell.doom_capture
+}
+
+/// M32: Input event kind constants for the per-process input queue.
+const INPUT_KIND_KEY_PRESS: u8 = 1;
+const INPUT_KIND_KEY_RELEASE: u8 = 2;
+
+/// Inject a key press to the userland video consumer (or kernel doom stub).
+fn doom_inject_key(byte: u8) -> bool {
+    let vc_enqueued = proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_PRESS, byte);
+    // M32: kernel doom bridge is a no-op stub; video consumer is the real path.
+    vc_enqueued || doom::inject_key(byte)
+}
+
+/// Inject a key release to the userland video consumer (or kernel doom stub).
+fn doom_inject_key_release(byte: u8) -> bool {
+    let vc_enqueued = proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_RELEASE, byte);
+    vc_enqueued || doom::inject_key_release(byte)
 }
 
 pub fn set_ui_doom_capture(enabled: bool) -> bool {
@@ -1455,7 +1472,7 @@ fn run_command(shell: &mut ShellState) {
     if let Some(rest) = input.strip_prefix("doom keyup ") {
         match parse_doom_key(rest) {
             Some(key) => {
-                if doom::inject_key_release(key) {
+                if doom_inject_key_release(key) {
                     serial::write_fmt(format_args!("doom: injected keyup {:#04x}\n", key));
                     doom::render_ui_status();
                 } else {
@@ -1471,7 +1488,7 @@ fn run_command(shell: &mut ShellState) {
     if let Some(rest) = input.strip_prefix("doom key ") {
         match parse_doom_key(rest) {
             Some(key) => {
-                if doom::inject_key(key) {
+                if doom_inject_key(key) {
                     serial::write_fmt(format_args!("doom: injected key {:#04x}\n", key));
                     doom::render_ui_status();
                 } else {
@@ -2409,55 +2426,28 @@ fn run_shell_terminal_command() {
 }
 
 fn run_shell_doom_status_command() {
-    doom::log_status();
+    // M32: kernel doom engine removed — fallback only reached if VFS launch fails.
+    serial::write_line("doom: kernel engine removed (M32); use /bin/doom via VFS launch");
 }
 
-fn run_shell_doom_play_command(shell: &mut ShellState) {
-    let start = doom::play(time::ticks());
-    match start {
-        doom::PlayStart::DoomGeneric => {
-            serial::write_line("doom: play mode started (doomgeneric)");
-        }
-        doom::PlayStart::Fallback => {
-            serial::write_line(
-                "doom: doomgeneric not ready; starting fallback runtime (run scripts/vendor_doomgeneric.sh and provide user/doom/wad/doom1.wad)",
-            );
-        }
-        doom::PlayStart::AlreadyRunning => {
-            serial::write_line("doom: runtime already running");
-        }
-    }
-    if !matches!(start, doom::PlayStart::AlreadyRunning) {
-        if doom::set_capture(true) {
-            shell.doom_capture = true;
-            serial::write_line("doom: capture enabled (F12: release keys | ESC: in-game menu)");
-        } else {
-            shell.doom_capture = false;
-            serial::write_line("doom: capture unavailable (fallback mode)");
-        }
-    }
-    doom::render_ui_status();
+fn run_shell_doom_play_command(_shell: &mut ShellState) {
+    // M32: kernel doom engine removed — fallback only reached if VFS launch fails.
+    serial::write_line("doom: VFS launch failed; kernel engine removed (M32)");
 }
 
 fn run_shell_doom_run_command() {
-    if doom::start(time::ticks()) {
-        serial::write_line("doom: runtime started");
-    } else {
-        serial::write_line("doom: runtime already running");
-    }
-    doom::render_ui_status();
+    serial::write_line("doom: VFS launch failed; kernel engine removed (M32)");
 }
 
-fn run_shell_doom_stop_command(shell: &mut ShellState) {
-    if doom::stop(time::ticks()) {
-        shell.release_all_serial_capture_keys();
-        shell.doom_capture = false;
-        let _ = doom::set_capture(false);
+fn run_shell_doom_stop_command(_shell: &mut ShellState) {
+    // M32: try to kill the video consumer process if one exists.
+    let vc_pid = proc::video_consumer_pid();
+    if vc_pid != 0 {
+        proc::kill_process(vc_pid);
         serial::write_line("doom: runtime stopped");
     } else {
         serial::write_line("doom: runtime already stopped");
     }
-    doom::render_ui_status();
 }
 
 fn current_shell_cwd() -> String {

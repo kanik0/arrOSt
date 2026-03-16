@@ -8,7 +8,6 @@ use crate::fs::{self, FdTable, FdTarget, MAX_FDS, MAX_OPEN_PATH_BYTES};
 use crate::mem::vma::{MAX_VMAS, VmaEntry, VmaFlags};
 use crate::{gfx, net, serial, time};
 use alloc::{boxed::Box, vec::Vec};
-use arrost_user_doom as user_doom;
 use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
@@ -16,15 +15,15 @@ use arrostd::syscall::{
     FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FileStat, IPPROTO_TCP, IPPROTO_UDP, MAP_ANONYMOUS, NSIG,
     O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SEEK_CUR,
     SEEK_END, SEEK_SET, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT,
-    SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE, SYS_CONNECT,
-    SYS_DOOM_LAUNCH, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT,
-    SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPID, SYS_GETPPID,
-    SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
-    SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK, SYS_RECV, SYS_RECVFROM,
-    SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SETENV, SYS_SIGACTION,
-    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS, SYS_UNLINK,
-    SYS_UNSETENV, SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq, UDP_SOCKET_FD, UdpRecvReq,
-    UdpSendReq, app, caps, errno,
+    SYS_AUDIO_WRITE, SYS_BIND, SYS_BRK, SYS_CAP_DROP, SYS_CAP_GET, SYS_CHDIR, SYS_CLOSE,
+    SYS_CONNECT, SYS_DOOM_LAUNCH, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD,
+    SYS_FSTAT, SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPID,
+    SYS_GETPPID, SYS_GETUID, SYS_INPUT_READ, SYS_KILL, SYS_LINK, SYS_LISTEN, SYS_MKDIR, SYS_MMAP,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PING, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_READLINK,
+    SYS_RECV, SYS_RECVFROM, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SEND, SYS_SENDTO, SYS_SETENV,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SPAWN, SYS_SYMLINK, SYS_TIME_MS,
+    SYS_UNLINK, SYS_UNSETENV, SYS_VIDEO_BLIT, SYS_WAITPID, SYS_WRITE, SYS_YIELD, TcpConnectReq,
+    UDP_SOCKET_FD, UdpRecvReq, UdpSendReq, app, caps, errno,
 };
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -110,6 +109,67 @@ pub fn kpti_set_kernel_rsp_scratch(rsp: u64) {
         .kernel_rsp_scratch
         .store(rsp, Ordering::Release);
     KPTI_KERNEL_RSP_SCRATCH.store(rsp, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// M32: video blit staging buffer + video consumer PID
+// ---------------------------------------------------------------------------
+
+const VIDEO_BLIT_MAX_W: usize = 320;
+const VIDEO_BLIT_MAX_H: usize = 200;
+const VIDEO_BLIT_MAX_PIXELS: usize = VIDEO_BLIT_MAX_W * VIDEO_BLIT_MAX_H;
+const AUDIO_WRITE_MAX_FRAMES: usize = 4096;
+
+struct VideoBlitStagingCell(UnsafeCell<[u32; VIDEO_BLIT_MAX_PIXELS]>);
+// SAFETY: single-threaded kernel; only accessed from syscall path.
+unsafe impl Sync for VideoBlitStagingCell {}
+
+static VIDEO_BLIT_STAGING: VideoBlitStagingCell =
+    VideoBlitStagingCell(UnsafeCell::new([0u32; VIDEO_BLIT_MAX_PIXELS]));
+
+/// PID of the ring-3 process that is the current video consumer (receives input events).
+/// 0 means no video consumer.
+static VIDEO_CONSUMER_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Return the PID of the current video consumer process (0 if none).
+pub fn video_consumer_pid() -> u32 {
+    VIDEO_CONSUMER_PID.load(Ordering::Relaxed)
+}
+
+/// Set the video consumer PID (called on first `SYS_VIDEO_BLIT`).
+pub fn set_video_consumer(pid: u32) {
+    VIDEO_CONSUMER_PID.store(pid, Ordering::Release);
+}
+
+/// Clear the video consumer if it matches `pid` (called on process exit).
+pub fn clear_video_consumer(pid: u32) {
+    let _ = VIDEO_CONSUMER_PID.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Enqueue an input event to the video consumer's per-process input queue.
+/// Returns true if enqueued, false if queue full or no such process.
+pub fn enqueue_input_to_video_consumer(kind: u8, value: u8) -> bool {
+    let pid = VIDEO_CONSUMER_PID.load(Ordering::Relaxed);
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: single-threaded kernel; scheduler lock is not needed here because
+    // this is called from the main kernel loop (input/shell/gfx polling).
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    for task in scheduler.ring3_tasks.iter_mut().flatten() {
+        let process = &mut task.process;
+        if process.pid == pid && process.is_video_consumer {
+            let event = (kind as u16) << 8 | (value as u16);
+            let next_tail = process.input_tail.wrapping_add(1);
+            if next_tail == process.input_head {
+                return false; // queue full
+            }
+            process.input_events[process.input_tail as usize] = event;
+            process.input_tail = next_tail;
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -357,7 +417,10 @@ pub struct Ring3SyscallDispatch {
 /// Maximum length of the per-process current working directory path.
 pub const MAX_CWD_LEN: usize = arrostd::abi::USERLAND_PATH_MAX;
 
-/// M26: per-process environment variable entry.
+/// M32: per-process input event queue capacity (ring buffer, must be power of 2 ≤ 256).
+const INPUT_QUEUE_CAP: usize = 256;
+
+// M26: per-process environment variable entry.
 const MAX_ENV_VARS: usize = 8;
 const MAX_ENV_KEY_LEN: usize = 32;
 const MAX_ENV_VAL_LEN: usize = 64;
@@ -440,6 +503,12 @@ pub struct Ring3ProcessContext {
     pub uid: u16,
     /// M30: group ID.
     pub gid: u16,
+    /// M32: per-process input event queue (ring buffer).
+    pub input_events: [u16; INPUT_QUEUE_CAP],
+    pub input_head: u8,
+    pub input_tail: u8,
+    /// M32: true if this process is the active video consumer (receives input events).
+    pub is_video_consumer: bool,
 }
 
 const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
@@ -469,6 +538,10 @@ const EMPTY_RING3_PROCESS_CONTEXT: Ring3ProcessContext = {
         pgid: 0,
         uid: 1000,
         gid: 1000,
+        input_events: [0u16; INPUT_QUEUE_CAP],
+        input_head: 0,
+        input_tail: 0,
+        is_video_consumer: false,
     };
     ctx.cwd[0] = b'/';
     ctx
@@ -782,14 +855,12 @@ impl SyscallStats {
 enum TaskKind {
     Init,
     InitWorker,
-    DoomWorker,
     Shell,
 }
 
 #[derive(Clone, Copy)]
 enum ExternalTaskKind {
     Terminal,
-    DoomRuntime,
     Binary,
 }
 
@@ -797,7 +868,6 @@ impl ExternalTaskKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
-            Self::DoomRuntime => "doom-runtime",
             Self::Binary => "binary",
         }
     }
@@ -847,7 +917,7 @@ struct PreparedRing3VfsBin {
     argc: usize,
 }
 
-const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 3] = [
+const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 4] = [
     VfsUserBinContract {
         path: "/bin/ls",
         worker_name: "/bin/ls",
@@ -861,6 +931,11 @@ const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 3] = [
     VfsUserBinContract {
         path: "/bin/ps",
         worker_name: "/bin/ps",
+        syscall_caps: caps::CORE,
+    },
+    VfsUserBinContract {
+        path: "/bin/doom",
+        worker_name: "/bin/doom",
         syscall_caps: caps::CORE,
     },
 ];
@@ -1073,7 +1148,6 @@ impl Scheduler {
         match task.kind {
             TaskKind::Init => self.run_init_task(task, now_ticks),
             TaskKind::InitWorker => self.run_init_worker_task(task, now_ticks),
-            TaskKind::DoomWorker => self.run_doom_worker_task(task, now_ticks),
             TaskKind::Shell => self.run_shell_task(task, now_ticks),
         }
     }
@@ -1183,10 +1257,6 @@ impl Scheduler {
 
     fn run_init_worker_task(&mut self, task: &mut Task, now_ticks: u64) {
         self.run_user_worker_task(task, now_ticks, init_user_app_contract(), "[uinit]", true);
-    }
-
-    fn run_doom_worker_task(&mut self, task: &mut Task, now_ticks: u64) {
-        self.run_user_worker_task(task, now_ticks, doom_user_app_contract(), "[udoom]", false);
     }
 
     fn run_user_worker_task(
@@ -2032,10 +2102,20 @@ impl Scheduler {
                 // arg0 = fds_ptr, arg1 = flags (only 0 supported)
                 self.syscall_pipe_ring3(ctx, arg0)
             }
-            // M31: doom engine launch/control from ring-3
-            SYS_DOOM_LAUNCH => {
-                // arg0 = cmd (DOOM_CMD_PLAY/RUN/STOP/STATUS)
-                self.syscall_doom_launch_ring3(arg0)
+            // M31→M32: kernel doom engine removed; userland uses SYS_VIDEO_BLIT etc.
+            SYS_DOOM_LAUNCH => errno::ENOSYS,
+            // M32: userland I/O syscalls
+            SYS_VIDEO_BLIT => {
+                // arg0 = pixel_ptr, arg1 = width, arg2 = height
+                self.syscall_video_blit_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_AUDIO_WRITE => {
+                // arg0 = samples_ptr, arg1 = frames, arg2 = sample_rate
+                self.syscall_audio_write_ring3(ctx, arg0, arg1, arg2)
+            }
+            SYS_INPUT_READ => {
+                // arg0 = buf_ptr, arg1 = max_events
+                self.syscall_input_read_ring3(ctx, arg0, arg1)
             }
             _ => {
                 self.stats.errors = self.stats.errors.saturating_add(1);
@@ -3452,6 +3532,8 @@ impl Scheduler {
                     );
                 if reap_now {
                     auto_reap_log = Some((task.pid, task.name, task.state));
+                    // M32: clear video consumer if the exiting process was it.
+                    clear_video_consumer(task.pid);
                 }
             }
             self.ring3_active_slot = None;
@@ -4773,38 +4855,152 @@ impl Scheduler {
         }
     }
 
-    /// SYS_DOOM_LAUNCH (M31): launch or control the kernel doom engine from ring-3.
+    // -----------------------------------------------------------------------
+    // M32: Userland I/O syscalls
+    // -----------------------------------------------------------------------
+
+    /// SYS_VIDEO_BLIT (62): copy user RGBX pixel buffer into compositor viewport.
     ///
-    /// `cmd` maps to the doom operation:
-    ///   0 (DOOM_CMD_PLAY)   – start play mode (same as `doom play` shell command)
-    ///   1 (DOOM_CMD_RUN)    – start run mode  (same as `doom run`)
-    ///   2 (DOOM_CMD_STOP)   – stop doom       (same as `doom stop`)
-    ///   3 (DOOM_CMD_STATUS) – print status to serial
-    ///
-    /// Returns 0 on success, `-EINVAL` for unknown cmd, `-ENOSYS` if doom is unavailable.
-    fn syscall_doom_launch_ring3(&mut self, cmd: u64) -> isize {
-        use arrostd::syscall::{DOOM_CMD_PLAY, DOOM_CMD_RUN, DOOM_CMD_STATUS, DOOM_CMD_STOP};
-        match cmd {
-            DOOM_CMD_PLAY => {
-                use crate::doom::PlayStart;
-                match crate::doom::play(crate::time::ticks()) {
-                    PlayStart::DoomGeneric | PlayStart::Fallback | PlayStart::AlreadyRunning => 0,
-                }
-            }
-            DOOM_CMD_RUN => {
-                let _ = crate::doom::start(crate::time::ticks());
-                0
-            }
-            DOOM_CMD_STOP => {
-                let _ = crate::doom::stop(crate::time::ticks());
-                0
-            }
-            DOOM_CMD_STATUS => {
-                crate::doom::log_status();
-                0
-            }
-            _ => errno::EINVAL,
+    /// `pixel_ptr` = pointer to `[u32; width * height]`; max 320x200.
+    /// On the first call, the calling process becomes the "video consumer"
+    /// and starts receiving input events via `SYS_INPUT_READ`.
+    fn syscall_video_blit_ring3(
+        &mut self,
+        ctx: Ring3SyscallCtx,
+        pixel_ptr: u64,
+        width: u64,
+        height: u64,
+    ) -> isize {
+        let w = width as usize;
+        let h = height as usize;
+        if w == 0 || h == 0 || w > VIDEO_BLIT_MAX_W || h > VIDEO_BLIT_MAX_H {
+            return errno::EINVAL;
         }
+        let pixel_count = w * h;
+        let byte_len = pixel_count * 4;
+
+        // Copy pixels from user space into the staging buffer.
+        // SAFETY: single-threaded kernel; staging buffer is only used here.
+        let staging = unsafe { &mut *VIDEO_BLIT_STAGING.0.get() };
+        let staging_bytes =
+            unsafe { core::slice::from_raw_parts_mut(staging.as_mut_ptr() as *mut u8, byte_len) };
+
+        if ctx.user_range_count == 0 {
+            // Shared address space (smoke test path).
+            let src = unsafe { core::slice::from_raw_parts(pixel_ptr as *const u8, byte_len) };
+            staging_bytes.copy_from_slice(src);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &ctx.user_ranges,
+            ctx.user_range_count,
+            ctx.address_space,
+            pixel_ptr,
+            staging_bytes,
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        // Push pixels to the compositor.
+        gfx::set_file_manager_doom_view(w, h, &staging[..pixel_count]);
+
+        // Mark this process as the video consumer if not already set.
+        let pid = ctx.pid;
+        if video_consumer_pid() != pid {
+            set_video_consumer(pid);
+            // Also set the flag on the process struct.
+            self.ring3_context.process.is_video_consumer = true;
+        }
+
+        0
+    }
+
+    /// SYS_AUDIO_WRITE (63): enqueue stereo PCM i16 frames to audio backend.
+    ///
+    /// `samples_ptr` = pointer to `[i16; frames * 2]` (stereo interleaved).
+    /// Max 4096 frames (16 KiB). Returns number of frames submitted.
+    fn syscall_audio_write_ring3(
+        &mut self,
+        ctx: Ring3SyscallCtx,
+        samples_ptr: u64,
+        frames: u64,
+        sample_rate: u64,
+    ) -> isize {
+        let frame_count = frames as usize;
+        if frame_count == 0 || frame_count > AUDIO_WRITE_MAX_FRAMES {
+            return errno::EINVAL;
+        }
+        let sample_count = frame_count * 2; // stereo
+        let byte_len = sample_count * 2; // i16 = 2 bytes
+
+        let mut buf = [0i16; AUDIO_WRITE_MAX_FRAMES * 2];
+        let buf_bytes =
+            unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, byte_len) };
+
+        if ctx.user_range_count == 0 {
+            let src = unsafe { core::slice::from_raw_parts(samples_ptr as *const u8, byte_len) };
+            buf_bytes.copy_from_slice(src);
+        } else if let Err(error) = ring3_groundwork::copy_from_user_bytes(
+            &ctx.user_ranges,
+            ctx.user_range_count,
+            ctx.address_space,
+            samples_ptr,
+            buf_bytes,
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        let rate = (sample_rate as u32).max(1);
+        let submitted = crate::audio::submit_pcm_i16(&buf[..sample_count], rate, 2);
+        (submitted / 2) as isize // return frames, not samples
+    }
+
+    /// SYS_INPUT_READ (64): read input events from the per-process queue.
+    ///
+    /// `buf_ptr` = pointer to user `[u16; max_events]`. Non-blocking.
+    /// Each event is `u16`: bits[7:0] = key/value, bits[15:8] = kind.
+    /// Returns number of events copied, 0 if empty.
+    fn syscall_input_read_ring3(
+        &mut self,
+        ctx: Ring3SyscallCtx,
+        buf_ptr: u64,
+        max_events: u64,
+    ) -> isize {
+        let max = (max_events as usize).min(128);
+        if max == 0 || buf_ptr == 0 {
+            return 0;
+        }
+
+        let process = &mut self.ring3_context.process;
+        let mut events = [0u16; 128];
+        let mut count = 0usize;
+
+        while count < max && process.input_head != process.input_tail {
+            events[count] = process.input_events[process.input_head as usize];
+            process.input_head = process.input_head.wrapping_add(1);
+            count += 1;
+        }
+
+        if count == 0 {
+            return 0;
+        }
+
+        let byte_len = count * 2;
+        let event_bytes =
+            unsafe { core::slice::from_raw_parts(events.as_ptr() as *const u8, byte_len) };
+
+        if ctx.user_range_count == 0 {
+            let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, byte_len) };
+            dst.copy_from_slice(event_bytes);
+        } else if let Err(error) = ring3_groundwork::copy_to_user_bytes(
+            &ctx.user_ranges,
+            ctx.user_range_count,
+            ctx.address_space,
+            buf_ptr,
+            event_bytes,
+        ) {
+            return self.map_ring3_copy_error(error);
+        }
+
+        count as isize
     }
 
     fn syscall_ping_ring3(&mut self, _ctx: Ring3SyscallCtx, ip_ptr: u64, ip_len: u64) -> isize {
@@ -6713,6 +6909,8 @@ fn syscall_required_caps(number: u64) -> u32 {
         SYS_EXECVE => caps::CORE,
         // M31: doom launch
         SYS_DOOM_LAUNCH => caps::CORE,
+        // M32: userland I/O
+        SYS_VIDEO_BLIT | SYS_AUDIO_WRITE | SYS_INPUT_READ => caps::CORE,
         SYS_GETPID | SYS_CAP_GET | SYS_CAP_DROP | SYS_SPAWN | SYS_WAITPID => caps::PROC,
         // M15 Phase A2: process identity and control
         SYS_GETPPID | SYS_GETUID | SYS_GETGID | SYS_KILL | SYS_SIGACTION | SYS_SIGRETURN => {
@@ -6744,23 +6942,9 @@ fn init_user_app_contract() -> UserAppContract {
     }
 }
 
-fn doom_user_app_contract() -> UserAppContract {
-    UserAppContract {
-        app_id: app::DOOM,
-        app_name: user_doom::app_name(),
-        worker_name: "doom-worker",
-        task_kind: TaskKind::DoomWorker,
-        syscall_caps: user_doom::required_caps(),
-        boot_message: user_doom::boot_message(),
-        sleep_ticks: user_doom::cooperative_sleep_ticks(),
-        exit_code: user_doom::cooperative_exit_code(),
-    }
-}
-
 fn user_app_contract(app_id: u64) -> Option<UserAppContract> {
     match app_id {
         app::INIT => Some(init_user_app_contract()),
-        app::DOOM => Some(doom_user_app_contract()),
         _ => None,
     }
 }
@@ -6846,7 +7030,6 @@ fn prepare_ring3_vfs_bin(path: &'static str, argv: &[&str]) -> Result<PreparedRi
 fn user_app_contract_for_kind(kind: TaskKind) -> Option<UserAppContract> {
     match kind {
         TaskKind::InitWorker => Some(init_user_app_contract()),
-        TaskKind::DoomWorker => Some(doom_user_app_contract()),
         _ => None,
     }
 }
@@ -7058,22 +7241,6 @@ pub fn spawn_terminal_process(tty: u32) -> isize {
             parent_pid,
             TASK_CAP_SHELL,
             Some(tty),
-        ) {
-            Ok(pid) => pid as isize,
-            Err(error) => error,
-        }
-    })
-}
-
-pub fn spawn_doom_runtime_process() -> isize {
-    with_scheduler(|scheduler| {
-        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
-        match scheduler.register_external_task(
-            "doom",
-            ExternalTaskKind::DoomRuntime,
-            parent_pid,
-            user_doom::required_caps(),
-            None,
         ) {
             Ok(pid) => pid as isize,
             Err(error) => error,

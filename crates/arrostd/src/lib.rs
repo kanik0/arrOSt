@@ -2,7 +2,7 @@
 
 // crates/arrostd/src/lib.rs: shared no_std helpers for ArrOSt crates.
 pub mod abi {
-    pub const USERLAND_ABI_REVISION: u16 = 7;
+    pub const USERLAND_ABI_REVISION: u16 = 8;
     pub const USERLAND_INIT_APP: &str = "init";
     pub const USERLAND_DOOM_APP: &str = "doom";
     pub const USERLAND_PATH_MAX: usize = 160;
@@ -13,7 +13,7 @@ pub mod abi {
 }
 
 pub mod syscall {
-    pub const ABI_REVISION: u16 = 7;
+    pub const ABI_REVISION: u16 = 8;
 
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_READ: u64 = 2;
@@ -91,6 +91,12 @@ pub mod syscall {
     pub const SYS_GETPGID: u64 = 60;
     /// M28: get wall-clock or monotonic time.
     pub const SYS_CLOCK_GETTIME: u64 = 61;
+    /// M32: copy user RGBX pixel buffer into compositor viewport.
+    pub const SYS_VIDEO_BLIT: u64 = 62;
+    /// M32: enqueue stereo PCM i16 audio frames to virtio-snd.
+    pub const SYS_AUDIO_WRITE: u64 = 63;
+    /// M32: read keyboard/mouse input events from per-process queue.
+    pub const SYS_INPUT_READ: u64 = 64;
 
     /// Clock IDs for `SYS_CLOCK_GETTIME`.
     pub const CLOCK_REALTIME: u64 = 0;
@@ -359,6 +365,9 @@ pub mod syscall {
             SYS_SETPGID => "setpgid",
             SYS_GETPGID => "getpgid",
             SYS_CLOCK_GETTIME => "clock_gettime",
+            SYS_VIDEO_BLIT => "video_blit",
+            SYS_AUDIO_WRITE => "audio_write",
+            SYS_INPUT_READ => "input_read",
             _ => "unknown",
         }
     }
@@ -508,12 +517,13 @@ pub mod syscall {
 
 pub mod runtime {
     use crate::syscall::{
-        FileStat, O_RDONLY, SYS_BRK, SYS_CHDIR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_DOOM_LAUNCH,
-        SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT, SYS_FWRITE, SYS_GETCWD,
-        SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPGID, SYS_GETPPID, SYS_GETUID, SYS_KILL,
-        SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2,
-        SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK, SYS_SETENV, SYS_SETPGID, SYS_SIGACTION,
-        SYS_SIGRETURN, SYS_SYMLINK, SYS_UNLINK, SYS_UNSETENV, SYS_WRITE,
+        FileStat, O_RDONLY, SYS_AUDIO_WRITE, SYS_BRK, SYS_CHDIR, SYS_CLOCK_GETTIME, SYS_CLOSE,
+        SYS_DOOM_LAUNCH, SYS_DUP2, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FREAD, SYS_FSTAT,
+        SYS_FWRITE, SYS_GETCWD, SYS_GETDENTS, SYS_GETENV, SYS_GETGID, SYS_GETPGID, SYS_GETPPID,
+        SYS_GETUID, SYS_INPUT_READ, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT,
+        SYS_MUNMAP, SYS_OPEN, SYS_PIPE, SYS_PIPE2, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SEEK,
+        SYS_SETENV, SYS_SETPGID, SYS_SIGACTION, SYS_SIGRETURN, SYS_SYMLINK, SYS_UNLINK,
+        SYS_UNSETENV, SYS_VIDEO_BLIT, SYS_WRITE,
     };
     use core::{slice, str};
 
@@ -1192,6 +1202,30 @@ pub mod runtime {
     pub fn dup2(src_fd: u32, dst_fd: u32) -> isize {
         syscall2(SYS_DUP2, src_fd as u64, dst_fd as u64)
     }
+
+    /// M32: blit an RGBX pixel buffer to the compositor doom viewport.
+    /// `pixels` must be `width * height` u32 entries. Max 320x200.
+    pub fn video_blit(pixels: *const u32, width: u32, height: u32) -> isize {
+        syscall3(SYS_VIDEO_BLIT, pixels as u64, width as u64, height as u64)
+    }
+
+    /// M32: enqueue stereo PCM i16 audio frames to virtio-snd.
+    /// `samples` points to `frames * 2` i16 values (stereo interleaved).
+    pub fn audio_write(samples: *const i16, frames: u32, sample_rate: u32) -> isize {
+        syscall3(
+            SYS_AUDIO_WRITE,
+            samples as u64,
+            frames as u64,
+            sample_rate as u64,
+        )
+    }
+
+    /// M32: read input events from the per-process queue (non-blocking).
+    /// Each event is a u16: bits[7:0]=key/value, bits[15:8]=kind.
+    /// Returns the number of events copied, 0 if empty.
+    pub fn input_read(buf: *mut u16, max_events: u32) -> isize {
+        syscall2(SYS_INPUT_READ, buf as u64, max_events as u64)
+    }
 }
 
 #[macro_export]
@@ -1314,7 +1348,7 @@ mod tests {
 
     #[test]
     fn syscall_numbering_matches_golden_contract() {
-        assert_eq!(syscall::ABI_REVISION, 7);
+        assert_eq!(syscall::ABI_REVISION, 8);
         assert_eq!(
             [
                 syscall::SYS_WRITE,

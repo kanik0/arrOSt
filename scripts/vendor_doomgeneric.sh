@@ -11,9 +11,9 @@ if [[ -d "${DEST_DIR}/.git" || -f "${DEST_DIR}/doomgeneric/doomgeneric.c" ]]; th
   exit 0
 fi
 
-# CI can provide an empty/incomplete checkout path (e.g. gitlink not initialized).
-# Replace it so cloning can succeed deterministically.
-if [[ -e "${DEST_DIR}" ]]; then
+# CI can provide an empty/incomplete checkout path (e.g. gitlink not initialized),
+# or a broken symlink from a local dev machine. Remove it so cloning succeeds.
+if [[ -e "${DEST_DIR}" || -L "${DEST_DIR}" ]]; then
   echo "DoomGeneric checkout at ${DEST_DIR} is incomplete; re-vendoring"
   rm -rf "${DEST_DIR}"
 fi

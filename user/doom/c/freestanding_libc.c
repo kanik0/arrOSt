@@ -14,6 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef ARROST_USERLAND
+#include "arrost_syscall.h"
+#endif
+
 int errno = 0;
 
 #define ARROST_FILE_POOL_SIZE 8u
@@ -329,13 +333,23 @@ float fabsf(float x) {
 }
 
 void abort(void) {
+#ifdef ARROST_USERLAND
+    arrost_syscall1(SYS_EXIT, 127);
+    for (;;) {} /* unreachable */
+#else
     /* Keep kernel alive: just set errno and return. */
     errno = EINVAL;
+#endif
 }
 
 void exit(int status) {
+#ifdef ARROST_USERLAND
+    arrost_syscall1(SYS_EXIT, (long)status);
+    for (;;) {} /* unreachable */
+#else
     (void)status;
     errno = EINVAL;
+#endif
 }
 
 int isalpha(int c) {
