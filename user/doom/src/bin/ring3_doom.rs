@@ -92,7 +92,7 @@ fn doom_main(argc: usize, argv: *const *const u8) -> i32 {
     };
     let rc = raw_syscall1(SYS_DOOM_LAUNCH, cmd);
     if rc < 0 {
-        write_str("doom: engine not available\n");
+        write_str("doom: userland C engine not compiled (set ARROST_DOOM_GENERIC_READY=1 and vendor DoomGeneric sources)\n");
         1
     } else {
         0
