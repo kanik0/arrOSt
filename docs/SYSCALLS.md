@@ -4,7 +4,7 @@ ArrOSt exposes a compact syscall ABI used by shared kernel/user metadata plus co
 
 ## ABI revision
 
-- Current revision: `7`
+- Current revision: `8`
 - Shared constants live in `crates/arrostd/src/lib.rs`
 
 ## Syscall numbers
@@ -129,6 +129,16 @@ Pipe implementation: 8-slot global table, 4 KiB circular buffers, ref-counted en
 |--------|------|-----------|-------|
 | 61 | `clock_gettime` | `(clock_id, ts_ptr) -> 0 or -errno` | Write `Timespec { tv_sec, tv_nsec }` to user buffer. `clock_id`: `CLOCK_REALTIME=0` (RTC wall-clock), `CLOCK_MONOTONIC=1` (PIT/GIC uptime). Requires `caps::TIME`. |
 
+### Userland I/O (62-64)
+
+| Number | Name | Signature | Notes |
+|--------|------|-----------|-------|
+| 62 | `video_blit` | `(ptr: *const u32, w: u32, h: u32) -> 0 or -errno` | Copy user RGBX pixel buffer into compositor doom viewport. Max 320x200. First call marks process as video consumer (receives input events). Requires `caps::CORE`. |
+| 63 | `audio_write` | `(ptr: *const i16, frames: u32, rate: u32) -> frames or -errno` | Enqueue stereo PCM i16 samples into audio backend. Max 4096 frames per call. Returns number of frames submitted. Requires `caps::CORE`. |
+| 64 | `input_read` | `(buf: *mut u16, max: u32) -> count or -errno` | Read from per-process input event queue (non-blocking). Event format: `u16`, bits[7:0]=key/value, bits[15:8]=kind (1=press, 2=release, 3=mouse dx, 4=mouse dy). Returns count of events copied, 0 if empty. Requires `caps::CORE`. |
+
+Per-process input queue: 256-entry ring buffer of `u16` events. Events are routed to the "video consumer" process (the first process to call `SYS_VIDEO_BLIT`). On process exit, the video consumer slot is cleared.
+
 `Timespec` is `#[repr(C)]` with two `u64` fields (`tv_sec`, `tv_nsec`).
 `CLOCK_REALTIME` reads the hardware RTC (CMOS on x86_64, PL031 on aarch64); `tv_nsec` is always 0.
 `CLOCK_MONOTONIC` derives seconds and nanoseconds from `time::uptime_millis()`.
@@ -238,6 +248,7 @@ On `aarch64`, the ring-3 `SVC` register ABI in the entry path is explicit: sysca
 `getenv`/`setenv`/`unsetenv` (M26, SYS_GETENV=56 / SYS_SETENV=57 / SYS_UNSETENV=58) are fully implemented for ring-3 processes. Shell-level `env`/`export` commands and `$VAR` expansion are available on the serial and GUI terminal.
 `setpgid`/`getpgid` (M24, SYS_SETPGID=59 / SYS_GETPGID=60) are fully implemented for ring-3 processes. Shell pipe syntax (`cmd1 | cmd2`, up to 4 stages) uses process groups for coordinated lifecycle and signal delivery.
 `clock_gettime` (M28, SYS_CLOCK_GETTIME=61) is fully implemented for ring-3 processes. `CLOCK_REALTIME` reads the hardware RTC; `CLOCK_MONOTONIC` derives from PIT/GIC tick counting.
+`video_blit`/`audio_write`/`input_read` (M32, SYS_VIDEO_BLIT=62 / SYS_AUDIO_WRITE=63 / SYS_INPUT_READ=64) are fully implemented for ring-3 processes. These enable userland graphical applications (e.g., Doom) to render pixels, output audio, and read input without kernel-side game engine code. ABI revision 8.
 
 ## Userland shim
 

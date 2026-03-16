@@ -193,7 +193,7 @@ Three scheduler tables coexist:
 2. **Ring-3 ELF processes** - Per-process page tables, dedicated user virtual range (`0x0000_2000_...`). Round-robin scheduling. State: `ready/running/sleep/exited/faulted`.
 3. **External process table** - Compositor-launched entries (GUI terminals, Doom sessions, `/bin/*` helpers).
 
-### Syscall ABI (revision 7)
+### Syscall ABI (revision 8)
 - `x86_64`: `int 0x80` (DPL=3 gate) - registers for args
 - `aarch64`: `SVC` - `x8`=number, `x0..x5`=args, `x0`=return
 - Numbers:
@@ -209,6 +209,7 @@ Three scheduler tables coexist:
   - env vars (M26): getenv(56) setenv(57) unsetenv(58)
   - process groups (M24): setpgid(59) getpgid(60)
   - clock (M28): clock_gettime(61)
+  - userland I/O (M32): video_blit(62) audio_write(63) input_read(64)
 - Capability masks: CORE, NET, PROC, TIME
 - Errno: negative return values (e.g., ENOENT=-2, EPERM=-1, EFAULT=-14)
 - Constants centralized in `crates/arrostd/src/lib.rs`
@@ -257,7 +258,7 @@ Three scheduler tables coexist:
 ### Build system
 - `cargo xtask` is the canonical build/run/smoke tool
 - Kernel uses `-Zbuild-std=core,compiler_builtins,alloc`
-- C code (Doom bridge) compiled via `cc` crate in `kernel/build.rs`
+- C code (DoomGeneric) compiled via `cc` crate in `user/doom/build.rs` (M32: moved from kernel)
 - User ELF binaries are embedded into the kernel at build time
 - Environment variables control conditional features (ring-3 smoke, dentry cache, etc.)
 
@@ -303,11 +304,11 @@ Non saltare mai questi step, anche se sembra inutile.
 | M29 | Block cache | 256-entry LRU write-back sector cache; `cache`/`sync` commands; `/proc/cache` |
 | M30 | Multi-user + login | Per-process `uid`/`gid`; `/etc/passwd` + `/etc/group`; `whoami`/`id`/`users` commands |
 | M31 | Doom first-class executable | Phases A+B+D: `SYS_DOOM_LAUNCH`; `/bin/doom`; F12/ESC/fullscreen; OPL2 FM music (quasi-monotone issue unresolved) |
+| M32 | Userland I/O + Doom 100% userland | `SYS_VIDEO_BLIT`/`SYS_AUDIO_WRITE`/`SYS_INPUT_READ`; Doom C to user build; kernel engine removed; ABI rev 8 |
 
 ### Planned
 | # | Milestone | Goal |
 |---|-----------|------|
-| M32 | Userland I/O + Doom 100% userland | `SYS_VIDEO_BLIT`/`SYS_AUDIO_WRITE`/`SYS_INPUT_READ`; move Doom C to user build; remove kernel Doom engine |
 | M33 | Signal completion | `sigprocmask`; nested signal delivery; `sa_restorer` trampoline |
 | M34 | File-backed mmap + shared memory | VFS page cache; `mmap(fd, ...)` `MAP_PRIVATE`/`MAP_SHARED`; `msync` |
 | M35 | Extended ProcFS Phase 2 | `/proc/<pid>/fd/`, `/proc/interrupts`, `/proc/diskstats`, `/proc/loadavg`, `/proc/stat` |

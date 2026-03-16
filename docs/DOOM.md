@@ -4,84 +4,72 @@ This document describes how Doom is integrated in ArrOSt today, what is already 
 
 ## Overview
 
-ArrOSt integrates Doom through a DoomGeneric bridge.
+ArrOSt integrates Doom as a 100% userland ring-3 process (M32).
 
-The current execution path is kernel-integrated and QEMU-focused:
+The execution path is:
 
-- DoomGeneric core + ArrOSt platform glue are built as C objects.
-- A Rust/C bridge moves frame, input, timing, config, and audio data between Doom and kernel subsystems.
-- Runtime diagnostics are exposed through serial logs and shell commands.
+- Shell `doom play` → VFS launch of `/bin/doom` as a ring-3 ELF process.
+- The userland Doom process uses I/O syscalls (`SYS_VIDEO_BLIT`, `SYS_AUDIO_WRITE`, `SYS_INPUT_READ`) to interact with the compositor, audio backend, and input subsystem.
+- DoomGeneric core + platform glue are compiled as C objects linked into the user ELF (not the kernel).
+- The kernel provides only the compositor viewport, audio backend, and per-process input queue — no game logic runs in kernel space.
 
 ## High-level architecture
 
 ### Build-time path
 
-`xtask` compiles:
+`user/doom/build.rs` compiles (gated on `ARROST_DOOM_GENERIC_READY` env var):
 
-- Doom user metadata crate (`arrost-user-doom`)
-- C backend object (`user/doom/c/doom_backend.c`)
-- DoomGeneric core object (`user/doom/third_party/doomgeneric/.../doomgeneric.c`)
-- ArrOSt DoomGeneric port object (`user/doom/c/doomgeneric_arrost.c`)
+- DoomGeneric core C files (from `user/doom/third_party/doomgeneric/`)
+- ArrOSt userland platform glue (`user/doom/c/doomgeneric_arrost_userland.c`)
+- Audio stub (`user/doom/c/doomgeneric_audio_stub.c`)
+- OPL2 FM emulator (`user/doom/c/opl/opl2.c`)
+- Freestanding libc (`user/doom/c/freestanding_libc.c`)
+- DoomGeneric runner (`user/doom/c/doomgeneric_runner.c`)
 
-Then kernel build embeds Doom metadata and readiness flags.
+The kernel `build.rs` only embeds the WAD file for VFS seeding and the user ELF binary.
 
 ### Runtime path
 
 `doom play`:
 
-1. Starts Doom runtime in DoomGeneric mode when ready.
-2. Enables capture mode when supported.
-3. Opens a dedicated Doom compositor window and renders Doom frames there.
-4. Routes keyboard/capture input to Doom key queue.
-5. Routes PCM output into ArrOSt audio backend.
+1. Shell dispatches to `/bin/doom play` via VFS launch.
+2. The ring-3 process allocates a 16 MiB heap via `SYS_MMAP`.
+3. Opens and reads `/usr/share/doom/doom1.wad` from the VFS.
+4. Calls `doomgeneric_Create()` to initialize the engine.
+5. Main loop: `doomgeneric_Tick()` + `SYS_SLEEP` (~35 FPS target).
+6. `DG_DrawFrame` → `SYS_VIDEO_BLIT(pixels, 320, 200)` → compositor renders in doom viewport.
+7. `DG_GetKey` → `SYS_INPUT_READ` → reads from per-process input queue.
+8. Audio callbacks → `SYS_AUDIO_WRITE` → stereo PCM to virtio-snd backend.
 
-If DoomGeneric is not ready, ArrOSt falls back to an explicit fallback runtime path.
+### I/O Syscalls (ABI revision 8)
+
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `SYS_VIDEO_BLIT` | 62 | Copy 320x200 RGBX pixel buffer to compositor viewport |
+| `SYS_AUDIO_WRITE` | 63 | Enqueue stereo PCM i16 samples to audio backend |
+| `SYS_INPUT_READ` | 64 | Read keyboard/mouse events from per-process input queue |
+
+The first process to call `SYS_VIDEO_BLIT` becomes the "video consumer" and receives routed input events. On process exit, the video consumer slot is cleared.
 
 ## Current capabilities
 
 ### Rendering
 
-- Doom frame conversion and viewport update are active.
-- Bridge output uses a 320x200 RGB framebuffer path (no 16-color quantization).
-- Doom output is shown in a dedicated draggable/resizable Doom window.
-- Viewport presentation uses aspect-ratio fit and bilinear filtering in the compositor.
-- Viewport filter is runtime-selectable (`nearest` default): `doom view bilinear|nearest`.
-- Viewport updates use bounded damage-region redraw, not full-window repaint.
-- Play-mode viewport refresh runs on a tighter cadence than status-text refresh for smoother pacing.
-- Runtime status exposes frame counters and non-zero frame metrics.
+- Doom frame rendered via `SYS_VIDEO_BLIT` into compositor doom viewport.
+- 320x200 RGBX framebuffer, compositor applies aspect-ratio fit.
+- Viewport filter selectable: `doom view bilinear|nearest`.
 
 ### Input
 
-- Command-based injection: `doom key` and `doom keyup`.
-- Capture mode: `doom capture on|off`.
-- Automatic capture on `doom play` (when supported).
-- Capture forwards all key input to Doom while active, except `ESC` which exits capture mode.
-- Press/release event flow is active through bridge queue.
-- Serial capture uses temporary key holds with auto-release to reduce missed events.
+- Keyboard/mouse events routed to video consumer process via per-process input queue.
+- Command-based injection: `doom key` and `doom keyup` (shell commands).
+- Input event format: `u16`, bits[7:0]=value, bits[15:8]=kind (1=press, 2=release, 3=mouse dx, 4=mouse dy).
 
 ### Audio
 
-- PCM audio path is active.
+- PCM audio via `SYS_AUDIO_WRITE` → virtio-snd backend.
+- OPL2 FM synthesis for music (GENMIDI patches, MUS player).
 - Preferred backend: `virtio-sound`.
-- Fallback backend: `off` (no PC-speaker path).
-- Virtio backend now uses a software jitter buffer with high-water trimming to reduce crackle/drop under bursty frame timing.
-- Virtio path applies linear resampling for cleaner playback when source/output rates differ.
-- Virtio stream setup now prefers native high-fidelity rates (44.1k/48k when available).
-- Doom mixer applies limiter/soft-clip to reduce hard clipping under heavy mix load.
-- Mixer gain/limiter tuning was tightened to reduce pumping and harsh clipping while keeping output level stable.
-- Runtime audio controls:
-  - `doom audio on|off|virtio|status|test`
-- Long-run strict smoke checks validate virtio audio stability.
-
-### Config persistence
-
-- Doom shim persists minimal config via `/arr.cfg` bridge load/store helpers.
-
-### Observability
-
-- `doom status` reports runtime, frame, input, and audio counters.
-- `doom source` reports DoomGeneric artifact readiness metadata.
-- `doom doctor` reports missing prerequisites and actionable hints.
 
 ## Prerequisites
 
@@ -94,11 +82,6 @@ Vendor helper:
 ```bash
 scripts/vendor_doomgeneric.sh
 ```
-
-Notes:
-
-- The helper is idempotent.
-- If an incomplete `user/doom/third_party/doomgeneric` checkout is present (for example in CI), the helper re-vendors it.
 
 ## Build and run
 
@@ -138,25 +121,7 @@ cargo xtask smoke-doom --arch x86_64
 cargo xtask smoke-doom --arch aarch64
 ```
 
-### Long-run smoke
-
-```bash
-cargo xtask smoke-doom-long --arch x86_64
-cargo xtask smoke-doom-long --arch aarch64
-```
-
-### Strict virtio audio smoke
-
-```bash
-cargo xtask smoke-doom-virtio --arch aarch64
-```
-
-### Fallback-path smoke
-
-```bash
-cargo xtask smoke-doom-fallback --arch x86_64
-cargo xtask smoke-doom-fallback --arch aarch64
-```
+Smoke tests validate boot readiness, audio backend, and basic shell doom commands. Kernel doom engine metrics are no longer checked (removed in M32).
 
 ## Expected shell interactions
 
@@ -164,67 +129,43 @@ Typical flow:
 
 ```text
 doom play
-doom status
-doom audio status
 doom key left
 doom keyup left
-doom view nearest
-doom capture on
+doom stop
 ```
-
-Key indicators in status output:
-
-- `engine=doomgeneric-loop` (primary runtime path)
-- `dg_frames` increasing
-- `dg_nonzero > 0`
-- `pcm_samples > 0`
-- `pcm_backend=virtio-snd` when virtio audio is active
-- `pcm_tx` and `pcm_done` progressing
 
 ## Known limitations
 
-- Music uses a self-contained OPL2 FM emulator with GENMIDI patches (M31D); fidelity is close to original DOS Doom but not cycle-accurate (no vibrato LFO, simplified KSL).
-- Doom currently runs through kernel-integrated bridge flow, not isolated user-mode execution.
-- Runtime polish is ongoing for full gameplay responsiveness and broader device coverage.
+- WAD file (4.2 MB) may not fit on the 32 MiB disk image, preventing userland Doom from loading in constrained environments.
+- Music uses OPL2 FM emulator with GENMIDI patches; fidelity is close to original DOS Doom but not cycle-accurate.
+- Kernel doom engine stubs remain in `doom.rs` for API compatibility during transition; callers in `shell.rs` and `gfx/mod.rs` still reference them.
 
 ## Troubleshooting
 
-### Black viewport or no visible activity
+### Doom process exits immediately
 
-- Run `doom status` and verify `engine=doomgeneric-loop`.
-- Verify `dg_frames` and `dg_draw` counters are increasing.
-- Run `doom source` / `doom doctor` to check WAD and DoomGeneric readiness.
+- Verify WAD is seeded: check boot log for `FS: seed /usr/share/doom/doom1.wad`.
+- If `storage_no_space` error: disk image too small for the WAD file.
+- Run `ps` to check if doom process is alive.
 
 ### No audible audio
 
 - Check boot log line: `Audio: backend=... ready=...`.
-- Run `doom audio status` and verify `pcm_samples > 0`.
-- Run `doom audio test` and re-check `pcm_tx`/`pcm_done`.
 - If host backend is unavailable, use `QEMU_AUDIO=wav` and inspect generated WAV output.
-
-### Fallback mode instead of DoomGeneric
-
-- Ensure DoomGeneric sources are vendored.
-- Ensure `user/doom/wad/doom1.wad` exists.
-- Rebuild with `cargo xtask build`.
-- If status/logs report `core_size=32` or `core_ready=false` for DoomGeneric, run `scripts/vendor_doomgeneric.sh` and rebuild.
-
-### Slow CI long-run smoke in software emulation
-
-- On runners without KVM access, QEMU uses `tcg` software acceleration.
-- `smoke-doom-long` keeps functional checks active but uses a lower frame-progression floor under `tcg`/`none` to avoid host-load false negatives.
 
 ## Relevant files
 
-- `kernel/src/doom.rs`
-- `kernel/src/doom_bridge.rs`
+- `kernel/src/doom.rs` (stub module — kernel engine removed)
+- `kernel/src/doom_bridge.rs` (WAD embed only)
+- `kernel/src/proc/mod.rs` (I/O syscall handlers)
 - `kernel/src/audio.rs`
 - `kernel/src/audio/virtio_sound.rs`
 - `kernel/src/shell.rs`
-- `user/doom/c/doomgeneric_runner.c`
-- `user/doom/c/doomgeneric_arrost.c`
+- `user/doom/src/bin/ring3_doom.rs`
+- `user/doom/build.rs`
+- `user/doom/c/doomgeneric_arrost_userland.c`
 - `user/doom/c/doomgeneric_audio_stub.c`
-- `user/doom/c/opl/opl2.h`
+- `user/doom/c/arrost_syscall.h`
 - `user/doom/c/opl/opl2.c`
 - `user/doom/c/freestanding_libc.c`
 - `xtask/src/main.rs`
