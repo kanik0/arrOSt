@@ -72,6 +72,7 @@ fn main() {
             .flag("-ffreestanding")
             .flag("-fno-builtin")
             .flag("-fno-stack-protector")
+            .flag("-fPIC")
             .flag("-ffunction-sections")
             .flag("-fdata-sections")
             .warnings(false)
@@ -112,6 +113,15 @@ fn main() {
 
         println!("cargo:rustc-cfg=arrost_userland_doom");
         build.compile("arrost_userland_doom");
+
+        // Force the linker to pull all symbols from the C archive.
+        // Without --whole-archive, --as-needed may skip the library
+        // when it appears before the Rust objects that reference it.
+        let out_dir = env::var("OUT_DIR").unwrap();
+        println!("cargo:rustc-link-arg-bin=ring3_doom=--whole-archive");
+        println!("cargo:rustc-link-arg-bin=ring3_doom=-L{out_dir}");
+        println!("cargo:rustc-link-arg-bin=ring3_doom=-larrost_userland_doom");
+        println!("cargo:rustc-link-arg-bin=ring3_doom=--no-whole-archive");
     }
 
     // rerun-if-changed / rerun-if-env-changed
