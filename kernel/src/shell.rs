@@ -3013,7 +3013,9 @@ fn is_missing_shell_bin_command(input: &str) -> bool {
 
 fn should_auto_dispatch_shell_bin(bin: fs::BinCommand<'_>) -> bool {
     match bin.path {
-        SERIAL_BIN_DOOM => matches!(bin.args, "" | "status" | "play" | "run" | "stop"),
+        // doom always has kernel-side handlers; never block as "unknown command"
+        // even when /bin/doom is missing (seed failure on some architectures).
+        SERIAL_BIN_DOOM => false,
         _ => true,
     }
 }
