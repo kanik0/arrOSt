@@ -647,18 +647,17 @@ fn doom_capture_enabled() -> bool {
 const INPUT_KIND_KEY_PRESS: u8 = 1;
 const INPUT_KIND_KEY_RELEASE: u8 = 2;
 
-/// Inject a key press to both the kernel doom bridge and any userland video consumer.
+/// Inject a key press to the userland video consumer (or kernel doom stub).
 fn doom_inject_key(byte: u8) -> bool {
-    // Route to userland video consumer if one exists.
-    proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_PRESS, byte);
-    // Also route to kernel doom bridge (for backward compatibility during transition).
-    doom::inject_key(byte)
+    let vc_enqueued = proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_PRESS, byte);
+    // M32: kernel doom bridge is a no-op stub; video consumer is the real path.
+    vc_enqueued || doom::inject_key(byte)
 }
 
-/// Inject a key release to both the kernel doom bridge and any userland video consumer.
+/// Inject a key release to the userland video consumer (or kernel doom stub).
 fn doom_inject_key_release(byte: u8) -> bool {
-    proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_RELEASE, byte);
-    doom::inject_key_release(byte)
+    let vc_enqueued = proc::enqueue_input_to_video_consumer(INPUT_KIND_KEY_RELEASE, byte);
+    vc_enqueued || doom::inject_key_release(byte)
 }
 
 pub fn set_ui_doom_capture(enabled: bool) -> bool {
@@ -2427,55 +2426,28 @@ fn run_shell_terminal_command() {
 }
 
 fn run_shell_doom_status_command() {
-    doom::log_status();
+    // M32: kernel doom engine removed — fallback only reached if VFS launch fails.
+    serial::write_line("doom: kernel engine removed (M32); use /bin/doom via VFS launch");
 }
 
-fn run_shell_doom_play_command(shell: &mut ShellState) {
-    let start = doom::play(time::ticks());
-    match start {
-        doom::PlayStart::DoomGeneric => {
-            serial::write_line("doom: play mode started (doomgeneric)");
-        }
-        doom::PlayStart::Fallback => {
-            serial::write_line(
-                "doom: doomgeneric not ready; starting fallback runtime (run scripts/vendor_doomgeneric.sh and provide user/doom/wad/doom1.wad)",
-            );
-        }
-        doom::PlayStart::AlreadyRunning => {
-            serial::write_line("doom: runtime already running");
-        }
-    }
-    if !matches!(start, doom::PlayStart::AlreadyRunning) {
-        if doom::set_capture(true) {
-            shell.doom_capture = true;
-            serial::write_line("doom: capture enabled (F12: release keys | ESC: in-game menu)");
-        } else {
-            shell.doom_capture = false;
-            serial::write_line("doom: capture unavailable (fallback mode)");
-        }
-    }
-    doom::render_ui_status();
+fn run_shell_doom_play_command(_shell: &mut ShellState) {
+    // M32: kernel doom engine removed — fallback only reached if VFS launch fails.
+    serial::write_line("doom: VFS launch failed; kernel engine removed (M32)");
 }
 
 fn run_shell_doom_run_command() {
-    if doom::start(time::ticks()) {
-        serial::write_line("doom: runtime started");
-    } else {
-        serial::write_line("doom: runtime already running");
-    }
-    doom::render_ui_status();
+    serial::write_line("doom: VFS launch failed; kernel engine removed (M32)");
 }
 
-fn run_shell_doom_stop_command(shell: &mut ShellState) {
-    if doom::stop(time::ticks()) {
-        shell.release_all_serial_capture_keys();
-        shell.doom_capture = false;
-        let _ = doom::set_capture(false);
+fn run_shell_doom_stop_command(_shell: &mut ShellState) {
+    // M32: try to kill the video consumer process if one exists.
+    let vc_pid = proc::video_consumer_pid();
+    if vc_pid != 0 {
+        proc::kill_process(vc_pid);
         serial::write_line("doom: runtime stopped");
     } else {
         serial::write_line("doom: runtime already stopped");
     }
-    doom::render_ui_status();
 }
 
 fn current_shell_cwd() -> String {

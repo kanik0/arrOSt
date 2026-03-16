@@ -917,7 +917,7 @@ struct PreparedRing3VfsBin {
     argc: usize,
 }
 
-const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 3] = [
+const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 4] = [
     VfsUserBinContract {
         path: "/bin/ls",
         worker_name: "/bin/ls",
@@ -931,6 +931,11 @@ const VFS_USER_BIN_CONTRACTS: [VfsUserBinContract; 3] = [
     VfsUserBinContract {
         path: "/bin/ps",
         worker_name: "/bin/ps",
+        syscall_caps: caps::CORE,
+    },
+    VfsUserBinContract {
+        path: "/bin/doom",
+        worker_name: "/bin/doom",
         syscall_caps: caps::CORE,
     },
 ];

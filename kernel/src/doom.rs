@@ -72,15 +72,25 @@ pub fn status() -> DoomStatus {
     DoomStatus::default()
 }
 
-pub fn log_status() {}
+pub fn log_status() {
+    crate::serial::write_line(
+        "doom: kernel engine removed (M32); doom runs in userland via /bin/doom",
+    );
+}
 
-pub fn log_doomgeneric_info() {}
+pub fn log_doomgeneric_info() {
+    crate::serial::write_line("doomgeneric: engine removed (M32 userland)");
+}
 
 pub fn doomgeneric_info_text() -> String {
     String::from("doomgeneric: engine removed (M32 userland)\n")
 }
 
-pub fn log_doomgeneric_doctor() {}
+pub fn log_doomgeneric_doctor() {
+    crate::serial::write_line(
+        "doom doctor: kernel engine removed (M32); doom runs in userland via /bin/doom",
+    );
+}
 
 pub fn doomgeneric_doctor_text() -> String {
     String::from("doom doctor: kernel engine removed (M32); doom runs in userland via /bin/doom\n")

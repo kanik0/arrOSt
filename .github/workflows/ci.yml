@@ -99,12 +99,6 @@ jobs:
       - name: Smoke DOOM x86_64
         run: timeout 180s cargo xtask smoke-doom --arch x86_64
 
-      - name: Smoke DOOM Long x86_64
-        run: timeout 240s cargo xtask smoke-doom-long --arch x86_64
-
-      - name: Smoke DOOM Fallback x86_64
-        run: timeout 180s cargo xtask smoke-doom-fallback --arch x86_64
-
       - name: Smoke Ring3 x86_64
         run: timeout 120s cargo xtask smoke-ring3 --arch x86_64
 
@@ -139,15 +133,6 @@ jobs:
 
       - name: Smoke DOOM aarch64
         run: timeout 180s cargo xtask smoke-doom --arch aarch64
-
-      - name: Smoke DOOM Long aarch64
-        run: timeout 240s cargo xtask smoke-doom-long --arch aarch64
-
-      - name: Smoke DOOM Virtio aarch64
-        run: timeout 180s cargo xtask smoke-doom-virtio --arch aarch64
-
-      - name: Smoke DOOM Fallback aarch64
-        run: timeout 180s cargo xtask smoke-doom-fallback --arch aarch64
 
       - name: Smoke Ring3 aarch64
         run: timeout 120s cargo xtask smoke-ring3 --arch aarch64
