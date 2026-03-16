@@ -391,9 +391,13 @@ impl FsState {
                         self.seed_defaults_diskfs();
                     } else {
                         self.ensure_builtin_bins();
+                        self.ensure_default_home_tree();
                         self.ensure_etc_users();
+                        self.ensure_usr_share_doom();
                         let _ = self.diskfs_v2.sync_metadata();
                     }
+                    // Flush write-back cache so seeded data is durable on disk.
+                    let _ = storage::cache::sync();
                 }
                 Err(err) => {
                     serial::write_fmt(format_args!(
@@ -1701,6 +1705,12 @@ impl FsState {
         }
         for path in BIN_EXEC_PATHS {
             let (data, mode) = builtin_bin_seed_payload(path);
+            // Skip files whose size already matches the expected payload.
+            if let Ok(stat) = self.stat_path(path, None) {
+                if stat.size as usize == data.len() {
+                    continue;
+                }
+            }
             if let Err(err) = self.seed_file_with_mode(path, data, mode) {
                 serial::write_fmt(format_args!(
                     "FS: seed {} failed ({}) len={}\n",
@@ -1824,6 +1834,12 @@ impl FsState {
                     ));
                     return;
                 }
+            }
+        }
+        // Skip WAD if size matches to avoid rewriting ~4 MiB on every boot.
+        if let Ok(stat) = self.stat_path(USR_SHARE_DOOM_WAD_PATH, None) {
+            if stat.size as usize == wad.len() {
+                return;
             }
         }
         if let Err(err) = self.seed_file_with_mode(USR_SHARE_DOOM_WAD_PATH, wad, 0o644) {
