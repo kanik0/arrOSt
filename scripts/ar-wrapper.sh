@@ -13,7 +13,7 @@ if [ -z "$real_ar" ]; then
     exit 127
 fi
 
-tmp="$(mktemp "${TMPDIR:-/tmp}/ar-wrapper.XXXXXX.stderr")"
+tmp="$(mktemp "${TMPDIR:-/tmp}/ar-wrapper-XXXXXX")"
 cleanup() {
     rm -f "$tmp"
 }

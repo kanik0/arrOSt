@@ -36,6 +36,7 @@ name = "arrost-user-doom"
 version = "0.1.0"
 dependencies = [
  "arrostd",
+ "cc",
 ]
 
 [[package]]
