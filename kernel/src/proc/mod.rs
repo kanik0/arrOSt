@@ -8,7 +8,6 @@ use crate::fs::{self, FdTable, FdTarget, MAX_FDS, MAX_OPEN_PATH_BYTES};
 use crate::mem::vma::{MAX_VMAS, VmaEntry, VmaFlags};
 use crate::{gfx, net, serial, time};
 use alloc::{boxed::Box, vec::Vec};
-use arrost_user_doom as user_doom;
 use arrost_user_init as user_init;
 use arrostd::abi::{USERLAND_ABI_REVISION, USERLAND_INIT_APP};
 use arrostd::syscall::{
@@ -856,14 +855,12 @@ impl SyscallStats {
 enum TaskKind {
     Init,
     InitWorker,
-    DoomWorker,
     Shell,
 }
 
 #[derive(Clone, Copy)]
 enum ExternalTaskKind {
     Terminal,
-    DoomRuntime,
     Binary,
 }
 
@@ -871,7 +868,6 @@ impl ExternalTaskKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
-            Self::DoomRuntime => "doom-runtime",
             Self::Binary => "binary",
         }
     }
@@ -1147,7 +1143,6 @@ impl Scheduler {
         match task.kind {
             TaskKind::Init => self.run_init_task(task, now_ticks),
             TaskKind::InitWorker => self.run_init_worker_task(task, now_ticks),
-            TaskKind::DoomWorker => self.run_doom_worker_task(task, now_ticks),
             TaskKind::Shell => self.run_shell_task(task, now_ticks),
         }
     }
@@ -1257,10 +1252,6 @@ impl Scheduler {
 
     fn run_init_worker_task(&mut self, task: &mut Task, now_ticks: u64) {
         self.run_user_worker_task(task, now_ticks, init_user_app_contract(), "[uinit]", true);
-    }
-
-    fn run_doom_worker_task(&mut self, task: &mut Task, now_ticks: u64) {
-        self.run_user_worker_task(task, now_ticks, doom_user_app_contract(), "[udoom]", false);
     }
 
     fn run_user_worker_task(
@@ -2106,11 +2097,8 @@ impl Scheduler {
                 // arg0 = fds_ptr, arg1 = flags (only 0 supported)
                 self.syscall_pipe_ring3(ctx, arg0)
             }
-            // M31: doom engine launch/control from ring-3
-            SYS_DOOM_LAUNCH => {
-                // arg0 = cmd (DOOM_CMD_PLAY/RUN/STOP/STATUS)
-                self.syscall_doom_launch_ring3(arg0)
-            }
+            // M31→M32: kernel doom engine removed; userland uses SYS_VIDEO_BLIT etc.
+            SYS_DOOM_LAUNCH => errno::ENOSYS,
             // M32: userland I/O syscalls
             SYS_VIDEO_BLIT => {
                 // arg0 = pixel_ptr, arg1 = width, arg2 = height
@@ -4862,40 +4850,6 @@ impl Scheduler {
         }
     }
 
-    /// SYS_DOOM_LAUNCH (M31): launch or control the kernel doom engine from ring-3.
-    ///
-    /// `cmd` maps to the doom operation:
-    ///   0 (DOOM_CMD_PLAY)   – start play mode (same as `doom play` shell command)
-    ///   1 (DOOM_CMD_RUN)    – start run mode  (same as `doom run`)
-    ///   2 (DOOM_CMD_STOP)   – stop doom       (same as `doom stop`)
-    ///   3 (DOOM_CMD_STATUS) – print status to serial
-    ///
-    /// Returns 0 on success, `-EINVAL` for unknown cmd, `-ENOSYS` if doom is unavailable.
-    fn syscall_doom_launch_ring3(&mut self, cmd: u64) -> isize {
-        use arrostd::syscall::{DOOM_CMD_PLAY, DOOM_CMD_RUN, DOOM_CMD_STATUS, DOOM_CMD_STOP};
-        match cmd {
-            DOOM_CMD_PLAY => {
-                use crate::doom::PlayStart;
-                match crate::doom::play(crate::time::ticks()) {
-                    PlayStart::DoomGeneric | PlayStart::Fallback | PlayStart::AlreadyRunning => 0,
-                }
-            }
-            DOOM_CMD_RUN => {
-                let _ = crate::doom::start(crate::time::ticks());
-                0
-            }
-            DOOM_CMD_STOP => {
-                let _ = crate::doom::stop(crate::time::ticks());
-                0
-            }
-            DOOM_CMD_STATUS => {
-                crate::doom::log_status();
-                0
-            }
-            _ => errno::EINVAL,
-        }
-    }
-
     // -----------------------------------------------------------------------
     // M32: Userland I/O syscalls
     // -----------------------------------------------------------------------
@@ -6983,23 +6937,9 @@ fn init_user_app_contract() -> UserAppContract {
     }
 }
 
-fn doom_user_app_contract() -> UserAppContract {
-    UserAppContract {
-        app_id: app::DOOM,
-        app_name: user_doom::app_name(),
-        worker_name: "doom-worker",
-        task_kind: TaskKind::DoomWorker,
-        syscall_caps: user_doom::required_caps(),
-        boot_message: user_doom::boot_message(),
-        sleep_ticks: user_doom::cooperative_sleep_ticks(),
-        exit_code: user_doom::cooperative_exit_code(),
-    }
-}
-
 fn user_app_contract(app_id: u64) -> Option<UserAppContract> {
     match app_id {
         app::INIT => Some(init_user_app_contract()),
-        app::DOOM => Some(doom_user_app_contract()),
         _ => None,
     }
 }
@@ -7085,7 +7025,6 @@ fn prepare_ring3_vfs_bin(path: &'static str, argv: &[&str]) -> Result<PreparedRi
 fn user_app_contract_for_kind(kind: TaskKind) -> Option<UserAppContract> {
     match kind {
         TaskKind::InitWorker => Some(init_user_app_contract()),
-        TaskKind::DoomWorker => Some(doom_user_app_contract()),
         _ => None,
     }
 }
@@ -7297,22 +7236,6 @@ pub fn spawn_terminal_process(tty: u32) -> isize {
             parent_pid,
             TASK_CAP_SHELL,
             Some(tty),
-        ) {
-            Ok(pid) => pid as isize,
-            Err(error) => error,
-        }
-    })
-}
-
-pub fn spawn_doom_runtime_process() -> isize {
-    with_scheduler(|scheduler| {
-        let parent_pid = scheduler.find_pid("sh").unwrap_or_default();
-        match scheduler.register_external_task(
-            "doom",
-            ExternalTaskKind::DoomRuntime,
-            parent_pid,
-            user_doom::required_caps(),
-            None,
         ) {
             Ok(pid) => pid as isize,
             Err(error) => error,

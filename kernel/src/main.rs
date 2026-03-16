@@ -10,6 +10,7 @@ extern crate alloc;
 mod arch;
 mod audio;
 mod console;
+#[allow(dead_code)]
 mod doom;
 mod doom_bridge;
 mod fs;
@@ -39,74 +40,6 @@ const VERSION_MINOR: &str = match option_env!("ARROST_VERSION_MINOR") {
 const VERSION_BUILD: &str = match option_env!("ARROST_BUILD_COUNT") {
     Some(value) => value,
     None => "0",
-};
-const DOOM_APP: &str = match option_env!("ARROST_DOOM_APP") {
-    Some(value) => value,
-    None => "doom",
-};
-const DOOM_ARTIFACT_SIZE: &str = match option_env!("ARROST_DOOM_ARTIFACT_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_ARTIFACT_HINT: &str = match option_env!("ARROST_DOOM_ARTIFACT_HINT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_C_BACKEND_SIZE: &str = match option_env!("ARROST_DOOM_C_BACKEND_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_C_BACKEND_READY: &str = match option_env!("ARROST_DOOM_C_BACKEND_READY") {
-    Some(value) => value,
-    None => "false",
-};
-const DOOM_C_BACKEND_OBJECT: &str = match option_env!("ARROST_DOOM_C_BACKEND_OBJECT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_GENERIC_READY: &str = match option_env!("ARROST_DOOM_GENERIC_READY") {
-    Some(value) => value,
-    None => "false",
-};
-const DOOM_GENERIC_ROOT: &str = match option_env!("ARROST_DOOM_GENERIC_ROOT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_GENERIC_CORE_SOURCE: &str = match option_env!("ARROST_DOOM_GENERIC_CORE_SOURCE") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_GENERIC_CORE_OBJECT: &str = match option_env!("ARROST_DOOM_GENERIC_CORE_OBJECT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_GENERIC_CORE_SIZE: &str = match option_env!("ARROST_DOOM_GENERIC_CORE_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_GENERIC_CORE_READY: &str = match option_env!("ARROST_DOOM_GENERIC_CORE_READY") {
-    Some(value) => value,
-    None => "false",
-};
-const DOOM_GENERIC_PORT_OBJECT: &str = match option_env!("ARROST_DOOM_GENERIC_PORT_OBJECT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_GENERIC_PORT_SIZE: &str = match option_env!("ARROST_DOOM_GENERIC_PORT_SIZE") {
-    Some(value) => value,
-    None => "0",
-};
-const DOOM_GENERIC_PORT_READY: &str = match option_env!("ARROST_DOOM_GENERIC_PORT_READY") {
-    Some(value) => value,
-    None => "false",
-};
-const DOOM_WAD_HINT: &str = match option_env!("ARROST_DOOM_WAD_HINT") {
-    Some(value) => value,
-    None => "<none>",
-};
-const DOOM_WAD_PRESENT: &str = match option_env!("ARROST_DOOM_WAD_PRESENT") {
-    Some(value) => value,
-    None => "false",
 };
 
 const KERNEL_BOOT_ABI_VERSION: u32 = 1;
@@ -415,30 +348,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hal_report.display_devices,
         hal_report.audio_devices,
         hal_report.input_devices,
-    ));
-
-    serial::write_fmt(format_args!(
-        "Doom: app={} rust_artifact={} rust_artifact_size={} c_backend_size={} c_backend_ready={} c_backend_object={}\n",
-        DOOM_APP,
-        DOOM_ARTIFACT_HINT,
-        DOOM_ARTIFACT_SIZE,
-        DOOM_C_BACKEND_SIZE,
-        DOOM_C_BACKEND_READY,
-        DOOM_C_BACKEND_OBJECT
-    ));
-    serial::write_fmt(format_args!(
-        "DoomGeneric: ready={} root={} core={} core_obj={} core_size={} core_ready={} port={} port_size={} port_ready={} wad={} wad_present={}\n",
-        DOOM_GENERIC_READY,
-        DOOM_GENERIC_ROOT,
-        DOOM_GENERIC_CORE_SOURCE,
-        DOOM_GENERIC_CORE_OBJECT,
-        DOOM_GENERIC_CORE_SIZE,
-        DOOM_GENERIC_CORE_READY,
-        DOOM_GENERIC_PORT_OBJECT,
-        DOOM_GENERIC_PORT_SIZE,
-        DOOM_GENERIC_PORT_READY,
-        DOOM_WAD_HINT,
-        DOOM_WAD_PRESENT
     ));
 
     // Initialize per-CPU state for BSP (must happen after mem init, before AP boot).
@@ -771,30 +680,6 @@ fn aarch64_kernel_main(handoff: u64) -> ! {
         hal_report.display_devices,
         hal_report.audio_devices,
         hal_report.input_devices,
-    ));
-
-    serial::write_fmt(format_args!(
-        "Doom: app={} rust_artifact={} rust_artifact_size={} c_backend_size={} c_backend_ready={} c_backend_object={}\n",
-        DOOM_APP,
-        DOOM_ARTIFACT_HINT,
-        DOOM_ARTIFACT_SIZE,
-        DOOM_C_BACKEND_SIZE,
-        DOOM_C_BACKEND_READY,
-        DOOM_C_BACKEND_OBJECT
-    ));
-    serial::write_fmt(format_args!(
-        "DoomGeneric: ready={} root={} core={} core_obj={} core_size={} core_ready={} port={} port_size={} port_ready={} wad={} wad_present={}\n",
-        DOOM_GENERIC_READY,
-        DOOM_GENERIC_ROOT,
-        DOOM_GENERIC_CORE_SOURCE,
-        DOOM_GENERIC_CORE_OBJECT,
-        DOOM_GENERIC_CORE_SIZE,
-        DOOM_GENERIC_CORE_READY,
-        DOOM_GENERIC_PORT_OBJECT,
-        DOOM_GENERIC_PORT_SIZE,
-        DOOM_GENERIC_PORT_READY,
-        DOOM_WAD_HINT,
-        DOOM_WAD_PRESENT
     ));
 
     // Initialize per-CPU state for BSP (must happen after mem init, before AP boot).
@@ -1151,7 +1036,6 @@ fn run_loop() -> ! {
         gfx::poll();
         net::poll();
         let ticks = time::ticks();
-        doom::poll(ticks);
         audio::poll(ticks);
         proc::run_once(ticks);
         proc::run_ring3_once(ticks);
